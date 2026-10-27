@@ -1,0 +1,265 @@
+{% extends "base.html" %}
+{% block title %}KupkaProd Web{% endblock %}
+
+{% block content %}
+<section class="dashboard-grid">
+  <div class="panel panel-form">
+    <div class="panel-head">
+      <h1>Start Production</h1>
+      <p>Run the existing movie pipeline without forwarding the Tk desktop.</p>
+    </div>
+
+    <form action="/projects/start" method="post" class="stack-form">
+      <label>
+        <span>Project name</span>
+        <input class="form-control" type="text" name="project_name" placeholder="optional, auto-generated like 0515_001">
+      </label>
+
+      <label>
+        <span>Movie brief or script</span>
+        <textarea class="form-control" name="brief" rows="9" placeholder="Describe the film or paste a screenplay. Leave empty to resume an existing project by name.">{{ runtime_defaults.brief }}</textarea>
+      </label>
+
+      <div class="inline-toggles">
+        <label><input type="checkbox" name="is_script" value="1" {% if runtime_defaults.is_script %}checked{% endif %}> Treat input as screenplay</label>
+        <label><input type="checkbox" name="lazy" value="1" {% if runtime_defaults.lazy %}checked{% endif %}> Lazy mode</label>
+        <label><input type="checkbox" name="t2v_only" value="1" {% if runtime_defaults.t2v_only %}checked{% endif %}> T2V only</label>
+        <label><input type="checkbox" name="skip_kf_eval" value="1" {% if runtime_defaults.skip_kf_eval %}checked{% endif %}> Skip keyframe eval</label>
+        <label><input type="checkbox" name="subtitle_safe" value="1" {% if runtime_defaults.subtitle_safe %}checked{% endif %}> Subtitle safe mode</label>
+        <label><input type="checkbox" name="no_dialogue" value="1" {% if runtime_defaults.no_dialogue %}checked{% endif %}> No dialogue / speech</label>
+      </div>
+
+      <details class="subpanel" open>
+        <summary>Pipeline settings</summary>
+        <div class="form-grid">
+          <label>
+            <span>Takes per scene</span>
+            <input class="form-control" type="number" min="1" max="10" name="takes" value="{{ runtime_defaults.takes }}">
+          </label>
+          <label>
+            <span>Scene min (sec)</span>
+            <input class="form-control" type="number" min="1" max="120" name="scene_min" value="{{ runtime_defaults.scene_min }}">
+          </label>
+          <label>
+            <span>Scene max (sec)</span>
+            <input class="form-control" type="number" min="2" max="120" name="scene_max" value="{{ runtime_defaults.scene_max }}">
+          </label>
+          <label>
+            <span>Keyframe width</span>
+            <input class="form-control" type="number" min="512" step="64" name="kf_width" value="{{ runtime_defaults.kf_width }}">
+          </label>
+          <label>
+            <span>Keyframe height</span>
+            <input class="form-control" type="number" min="512" step="64" name="kf_height" value="{{ runtime_defaults.kf_height }}">
+          </label>
+          <label>
+            <span>Video width</span>
+            <input class="form-control" type="number" min="256" step="32" name="video_width" value="{{ runtime_defaults.video_width }}">
+          </label>
+          <label>
+            <span>Video height</span>
+            <input class="form-control" type="number" min="256" step="32" name="video_height" value="{{ runtime_defaults.video_height }}">
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="final_transition_enabled" value="1" {% if runtime_defaults.final_transition_enabled %}checked{% endif %}>
+            <span>Enable scene transitions</span>
+          </label>
+          <label>
+            <span>Transition duration (sec)</span>
+            <input class="form-control" type="number" min="0" max="2" step="0.05" name="final_transition_duration" value="{{ runtime_defaults.final_transition_duration }}">
+          </label>
+        </div>
+      </details>
+
+      <details class="subpanel" open>
+        <summary>Prompt bias</summary>
+        <div class="slider-grid">
+          <label class="slider-field">
+            <div class="slider-copy">
+              <span>Character focus</span>
+              <small>Higher keeps visible people as the dominant subject in frame.</small>
+            </div>
+            <input class="form-range" type="range" min="0" max="100" step="1" name="character_focus" value="{{ runtime_defaults.character_focus }}">
+            <output>{{ runtime_defaults.character_focus }}</output>
+          </label>
+          <label class="slider-field">
+            <div class="slider-copy">
+              <span>Action focus</span>
+              <small>Higher prefers the key action over atmosphere or setup shots.</small>
+            </div>
+            <input class="form-range" type="range" min="0" max="100" step="1" name="action_focus" value="{{ runtime_defaults.action_focus }}">
+            <output>{{ runtime_defaults.action_focus }}</output>
+          </label>
+          <label class="slider-field">
+            <div class="slider-copy">
+              <span>Environment weight</span>
+              <small>Higher strengthens location continuity, set dressing, and spatial context.</small>
+            </div>
+            <input class="form-range" type="range" min="0" max="100" step="1" name="environment_weight" value="{{ runtime_defaults.environment_weight }}">
+            <output>{{ runtime_defaults.environment_weight }}</output>
+          </label>
+          <label class="slider-field">
+            <div class="slider-copy">
+              <span>Establishing shot bias</span>
+              <small>Higher allows more room-first or wide establishing compositions.</small>
+            </div>
+            <input class="form-range" type="range" min="0" max="100" step="1" name="establishing_shot_bias" value="{{ runtime_defaults.establishing_shot_bias }}">
+            <output>{{ runtime_defaults.establishing_shot_bias }}</output>
+          </label>
+        </div>
+        <div class="inline-toggles">
+          <label><input type="checkbox" name="natural_dialogue" value="1" {% if runtime_defaults.natural_dialogue %}checked{% endif %}> Natural dialogue mode</label>
+        </div>
+        <label>
+          <span>Direct ZiT add-on prompt</span>
+          <textarea class="form-control" name="zit_direct_prompt" rows="4" placeholder="Appended verbatim to the final ZiT keyframe prompt after the LLM output.">{{ runtime_defaults.zit_direct_prompt }}</textarea>
+        </label>
+      </details>
+
+      <details class="subpanel">
+        <summary>Server settings</summary>
+        <div class="form-grid">
+          <label>
+            <span>Active ComfyUI host</span>
+            <select class="form-control" name="comfyui_host">
+              {% for host in settings.comfyui_hosts %}
+                <option value="{{ host }}" {% if settings.comfyui_host == host %}selected{% endif %}>{{ host }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            <span>ComfyUI root</span>
+            <input class="form-control" type="text" name="comfyui_root" value="{{ settings.comfyui_root }}">
+          </label>
+          <label>
+            <span>ComfyUI output dir</span>
+            <input class="form-control" type="text" name="comfyui_output_dir" value="{{ settings.comfyui_output_dir }}">
+          </label>
+          <label>
+            <span>Project output root</span>
+            <input class="form-control" type="text" name="project_output_root" value="{{ settings.project_output_root }}">
+          </label>
+          <label>
+            <span>ComfyUI launcher</span>
+            <input class="form-control" type="text" name="comfyui_launcher" value="{{ settings.comfyui_launcher }}">
+          </label>
+          <label>
+            <span>ZiT prompt node ID</span>
+            <input class="form-control" type="text" name="kf_prompt_node_id" value="{{ settings.kf_prompt_node_id }}" placeholder="57:27">
+          </label>
+          <label>
+            <span>ZiT prompt input name</span>
+            <input class="form-control" type="text" name="kf_prompt_input_name" value="{{ settings.kf_prompt_input_name }}" placeholder="text">
+          </label>
+          <label class="field-span-2">
+            <span>Configured ComfyUI hosts</span>
+            <textarea class="form-control" name="comfyui_hosts_text" rows="4" placeholder="One host:port per line">{{ settings.comfyui_hosts_text }}</textarea>
+          </label>
+          <label>
+            <span>LLM provider</span>
+            <select class="form-control" name="llm_provider">
+              <option value="ollama" {% if settings.llm_provider == 'ollama' %}selected{% endif %}>ollama</option>
+              <option value="openai_compatible" {% if settings.llm_provider == 'openai_compatible' %}selected{% endif %}>openai_compatible</option>
+            </select>
+          </label>
+          <label>
+            <span>LLM API base URL</span>
+            <input class="form-control" type="text" name="llm_base_url" value="{{ settings.llm_base_url }}">
+          </label>
+          <label>
+            <span>LLM reasoning format</span>
+            <select class="form-control" name="llm_reasoning_format">
+              <option value="none" {% if settings.llm_reasoning_format == 'none' %}selected{% endif %}>none</option>
+              <option value="deepseek" {% if settings.llm_reasoning_format == 'deepseek' %}selected{% endif %}>deepseek</option>
+            </select>
+          </label>
+          <label>
+            <span>LLM model (creative)</span>
+            <input class="form-control" type="text" name="llm_model_creative" value="{{ settings.llm_model_creative }}">
+          </label>
+          <label>
+            <span>LLM model (fast)</span>
+            <input class="form-control" type="text" name="llm_model_fast" value="{{ settings.llm_model_fast }}">
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="llm_enable_thinking" value="1" {% if settings.llm_enable_thinking %}checked{% endif %}>
+            <span>Enable llama.cpp thinking mode</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="llm_reasoning_breakdown_only" value="1" {% if settings.llm_reasoning_breakdown_only %}checked{% endif %}>
+            <span>Reasoning only for breakdown</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="llm_creative_drafting_mode" value="1" {% if settings.llm_creative_drafting_mode %}checked{% endif %}>
+            <span>Creative drafting mode</span>
+          </label>
+        </div>
+      </details>
+
+      <div class="button-row">
+        <button class="btn btn-outline-secondary" type="submit" formaction="/settings/save">Save settings only</button>
+        <button class="btn btn-primary" type="submit">Launch or Resume</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="panel panel-projects">
+    <div class="panel-head">
+      <h2>Projects</h2>
+      <p>Saved productions and anything currently running or queued in this web session.</p>
+      {% if queue_count %}
+        <p class="muted">Queue: {{ queue_count }} waiting job{% if queue_count != 1 %}s{% endif %}.</p>
+      {% endif %}
+    </div>
+
+    {% if queue_items %}
+      <div class="project-metrics">
+        {% for item in queue_items %}
+          <span>#{{ item.queue_position }} · {{ item.project_name }}</span>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    {% if projects %}
+      <div class="project-list">
+        {% for project in projects %}
+          <a class="project-card" href="/projects/{{ project.name }}">
+            <div class="project-card-top">
+              <strong>{{ project.name }}</strong>
+              <span class="status-pill {% if project.job.running %}running{% elif project.job.queued %}queued{% endif %}">{{ project.phase }}</span>
+            </div>
+            <div class="project-metrics">
+              <span>{{ project.total_scenes }} scenes</span>
+              <span>{{ project.keyframes_done }} keyframes approved</span>
+              <span>{{ project.takes_done }} takes selected</span>
+            </div>
+            {% if project.final_url %}
+              <span class="link-line">Final film ready</span>
+            {% endif %}
+          </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state">No projects yet. Start with a short brief or resume by project name.</div>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (() => {
+    document.querySelectorAll(".slider-field").forEach((field) => {
+      const input = field.querySelector("input[type='range']");
+      const output = field.querySelector("output");
+      if (!input || !output) return;
+      const sync = () => {
+        output.value = input.value;
+        output.textContent = input.value;
+      };
+      input.addEventListener("input", sync);
+      sync();
+    });
+  })();
+</script>
+{% endblock %}

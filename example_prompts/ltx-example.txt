@@ -1,0 +1,60 @@
+Use the provided start image as the first frame and the end image as the final frame anchor. Preserve exact character identity (face, glasses, suit, proportions), bedroom layout, lighting, and object continuity.
+
+Scene: a quiet, modest apartment bedroom in the early morning. Soft natural light enters through the curtains. The atmosphere is still, intimate, slightly heavy.
+
+Camera:
+slow cinematic camera movement, very subtle and controlled
+gentle lateral drift combined with a slight push-in
+feels like a human operator breathing with the character
+no abrupt motion, no shake
+
+Action:
+
+0:00–0:03  
+The gorilla lies on his back, staring at the ceiling.  
+He breathes slowly at first. Minimal movement.
+
+0:03–0:06  
+His breathing becomes heavier, more noticeable in his chest and shoulders.  
+A slight tension appears in his face. Eyes fixed, unfocused.
+
+0:06–0:08  
+A small shift of the head toward the side (transition toward end frame).  
+His gaze drifts, still empty, lost in thought.
+
+0:08–0:10  
+He settles into stillness again, breathing heavy but controlled.  
+End frame matches the second image angle.
+
+Performance:
+- strong sense of fatigue and mental weight  
+- distant, empty gaze ("life is hard" feeling)  
+- no exaggerated acting, fully grounded realism  
+- subtle micro-expressions only
+
+Environment:
+- completely quiet room  
+- slight curtain movement from soft air  
+- natural light slowly evolving  
+
+Motion:
+real-time only, no slow motion  
+very subtle body movement (chest breathing is key)
+
+Audio:
+- deep, heavy breathing  
+- very soft room tone  
+- distant city ambience (barely audible)  
+- no music
+
+Lighting:
+soft diffused morning light  
+slight variation in light as time passes  
+natural shadows, muted tones
+
+Style:
+cinematic realism, minimalist, introspective  
+35mm film look, slight grain, soft highlight roll-off  
+shallow depth of field, focus on face and chest movement  
+
+No text, no subtitles, no logos

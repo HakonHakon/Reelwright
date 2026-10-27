@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}KupkaProd Web{% endblock %}</title>
+  <link rel="stylesheet" href="{{ request.url_for('static', path='app.css') }}">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <a class="brand" href="/">
+        <span class="brand-mark">KP</span>
+        <span class="brand-copy">
+          <strong>KupkaProd Cinema Pipeline</strong>
+          <small>Browser control room for local ComfyUI productions</small>
+        </span>
+      </a>
+      <nav class="topnav">
+        <a href="/">Dashboard</a>
+      </nav>
+    </header>
+
+    {% if message %}
+      <div class="flash success">{{ message }}</div>
+    {% endif %}
+    {% if error %}
+      <div class="flash error">{{ error }}</div>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </div>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

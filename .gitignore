@@ -1,0 +1,52 @@
+# User-specific settings (created on first run)
+video_director_agent/user_settings.json
+
+# Generated output
+video_director_agent/output/
+video_director_agent/logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# I2V template (user must export their own — optional)
+video_director_agent/i2v_template.json
+
+# Test files
+video_director_agent/test_breakdown.json
+video_director_agent/breakdown_test.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude
+.claude/
+claudereadherecheckpoint.txt
+
+# Temp
+*.tmp
+workflow_pretty.json
+error*.png
+
+# Local venv
+.venv/
+
+# Studio data (projects, renders)
+studio_data/
+
+# Never commit your own work
+studio_data/
+*.safetensors
+*.mp4
+*.mov
+*.wav
+*.mp3
+video_director_agent/state/
+video_director_agent/user_settings.json
+*.bak*

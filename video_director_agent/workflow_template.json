@@ -1,0 +1,566 @@
+{
+  "75": {
+    "inputs": {
+      "filename_prefix": "video/LTX-2.3",
+      "format": "auto",
+      "codec": "auto",
+      "video-preview": "",
+      "video": [
+        "153:133",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "Save Video"
+    }
+  },
+  "153:112": {
+    "inputs": {
+      "steps": 10,
+      "max_shift": 1.75,
+      "base_shift": 0.95,
+      "stretch": true,
+      "terminal": 0.1,
+      "latent": [
+        "153:122",
+        0
+      ]
+    },
+    "class_type": "LTXVScheduler",
+    "_meta": {
+      "title": "LTXVScheduler"
+    }
+  },
+  "153:113": {
+    "inputs": {
+      "sigmas": "0.85, 0.725, 0.4219, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "ManualSigmas"
+    }
+  },
+  "153:114": {
+    "inputs": {
+      "model_name": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    },
+    "class_type": "LatentUpscaleModelLoader",
+    "_meta": {
+      "title": "Load Latent Upscale Model"
+    }
+  },
+  "153:115": {
+    "inputs": {
+      "positive": [
+        "153:120",
+        0
+      ],
+      "negative": [
+        "153:120",
+        1
+      ],
+      "latent": [
+        "153:128",
+        0
+      ]
+    },
+    "class_type": "LTXVCropGuides",
+    "_meta": {
+      "title": "LTXVCropGuides"
+    }
+  },
+  "153:116": {
+    "inputs": {
+      "cfg": 1.0,
+      "model": [
+        "153:146",
+        0
+      ],
+      "positive": [
+        "153:115",
+        0
+      ],
+      "negative": [
+        "153:115",
+        1
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFGGuider"
+    }
+  },
+  "153:117": {
+    "inputs": {
+      "upscale_method": "bicubic",
+      "scale_by": 0.5,
+      "image": [
+        "153:124",
+        0
+      ]
+    },
+    "class_type": "ImageScaleBy",
+    "_meta": {
+      "title": "Upscale Image By"
+    }
+  },
+  "153:118": {
+    "inputs": {
+      "image": [
+        "153:117",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "153:119": {
+    "inputs": {
+      "frames_number": [
+        "153:125",
+        0
+      ],
+      "frame_rate": [
+        "153:141",
+        0
+      ],
+      "batch_size": 1,
+      "audio_vae": [
+        "153:156",
+        0
+      ]
+    },
+    "class_type": "LTXVEmptyLatentAudio",
+    "_meta": {
+      "title": "LTXV Empty Latent Audio"
+    }
+  },
+  "153:120": {
+    "inputs": {
+      "frame_rate": [
+        "153:140",
+        0
+      ],
+      "positive": [
+        "153:132",
+        0
+      ],
+      "negative": [
+        "153:123",
+        0
+      ]
+    },
+    "class_type": "LTXVConditioning",
+    "_meta": {
+      "title": "LTXVConditioning"
+    }
+  },
+  "153:121": {
+    "inputs": {
+      "width": [
+        "153:118",
+        0
+      ],
+      "height": [
+        "153:118",
+        1
+      ],
+      "length": [
+        "153:125",
+        0
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyLTXVLatentVideo",
+    "_meta": {
+      "title": "EmptyLTXVLatentVideo"
+    }
+  },
+  "153:122": {
+    "inputs": {
+      "video_latent": [
+        "153:121",
+        0
+      ],
+      "audio_latent": [
+        "153:119",
+        0
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "LTXVConcatAVLatent"
+    }
+  },
+  "153:125": {
+    "inputs": {
+      "value": 721
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Length"
+    }
+  },
+  "153:126": {
+    "inputs": {
+      "noise": [
+        "153:151",
+        0
+      ],
+      "guider": [
+        "153:139",
+        0
+      ],
+      "sampler": [
+        "153:144",
+        0
+      ],
+      "sigmas": [
+        "153:112",
+        0
+      ],
+      "latent_image": [
+        "153:122",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "153:127": {
+    "inputs": {
+      "noise_seed": 885761439081726
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "153:128": {
+    "inputs": {
+      "av_latent": [
+        "153:126",
+        0
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent",
+    "_meta": {
+      "title": "LTXVSeparateAVLatent"
+    }
+  },
+  "153:129": {
+    "inputs": {
+      "video_latent": [
+        "153:130",
+        0
+      ],
+      "audio_latent": [
+        "153:128",
+        1
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "LTXVConcatAVLatent"
+    }
+  },
+  "153:130": {
+    "inputs": {
+      "samples": [
+        "153:115",
+        2
+      ],
+      "upscale_model": [
+        "153:114",
+        0
+      ],
+      "vae": [
+        "153:900",
+        2
+      ]
+    },
+    "class_type": "LTXVLatentUpsampler",
+    "_meta": {
+      "title": "spatial"
+    }
+  },
+  "153:131": {
+    "inputs": {
+      "noise": [
+        "153:127",
+        0
+      ],
+      "guider": [
+        "153:116",
+        0
+      ],
+      "sampler": [
+        "153:145",
+        0
+      ],
+      "sigmas": [
+        "153:113",
+        0
+      ],
+      "latent_image": [
+        "153:129",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "153:133": {
+    "inputs": {
+      "fps": [
+        "153:140",
+        0
+      ],
+      "images": [
+        "153:137",
+        0
+      ],
+      "audio": [
+        "153:138",
+        0
+      ]
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "Create Video"
+    }
+  },
+  "153:135": {
+    "inputs": {
+      "av_latent": [
+        "153:131",
+        1
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent",
+    "_meta": {
+      "title": "LTXVSeparateAVLatent"
+    }
+  },
+  "153:138": {
+    "inputs": {
+      "samples": [
+        "153:135",
+        1
+      ],
+      "audio_vae": [
+        "153:156",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVAEDecode",
+    "_meta": {
+      "title": "LTXV Audio VAE Decode"
+    }
+  },
+  "153:139": {
+    "inputs": {
+      "cfg": 1.0,
+      "model": [
+        "153:146",
+        0
+      ],
+      "positive": [
+        "153:120",
+        0
+      ],
+      "negative": [
+        "153:120",
+        1
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFGGuider"
+    }
+  },
+  "153:140": {
+    "inputs": {
+      "value": 24.0
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "Frame Rate(float)"
+    }
+  },
+  "153:141": {
+    "inputs": {
+      "value": 24
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Frame Rate(int)"
+    }
+  },
+  "153:144": {
+    "inputs": {
+      "sampler_name": "lcm"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "153:145": {
+    "inputs": {
+      "sampler_name": "lcm"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "153:150": {
+    "inputs": {
+      "preview_markdown": "",
+      "preview_text": "",
+      "previewMode": null,
+      "source": [
+        "153:158",
+        0
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Preview as Text"
+    }
+  },
+  "153:151": {
+    "inputs": {
+      "noise_seed": 191630112419704
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "153:124": {
+    "inputs": {
+      "width": 960,
+      "height": 540,
+      "batch_size": 2,
+      "color": 0
+    },
+    "class_type": "EmptyImage",
+    "_meta": {
+      "title": "EmptyImage"
+    }
+  },
+  "153:132": {
+    "inputs": {
+      "text": "Donald Trump and Elon Musk sitting across from each other at a podcast table with microphones and ring lights, inside an ornate White House room, Trump in dark suit and red tie, Elon in casual dark blazer, warm intimate studio lighting, medium two-shot framing both men, Trump leaning forward saying \"you know what nobody talks about, stubbing your toe, and its always the pinky toe, never the big toe, never a normal toe, always the smallest most useless toe\", Elon nodding slowly saying \"the pinky toe, yes\", Trump continuing \"and i'll tell you something, i have never stubbed my toe, not once, very strong toes, the best toes, presidential toes\", Elon saying \"i don't think toe strength is a metric anyone tracks\", Trump saying \"they should, they absolutely should, very important metric, i would know\", both men gesturing naturally, humanoid robot visible in background, photorealistic, cinematic",
+      "clip": [
+        "153:158",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "153:137": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 4096,
+      "temporal_overlap": 8,
+      "samples": [
+        "153:135",
+        0
+      ],
+      "vae": [
+        "153:900",
+        2
+      ]
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "VAE Decode (Tiled)"
+    }
+  },
+  "153:136": {
+    "inputs": {
+      "samples": [
+        "153:135",
+        0
+      ],
+      "vae": [
+        "153:900",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "153:123": {
+    "inputs": {
+      "text": "cartoon, anime, deformed hands, extra fingers, blurry faces, outdoor, crowd, rally, watermark, angry expressions, text, subtitles, captions, words, typography, on-screen text",
+      "clip": [
+        "153:158",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "153:156": {
+    "inputs": {
+      "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"
+    },
+    "class_type": "LTXVAudioVAELoader",
+    "_meta": {
+      "title": "Load LTXV Audio VAE"
+    }
+  },
+  "153:158": {
+    "inputs": {
+      "text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors",
+      "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors",
+      "device": "default"
+    },
+    "class_type": "LTXAVTextEncoderLoader",
+    "_meta": {
+      "title": "Load LTXV Audio Text Encoder"
+    }
+  },
+  "153:146": {
+    "inputs": {
+      "lora_name": "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "153:900",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LTX-2.3 Distilled LoRA"
+    }
+  },
+  "153:900": {
+    "inputs": {
+      "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load LTX-2.3 Checkpoint (dev fp8)"
+    }
+  }
+}

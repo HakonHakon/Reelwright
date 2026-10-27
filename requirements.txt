@@ -1,0 +1,10 @@
+websocket-client
+ollama
+opencv-python
+Pillow
+requests
+sv_ttk
+fastapi
+uvicorn
+jinja2
+python-multipart

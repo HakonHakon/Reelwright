@@ -112,7 +112,8 @@ def create_series(name: str) -> dict:
         sid = _unique(slug(name, "series"), existing)
         s = {"id": sid, "name": name or sid, "created": now()}
         _write(os.path.join(series_dir(sid), "series.json"), s)
-        _write(os.path.join(bible_dir(sid), "style.json"), DEFAULT_STYLE)
+        _write(os.path.join(bible_dir(sid), "style.json"),
+               {**DEFAULT_STYLE, **_settings.load().get("style_defaults", {})})
         _write(os.path.join(bible_dir(sid), "props.json"), [])
         return s
 

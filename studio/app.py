@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
-from . import jobs, llm, media, planner, prompts, store
+from . import jobs, llm, media, planner, prompts, store, providers
 from . import settings as settings_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +21,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="
 EDITABLE_SHOT_FIELDS = {
     "scene_id", "location_id", "time_of_day", "framing", "camera", "characters", "action", "dialogue",
     "sound", "action_seconds", "duration_s", "duration_locked", "start_mode", "frame_source", "engine",
-    "image_prompt_extra", "motion_prompt_extra", "image_prompt_override", "motion_prompt_override", "notes",
+    "video_model", "image_prompt_extra", "motion_prompt_extra", "image_prompt_override", "motion_prompt_override", "notes",
 }
 
 
@@ -142,6 +142,10 @@ def series_get(sid: str):
 
 @app.put("/api/s/{sid}/style")
 def style_put(sid: str, body: dict = Body(...)):
+    try:
+        providers.validate_model(body.get("default_engine") or store.get_style(sid)["default_engine"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return store.save_style(sid, body)
 
 
@@ -168,9 +172,9 @@ def char_put(sid: str, cid: str, body: dict = Body(...)):
 
 @app.delete("/api/s/{sid}/characters/{cid}")
 def char_delete(sid: str, cid: str):
-    d = store.char_dir(sid, cid)
-    if os.path.isdir(d):
-        os.replace(d, os.path.join(os.path.dirname(d), f".deleted_{cid}_{int(time.time())}"))
+    _ensure_idle(sid)
+    store.get_character(sid, cid) or _404("character")
+    store.archive_dir(store.char_dir(sid, cid))
     return {"ok": True}
 
 
@@ -221,9 +225,9 @@ def loc_put(sid: str, lid: str, body: dict = Body(...)):
 
 @app.delete("/api/s/{sid}/locations/{lid}")
 def loc_delete(sid: str, lid: str):
-    d = store.loc_dir(sid, lid)
-    if os.path.isdir(d):
-        os.replace(d, os.path.join(os.path.dirname(d), f".deleted_{lid}_{int(time.time())}"))
+    _ensure_idle(sid)
+    store.get_location(sid, lid) or _404("location")
+    store.archive_dir(store.loc_dir(sid, lid))
     return {"ok": True}
 
 
@@ -272,7 +276,7 @@ def _decorate(sid: str, e: dict) -> dict:
     e["_runtime"] = planner.runtime_seconds(shots)
     e["_estimate_s"] = round(planner.estimate_render_seconds(shots, e["stats"].get("spf", {}), int(s["takes_per_shot"])))
     e["_settings"] = {"takes_per_shot": s["takes_per_shot"], "candidates_per_shot": s["candidates_per_shot"],
-                      "video": s["video"], "ltx_max": s["ltx"]["max_seconds"], "wan_max": s["wan"]["max_seconds"]}
+                      "video": s["video"], "face_model": s["face_correction"]["model"], "ltx_max": s["ltx"]["max_seconds"], "wan_max": s["wan"]["max_seconds"]}
     return e
 
 
@@ -312,6 +316,11 @@ def ep_shots(sid: str, eid: str, body: list = Body(...)):
     s = _s()
     b = store.bible(sid)
 
+    for inc in body:
+        try:
+            providers.validate_model(inc.get("engine") or b["style"].get("default_engine") or "ltx", inc.get("video_model") or "")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     def apply(e):
         old = {sh["id"]: sh for sh in e["shots"]}
         new_list = []
@@ -325,9 +334,13 @@ def ep_shots(sid: str, eid: str, body: list = Body(...)):
                     base[k] = inc[k]
             if not inc.get("duration_locked"):
                 eng = base.get("engine") or b["style"].get("default_engine") or "ltx"
-                cap = s["wan"]["max_seconds"] if eng == "wan" else s["ltx"]["max_seconds"]
+                cap = s[eng]["max_seconds"]
                 base["duration_s"] = planner.compute_duration(base, b, cap)
             new_list.append(base)
+        if {sh["id"] for sh in e["shots"]} - {sh.get("id") for sh in new_list}:
+            _ensure_idle(sid, eid)
+            e["gates"] = dict.fromkeys(e["gates"], False)
+            e["outputs"] = {}
         e["shots"] = new_list
         store.renumber_shots(e)
     return _decorate(sid, store.update_episode(sid, eid, apply))
@@ -425,16 +438,16 @@ def shot_frame(sid: str, eid: str, shot_id: str, body: dict = Body(...)):
         if body.get("clear_end"):
             sh["end_frame"] = ""
         if "remove" in body:
-            i = int(body["remove"])
-            cands = sh["frame"]["candidates"]
-            if 0 <= i < len(cands):
-                cands.pop(i)
-                sel = sh["frame"].get("selected")
-                if sel is not None:
-                    sh["frame"]["selected"] = None if sel == i else (sel - 1 if sel > i else sel)
+            _ensure_idle(sid, eid)
+            store.remove_assets(sh["frame"], "candidates", [int(body["remove"])])
+            ep["gates"].update({"frames": False, "animatic": False, "takes": False})
+            ep["outputs"] = {}
         if "set_end" in body:
             sh["end_frame"] = body["set_end"]
-    return _decorate(sid, store.update_episode(sid, eid, apply))
+    try:
+        return _decorate(sid, store.update_episode(sid, eid, apply))
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/refine")
@@ -447,8 +460,19 @@ def shot_refine(sid: str, eid: str, shot_id: str, body: dict = Body(...)):
 # takes
 @app.post("/api/s/{sid}/e/{eid}/takes")
 def ep_takes(sid: str, eid: str, body: dict = Body(default={})):
+    _ep(sid, eid)
+    try:
+        if body.get("engine"):
+            providers.validate_model(body["engine"], body.get("model") or "")
+        elif body.get("model"):
+            raise ValueError("Choose an engine with the model")
+        if not 1 <= int(body.get("takes") or _s()["takes_per_shot"]) <= 8:
+            raise ValueError("Takes per shot must be between 1 and 8")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
     return _submit("takes", f"Takes {eid}", jobs.job_takes, sid=sid, eid=eid,
-                   shot_ids=body.get("shot_ids") or [], takes=body.get("takes"), force=bool(body.get("force")))
+                   shot_ids=body.get("shot_ids") or [], takes=body.get("takes"), force=bool(body.get("force")),
+                   engine_override=body.get("engine") or "", model_override=body.get("model") or "")
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/take")
@@ -465,13 +489,14 @@ def shot_take(sid: str, eid: str, shot_id: str, body: dict = Body(...)):
             if k in body:
                 t[k] = max(0.0, float(body[k] or 0))
         if "remove" in body:
-            i = int(body["remove"])
-            if 0 <= i < len(t["items"]):
-                t["items"].pop(i)
-                sel = t.get("selected")
-                if sel is not None:
-                    t["selected"] = None if sel == i else (sel - 1 if sel > i else sel)
-    return _decorate(sid, store.update_episode(sid, eid, apply))
+            _ensure_idle(sid, eid)
+            store.remove_assets(t, "items", [int(body["remove"])])
+            ep["gates"]["takes"] = False
+            ep["outputs"] = {}
+    try:
+        return _decorate(sid, store.update_episode(sid, eid, apply))
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/next_from_last")
@@ -524,3 +549,75 @@ async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: fl
         m["volume"] = float(volume)
         m["duck"] = duck.lower() in ("1", "true", "yes", "on")
     return store.update_episode(sid, eid, apply)["music"]
+
+
+# Deletion is recoverable and blocked while jobs can still write into the project.
+def _ensure_idle(sid, eid=None):
+    for job in jobs.QUEUE.list():
+        params = job.get("params", {})
+        if job["status"] in ("queued", "running") and params.get("sid") == sid:
+            if eid is None or params.get("eid") in (None, eid):
+                raise HTTPException(409, "Cancel or finish this project's active jobs before deleting.")
+
+
+@app.delete("/api/s/{sid}")
+def series_delete(sid: str):
+    _ensure_idle(sid)
+    store.get_series(sid) or _404("project")
+    store.archive_dir(store.series_dir(sid))
+    return {"ok": True}
+
+
+@app.delete("/api/s/{sid}/e/{eid}")
+def episode_delete(sid: str, eid: str):
+    _ensure_idle(sid, eid)
+    _ep(sid, eid)
+    store.archive_dir(store.ep_dir(sid, eid))
+    return {"ok": True}
+
+
+@app.post("/api/s/{sid}/e/{eid}/delete_assets")
+def delete_assets(sid: str, eid: str, body: dict = Body(...)):
+    _ensure_idle(sid, eid)
+    kind = body.get("kind")
+    if kind not in ("frame", "take"):
+        raise HTTPException(400, "kind must be frame or take")
+    def apply(ep):
+        # Validate the entire request before changing any shot.
+        for shot_id, indices in body.get("items", {}).items():
+            sh = store.find_shot(ep, shot_id)
+            group = sh["frame" if kind == "frame" else "takes"]
+            values = group["candidates" if kind == "frame" else "items"]
+            if any(type(i) is not int or i < 0 or i >= len(values) for i in indices):
+                raise ValueError("invalid asset index")
+        for shot_id, indices in body.get("items", {}).items():
+            sh = store.find_shot(ep, shot_id)
+            store.remove_assets(sh["frame" if kind == "frame" else "takes"],
+                                "candidates" if kind == "frame" else "items", indices)
+        ep["gates"].update({"frames": False, "animatic": False, "takes": False} if kind == "frame" else {"takes": False})
+        ep["outputs"] = {}
+    try:
+        return _decorate(sid, store.update_episode(sid, eid, apply))
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/face_correction")
+def face_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default={})):
+    sh = store.find_shot(_ep(sid, eid), shot_id)
+    index = body.get("index", sh["takes"].get("selected"))
+    index = 0 if index is None else index
+    if type(index) is not int or not 0 <= index < len(sh["takes"]["items"]):
+        raise HTTPException(400, "Choose an existing take first")
+    model = body.get("model") or _s()["face_correction"]["model"]
+    if model not in ("keep", "codeformer"):
+        raise HTTPException(400, "Unknown face correction model")
+    return _submit("face_correction", f"Face correction: {shot_id}", jobs.job_face_correction,
+                   sid=sid, eid=eid, shot_id=shot_id,
+                   source_file=sh["takes"]["items"][index]["file"], model=model)
+
+
+@app.get("/api/models")
+def video_models():
+    from .providers import VIDEO_MODELS
+    return VIDEO_MODELS

@@ -79,6 +79,15 @@ DEFAULTS = {
         "max_seconds": 5,
         "negative": "blurry, static, deformed, extra fingers, watermark, subtitles, text",
     },
+    "minimax": {
+        "model": "MiniMax-Hailuo-2.3", "resolution": "768P",
+        "api_key_env": "MINIMAX_API_KEY", "base_url": "https://api.minimax.io/v1",
+        "poll_seconds": 5, "timeout_seconds": 1800, "max_seconds": 10,
+    },
+    "face_correction": {
+        "model": "keep", "keep_dir": "", "codeformer_dir": "",
+        "python": "", "fidelity": 0.8,
+    },
     "loudness_lufs": -16,
     "continuity": {
         "punch_in_denoise": 0.32,   # low: keep the master's face, age and clothes; only re-sharpen

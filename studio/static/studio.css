@@ -293,3 +293,7 @@ table.shots textarea { min-height: 58px; }
   .tabs a { padding-right: 22px; font-size: 20px; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } html { scroll-behavior: auto; } }
+
+.bulk-actions { margin: 12px 0; padding: 10px; border: 1px solid var(--rule); border-radius: 6px; }
+.bulk-actions label { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+input.bulk-check, .bulk-actions input { width: auto; min-width: 16px; margin: 6px; }

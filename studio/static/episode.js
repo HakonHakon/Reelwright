@@ -18,9 +18,23 @@ async function viewEpisode(view, sid, eid, tab) {
     <div class="tabs">${TABS.map(([k, label, gate], i) => `<a href="#/s/${sid}/e/${eid}/${k}" class="${k === tab ? "on" : ""} ${done[k] ? "done" : ""}"><span class="n">${done[k] ? ic("check") : i + 1}</span><span>${label.replace(/^\d+\.\s*/, "")}</span>${gate && g[gate] ? `<span class="gate chip good">approved</span>` : ""}</a>`).join("")}</div>
     <div class="progress"><div style="width:${Math.round((nDone / 6) * 100)}%"></div></div>
     <div id="tab"></div>`;
+  const deleteEpisode = document.createElement("button"); deleteEpisode.textContent = "Delete episode"; deleteEpisode.className = "danger";
+  $(".page-head", view).append(deleteEpisode);
+  deleteEpisode.onclick = async () => {
+    if (await ask(`Delete episode ${e.title}? Files are kept in a .deleted folder.`, "Delete", true)) {
+      await api("DELETE", ctx.base); location.hash = `#/s/${sid}`;
+    }
+  };
   const el = $("#tab");
   const fn = { story: tabStory, shots: tabShots, frames: tabFrames, animatic: tabAnimatic, takes: tabTakes, cut: tabCut }[tab] || tabStory;
   await fn(el, ctx);
+  if (tab === "frames" || tab === "takes") {
+    bulkSelect(el, "[data-rm]", async targets => {
+      const items = {};
+      for (const t of targets) (items[t.dataset.shot] ||= []).push(+t.dataset.rm);
+      await POST(`${ctx.base}/delete_assets`, {kind: tab === "frames" ? "frame" : "take", items});
+    }, reload, tab === "frames" ? "frames" : "takes");
+  }
 }
 
 const reload = () => route();
@@ -110,11 +124,15 @@ async function tabShots(el, ctx) {
               ${sh.duration_locked ? `<button class="link" data-unlock="${i}" title="locked - click to auto-compute">🔒</button>` : ""}</div>
             ${sel("start_mode", i, sh.start_mode, ["new", "punch_in", "reuse", "chain"], ["new frame (master)", "punch-in from scene master", "reuse master angle", "chain: last frame of prev take"])}
             ${sel("frame_source", i, sh.frame_source, ["", "flux_lora", "zimage", "qwen_refs", "auto", "upload"], ["source: inherit (" + sourceLabel(sh._source) + ")", "Flux + LoRA", "Z-Image", "Reference photos (Qwen Edit)", "Auto (LoRA > photos > Z-Image)", "Upload"])}
-            ${sel("engine", i, sh.engine, ["", "ltx", "wan"], ["engine: series default", "LTX-2.3", "Wan 2.2"])}</td>
+            ${sel("engine", i, sh.engine, ["", "ltx", "wan", "minimax"], ["engine: series default", "LTX-2.3", "Wan 2.2", "MiniMax (cloud)"])}</td>
           <td><div class="row" style="gap:2px"><button class="link" data-up="${i}" title="move up">↑</button><button class="link" data-down="${i}" title="move down">↓</button>
             <button class="link" data-dup="${i}" title="split: duplicate below">split</button><button class="link" data-merge="${i}" title="merge with next">merge</button>
             <button class="link danger" data-del="${i}">delete</button></div></td></tr>`;
       }).join("")}</tbody></table>`;
+    bulkSelect(el, "[data-del]", async targets => {
+      const indices = targets.map(t => +t.dataset.del).sort((a,b) => b-a);
+      indices.forEach(i => shots.splice(i, 1)); App.dirty = true;
+    }, render, "shots");
   };
   render();
   const payload = () => shots.map((sh) => ({ ...sh }));
@@ -312,10 +330,12 @@ async function tabAnimatic(el, ctx) {
 async function tabTakes(el, ctx) {
   const shots = ctx.e.shots;
   const spf = ctx.e.stats?.spf || {};
+  const models = await GET("/api/models");
   el.innerHTML = `
     ${!ctx.e.gates.frames ? `<div class="notice">First frames aren't approved yet. Shots without a selected frame are skipped.</div>` : ""}
     <div class="card row">
       <label class="row" style="margin:0">takes per shot <input id="ntakes" type="number" min="1" max="8" value="${ctx.e._settings.takes_per_shot}" style="width:60px"></label>
+      <label>Video model <select id="take-model"><option value="">Per-shot / project default</option>${models.map(m => `<option value="${esc(m.id)}" data-engine="${m.engine}">${esc(m.name)}</option>`).join("")}</select></label>
       <button class="primary" id="render-missing">Render shots without takes</button>
       <button id="render-checked">Render checked shots</button>
       <span class="muted small grow">Measured speed: ${Object.entries(spf).map(([k, v]) => `${k} ${v} s/frame`).join(", ") || "not measured yet"} · est. ${fmtSec(ctx.e._estimate_s)} for all</span>
@@ -323,11 +343,15 @@ async function tabTakes(el, ctx) {
     </div>
     ${shots.map((sh) => takeCard(ctx, sh)).join("")}`;
   const n = () => parseInt($("#ntakes").value) || 1;
-  $("#render-missing").onclick = () => startJob(`${ctx.base}/takes`, { takes: n() });
+  const modelChoice = () => {
+    const option = $("#take-model").selectedOptions[0];
+    return { engine: option.dataset.engine || "", model: option.value };
+  };
+  $("#render-missing").onclick = () => startJob(`${ctx.base}/takes`, { takes: n(), ...modelChoice() });
   $("#render-checked").onclick = () => {
     const ids = $$("input[data-chk]:checked").map((x) => x.dataset.chk);
     if (!ids.length) return toast("Tick some shots first", true);
-    startJob(`${ctx.base}/takes`, { shot_ids: ids, takes: n(), force: true });
+    startJob(`${ctx.base}/takes`, { shot_ids: ids, takes: n(), force: true, ...modelChoice() });
   };
   el.onclick = async (ev) => {
     const t = ev.target, ds = t.dataset;
@@ -336,7 +360,8 @@ async function tabTakes(el, ctx) {
     if (ds.pick != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { select: +ds.pick }); reload(); }
     if (ds.rm != null && ds.shot) { if (await ask("Remove this take from the list?", "Remove", true)) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { remove: +ds.rm }); reload(); } }
     if (ds.lock && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { lock: ds.lock === "1" }); reload(); }
-    if (ds.more && ds.shot) startJob(`${ctx.base}/takes`, { shot_ids: [ds.shot], takes: n(), force: true });
+    if (ds.more && ds.shot) startJob(`${ctx.base}/takes`, { shot_ids: [ds.shot], takes: n(), force: true, ...modelChoice() });
+    if (ds.face != null && ds.shot) startJob(`${ctx.base}/shots/${ds.shot}/face_correction`, { index: +ds.face, model: $(`#face-${ds.shot}`).value });
     if (ds.next && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/next_from_last`); toast("Next shot's first frame set from this take."); reload(); }
     if (ds.trim && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { trim_in: parseFloat($(`#ti-${ds.shot}`).value) || 0, trim_out: parseFloat($(`#to-${ds.shot}`).value) || 0 }); App.dirty = false; toast("Trim saved."); }
   };
@@ -351,14 +376,16 @@ function takeCard(ctx, sh) {
       <span class="chip accent">${esc(sh._engine)}</span><span class="muted">${sh.duration_s}s · ${esc(sh.start_mode)}</span>
       ${f ? `<img src="${media(f.file)}" style="height:40px;border-radius:4px" data-zoom="${media(f.file)}">` : sh.start_mode === "chain" ? `<span class="chip">frame from previous take</span>` : `<span class="chip bad">no frame</span>`}
       ${sh.end_frame ? `<span class="chip">end frame</span>` : ""}<span class="grow"></span>
+      <select id="face-${sh.id}" aria-label="Face correction model"><option value="keep" ${ctx.e._settings.face_model === "keep" ? "selected" : ""}>KEEP (main face, temporal)</option><option value="codeformer" ${ctx.e._settings.face_model === "codeformer" ? "selected" : ""}>CodeFormer (all faces)</option></select>
       <button data-more="1" data-shot="${sh.id}">Render more takes</button>
       <button data-next="1" data-shot="${sh.id}" title="extract the last frame of the selected take as the next shot's first frame">Last frame → next shot</button>
       <button data-lock="${sh.takes.locked ? 0 : 1}" data-shot="${sh.id}">${sh.takes.locked ? "Unlock" : "Lock"}</button></div>
     <details><summary>motion prompt</summary><pre class="prompt">${esc(sh._motion_prompt)}</pre></details>
     <div class="cands"><div class="cands-in">${items.map((t, k) => `<div class="cand ${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? "sel" : ""}">
       <div class="frame"><video controls preload="metadata" src="${media(t.file)}"></video></div>
-      <div class="meta"><span class="code">${esc(sh.id)}/T${k + 1}</span>${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? `<span class="pick">picked</span>` : ""}<span>${esc(t.engine)}, ${t.seconds}s, ${t.render_s}s render</span> ${(t.flags || []).map((x) => `<span class="chip warn">${esc(x)}</span>`).join(" ")}</div>
+      <div class="meta"><span class="code">${esc(sh.id)}/T${k + 1}</span>${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? `<span class="pick">picked</span>` : ""}<span>${esc(t.model || t.engine)}${t.face_correction ? " · " + esc(t.face_correction) + " corrected" : ""}, ${t.seconds}s, ${t.render_s}s render</span> ${(t.flags || []).map((x) => `<span class="chip warn">${esc(x)}</span>`).join(" ")}</div>
       <div class="acts">${sh.takes.selected === k ? "" : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
+        <button data-face="${k}" data-shot="${sh.id}">Correct faces</button>
         <button class="danger" data-rm="${k}" data-shot="${sh.id}">✕</button></div></div>`).join("") || `<p class="muted" style="padding:20px">No takes yet.</p>`}</div></div>
     ${items.length ? `<div class="row small" style="margin-top:8px">Trim selected take: in <input id="ti-${sh.id}" type="number" step="0.05" min="0" value="${sh.takes.trim_in || 0}" style="width:70px">s
       out <input id="to-${sh.id}" type="number" step="0.05" min="0" value="${sh.takes.trim_out || 0}" style="width:70px">s (cut from end)

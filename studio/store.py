@@ -16,6 +16,7 @@ import json
 import os
 import re
 import threading
+import uuid
 
 from . import settings as _settings
 
@@ -97,6 +98,8 @@ def list_series() -> list[dict]:
     out = []
     if os.path.isdir(root()):
         for sid in sorted(os.listdir(root())):
+            if sid.startswith("."):
+                continue
             s = _read(os.path.join(series_dir(sid), "series.json"))
             if s:
                 out.append(s)
@@ -160,6 +163,8 @@ def list_characters(sid: str) -> list[dict]:
     out = []
     if os.path.isdir(base):
         for cid in sorted(os.listdir(base)):
+            if cid.startswith("."):
+                continue
             c = _read(os.path.join(base, cid, "character.json"))
             if c:
                 out.append(c)
@@ -196,6 +201,8 @@ def list_locations(sid: str) -> list[dict]:
     out = []
     if os.path.isdir(base):
         for lid in sorted(os.listdir(base)):
+            if lid.startswith("."):
+                continue
             loc = _read(os.path.join(base, lid, "location.json"))
             if loc:
                 out.append(loc)
@@ -246,6 +253,8 @@ def list_episodes(sid: str) -> list[dict]:
     out = []
     if os.path.isdir(base):
         for eid in sorted(os.listdir(base)):
+            if eid.startswith("."):
+                continue
             e = _read(os.path.join(base, eid, "episode.json"))
             if e:
                 out.append({k: e.get(k) for k in ("id", "title", "created")} | {"shots": len(e.get("shots", []))})
@@ -316,6 +325,31 @@ def rel(path: str) -> str:
 
 def abs_media(relpath: str) -> str:
     p = os.path.abspath(os.path.join(_settings.DATA_ROOT, relpath))
-    if not p.startswith(os.path.abspath(_settings.DATA_ROOT)):
+    if os.path.commonpath([p, os.path.abspath(_settings.DATA_ROOT)]) != os.path.abspath(_settings.DATA_ROOT):
         raise ValueError("path escapes data root")
     return p
+
+
+def archive_dir(path: str) -> None:
+    """Recoverable deletion; hidden siblings are excluded from all listings."""
+    path = os.path.abspath(path)
+    base = os.path.abspath(root())
+    if os.path.commonpath([path, base]) != base or path == base:
+        raise ValueError("invalid archive path")
+    with _lock:
+        if not os.path.isdir(path):
+            raise KeyError("item not found")
+        os.replace(path, os.path.join(os.path.dirname(path),
+                   f".deleted_{os.path.basename(path)}_{uuid.uuid4().hex}"))
+
+
+def remove_assets(group: dict, list_key: str, indices: list[int]) -> None:
+    items = group[list_key]
+    deleted = set(indices)
+    if any(type(i) is not int or i < 0 or i >= len(items) for i in deleted):
+        raise ValueError("invalid asset index")
+    selected = group.get("selected")
+    group[list_key] = [x for i, x in enumerate(items) if i not in deleted]
+    if selected is not None:
+        group["selected"] = None if selected in deleted else selected - sum(i < selected for i in deleted)
+    group["locked"] = False

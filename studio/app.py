@@ -312,7 +312,7 @@ def ep_create(sid: str, body: dict = Body(...)):
 
 
 def _decorate(sid: str, e: dict) -> dict:
-    s = _s()
+    s = settings_mod.for_episode(_s(), e)
     b = store.bible(sid)
     shots = sorted(e["shots"], key=lambda x: x.get("order", 0))
     for sh in shots:
@@ -430,6 +430,7 @@ async def shot_upload_frame(sid: str, eid: str, shot_id: str, file: UploadFile =
                             crop: str = Form(""), end: str = Form("")):
     s = _s()
     e = _ep(sid, eid)
+    s = settings_mod.for_episode(s, e)
     store.find_shot(e, shot_id)
     raw = await _save_upload(file, os.path.join(store.ep_dir(sid, eid), "uploads"))
     out_dir = os.path.join(store.ep_dir(sid, eid), "frames", shot_id)
@@ -457,6 +458,7 @@ async def bulk_upload(sid: str, eid: str, files: list[UploadFile] = File(...)):
     """Files named by shot id (S03_SH02.png) become uploaded first frames."""
     s = _s()
     e = _ep(sid, eid)
+    s = settings_mod.for_episode(s, e)
     ids = {sh["id"].upper(): sh["id"] for sh in e["shots"]}
     matched, skipped = [], []
     b = store.bible(sid)

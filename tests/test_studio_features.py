@@ -354,3 +354,24 @@ def test_app_manifest_and_worker(client):
     assert worker.status_code==200
     assert worker.headers['service-worker-allowed']=='/'
     assert worker.headers['cache-control']=='no-cache'
+
+
+def test_portrait_episode_upload_keeps_its_own_dimensions(client):
+    import io
+    from PIL import Image
+    sid,eid,sh=project(client)
+    def portrait(e):
+        e['video']={'width':512,'height':910,'fps':30}
+        e['image']={'width':512,'height':910}
+    store.update_episode(sid,eid,portrait)
+    before=settings.load()
+    context=settings.for_episode(before,store.get_episode(sid,eid))
+    assert context['minimax_local']['height'] > context['minimax_local']['width']
+    assert before['video']['width']==1024 and before['video']['height']==576
+    response=client.get(f'/api/s/{sid}/e/{eid}').json()
+    assert response['_settings']['video']=={'width':512,'height':910,'fps':30}
+    photo=io.BytesIO();Image.new('RGB',(256,455),'blue').save(photo,format='PNG')
+    response=client.post(f'/api/s/{sid}/e/{eid}/shots/{sh["id"]}/upload_frame',files={'file':('portrait.png',photo.getvalue(),'image/png')})
+    assert response.status_code==200
+    file=response.json()['shots'][0]['frame']['candidates'][-1]['file']
+    assert Image.open(store.abs_media(file)).size==(512,910)

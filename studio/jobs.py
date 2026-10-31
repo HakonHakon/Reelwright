@@ -302,6 +302,7 @@ def _ep_path(sid, eid, *parts):
 def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
     s, c = _ctx()
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     b = store.bible(sid)
     shots = [sh for sh in e["shots"] if (not shot_ids or sh["id"] in shot_ids)]
     todo = []
@@ -475,6 +476,7 @@ def job_refine(job, sid, eid, shot_id, cand_index, engine="flux_lora", denoise=0
     _gpu_prepare(job, s, c)
     b = store.bible(sid)
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     sh = store.find_shot(e, shot_id)
     cand = sh["frame"]["candidates"][int(cand_index)]
     name = c.upload(store.abs_media(cand["file"]), f"studio_{eid}_{shot_id}_refine_{int(time.time())}.png")
@@ -530,6 +532,7 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
     s, c = _ctx()
     b = store.bible(sid)
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     shots = sorted(e["shots"], key=lambda x: x["order"])
     todo = [sh for sh in shots if (not shot_ids or sh["id"] in shot_ids)
             and not (sh["takes"].get("locked") and not force)
@@ -659,6 +662,7 @@ def _first_frame_for(job, s, sid, eid, e, sh):
 def job_animatic(job, sid, eid):
     s, _ = _ctx()
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     items = []
     for sh in sorted(e["shots"], key=lambda x: x["order"]):
         sel = _selected_frame(sh) or (sh["frame"]["candidates"][0] if sh["frame"]["candidates"] else None)
@@ -677,6 +681,7 @@ def job_animatic(job, sid, eid):
 def job_cut(job, sid, eid):
     s, _ = _ctx()
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     b = store.bible(sid)
     v = s["video"]
     work = _ep_path(sid, eid, "out", "work")

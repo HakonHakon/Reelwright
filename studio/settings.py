@@ -178,3 +178,21 @@ def raw_user() -> dict:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
             return json.load(f)
     return {}
+
+
+def for_episode(s: dict, episode: dict) -> dict:
+    """Apply a project's portrait/landscape output sizes without changing other projects."""
+    if not episode.get('video') and not episode.get('image'):
+        return s
+    import math
+    result = copy.deepcopy(s)
+    for key in ('video', 'image'):
+        if episode.get(key):
+            result[key].update(episode[key])
+    if episode.get('video'):
+        ratio = result['video']['width'] / result['video']['height']
+        h3 = result['minimax_local']
+        pixels = h3['width'] * h3['height']
+        h3['width'] = max(32, round(math.sqrt(pixels * ratio) / 32) * 32)
+        h3['height'] = max(32, round(math.sqrt(pixels / ratio) / 32) * 32)
+    return result

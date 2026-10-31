@@ -95,6 +95,9 @@ DEFAULTS = {
     "face_correction": {
         "model": "keep", "keep_dir": "", "codeformer_dir": "",
         "python": "", "fidelity": 0.8,
+        "identity_unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "identity_lora": "h3_character_swap_v1.5.safetensors",
+        "identity_turbo_lora": "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
     },
     "loudness_lufs": -16,
     "continuity": {

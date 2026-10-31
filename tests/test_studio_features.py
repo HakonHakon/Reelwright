@@ -375,3 +375,68 @@ def test_portrait_episode_upload_keeps_its_own_dimensions(client):
     assert response.status_code==200
     file=response.json()['shots'][0]['frame']['candidates'][-1]['file']
     assert Image.open(store.abs_media(file)).size==(512,910)
+
+
+def test_character_identity_correction_uses_uploaded_portrait(client, monkeypatch, tmp_path):
+    from studio import app as app_module, face_correction
+    sid, eid, sh = project(client)
+    url = f'/api/s/{sid}/e/{eid}/shots/{sh["id"]}/face_correction'
+    assert client.post(url, json={'model': 'minimax_identity'}).status_code == 400
+    photo = tmp_path / 'hakon.png'
+    photo.write_bytes(b'portrait')
+    character = store.new_character('Hakon', refs=[store.rel(str(photo))])
+    store.save_character(sid, character)
+    store.update_episode(sid, eid, lambda e: e['shots'][0].update(characters=[{'id': character['id']}]))
+    monkeypatch.setattr(app_module, '_submit', lambda *args, **kw: kw)
+    response = client.post(url, json={'model': 'minimax_identity', 'index': 2})
+    assert response.status_code == 200
+    assert response.json()['source_file'] == 'take2.mp4'
+    calls = []
+    monkeypatch.setattr(face_correction, 'match_identity', lambda *args: calls.append(args))
+    monkeypatch.setattr(jobs.comfy_mod.Comfy, 'alive', lambda *args: False)
+    monkeypatch.setattr(jobs.llm, 'unload', lambda *args: None)
+    jobs.job_face_correction(jobs.Job('face', 'test', None, {}), **response.json())
+    assert calls[0][-1]['refs'] == character['refs']
+    takes = store.get_episode(sid, eid)['shots'][0]['takes']
+    assert takes['selected'] == 2 and takes['items'][2]['file'] == 'take2.mp4'
+    assert takes['items'][-1]['character_refs'] == character['refs']
+    assert takes['items'][-1]['face_correction'] == 'minimax_identity'
+
+
+def test_reference_identity_edit_preserves_source_soundtrack(client, monkeypatch, tmp_path):
+    import shutil
+    import subprocess
+    from studio import face_correction, comfy, media
+    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+        pytest.skip('requires ffmpeg and ffprobe')
+    source, generated, destination = [tmp_path / name for name in ('source.mp4', 'generated.mp4', 'result.mp4')]
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+                    'color=c=blue:s=64x96:r=30:d=0.5', '-f', 'lavfi', '-i',
+                    'sine=frequency=440:duration=0.5', '-c:v', 'libx264', '-c:a', 'aac', str(source)], check=True)
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+                    'color=c=red:s=64x96:r=24:d=2.5', '-c:v', 'libx264', str(generated)], check=True)
+    portrait = tmp_path / 'portrait.png'; portrait.write_bytes(b'portrait')
+    uploaded, graphs = [], []
+    monkeypatch.setattr(comfy.Comfy, 'upload', lambda self, path, name: uploaded.append(path) or name)
+    def run(self, graph, cancel):
+        assert not cancel()
+        graphs.append(graph)
+        return {'videos': [{'filename': 'generated.mp4', 'type': 'output'}]}
+    monkeypatch.setattr(comfy.Comfy, 'run', run)
+    monkeypatch.setattr(comfy.Comfy, 'download', lambda self, item, dest: shutil.copyfile(generated, dest))
+    cfg = settings.load(); cfg.update(ffmpeg=shutil.which('ffmpeg'), ffprobe=shutil.which('ffprobe'))
+    face_correction.match_identity(jobs.Job('face', 'test', None, {}), cfg, str(source), str(destination),
+                                   {'name': 'Hakon', 'refs': [store.rel(str(portrait))]})
+    graph = graphs[0]
+    assert str(portrait) in uploaded
+    assert graph['6']['inputs']['ref_images.ref_image_0'] == ['5', 0]
+    assert graph['6']['inputs']['ref_videos.ref_video_0'] == ['18', 0]
+    assert graph['1']['inputs']['unet_name'] == cfg['face_correction']['identity_unet']
+    assert graph['19']['inputs']['lora_name'] == cfg['face_correction']['identity_lora']
+    before, after = media.probe('ffprobe', str(source)), media.probe('ffprobe', str(destination))
+    assert after['width'] == 64 and after['height'] == 96 and after['fps'] == 30
+    assert abs(before['duration'] - after['duration']) < .04
+    def audio_hash(path):
+        return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-map', '0:a:0',
+                                       '-c:a', 'copy', '-f', 'hash', '-hash', 'sha256', '-'])
+    assert audio_hash(source) == audio_hash(destination)

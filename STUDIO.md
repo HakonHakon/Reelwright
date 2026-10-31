@@ -58,6 +58,23 @@ The default **KEEP** is intended for temporal consistency on a single main face;
 Neither is a guaranteed improvement for stylised characters or identity errors.
 Frame rate and original audio are retained.
 
+For an incorrect character identity, choose **Match character references · MiniMax H3**
+on Takes. This conditions a local video edit on the character's uploaded portraits
+and the source performance, rather than sharpening the existing face. It supports
+single-character takes up to 15 seconds. The original soundtrack and take are retained;
+review the new version for likeness, motion and foreground objects before selecting it.
+This generative edit can alter expressions or scene details.
+
+In addition to the local H3 text encoder and video VAE, install these in ComfyUI:
+- `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` from
+  [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).
+- `loras/h3_character_swap_v1.5.safetensors` from
+  [akatz-ai/MiniMax-H3-Character-Swap-LoRA](https://huggingface.co/akatz-ai/MiniMax-H3-Character-Swap-LoRA).
+- `loras/minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` from
+  [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo).
+
+Their names can be configured under **Models → Local character reference files**.
+
 Install the chosen upstream restorer in its own Python environment using its instructions:
 - KEEP: https://github.com/jnjaby/KEEP (clone recursively, install dependencies and weights).
 - CodeFormer: https://github.com/sczhou/CodeFormer (install dependencies and weights).

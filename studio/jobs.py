@@ -745,10 +745,21 @@ def job_face_correction(job, sid, eid, shot_id, source_file, model="keep"):
     llm.unload(s["ollama_host"], [s["planner_model"], s["vision_model"]])
     destination = os.path.join(_ep_path(sid, eid, "takes", shot_id), f"face_{uuid.uuid4().hex}.mp4")
     started = time.monotonic()
-    face_correction.restore(job, s, store.abs_media(source_file), destination, model)
+    if model == "minimax_identity":
+        if len(sh.get("characters", [])) != 1:
+            raise ValueError("Character reference correction needs a single-character shot")
+        character = store.get_character(sid, sh["characters"][0]["id"])
+        if not character:
+            raise ValueError("The shot's character was removed")
+        face_correction.match_identity(job, s, store.abs_media(source_file), destination, character)
+    else:
+        face_correction.restore(job, s, store.abs_media(source_file), destination, model)
     job.check()
     item = {**original, "file": store.rel(destination), "source_take": source_file,
             "face_correction": model, "created": store.now(), "render_s": round(time.monotonic() - started)}
+    if model == "minimax_identity":
+        item.update(model="MiniMax H3 · character references", engine="minimax_local",
+                    character_refs=list(character["refs"]), flags=["Character likeness needs review"])
     def apply(ep):
         take = store.find_shot(ep, shot_id)["takes"]
         take["items"].append(item)

@@ -461,7 +461,7 @@ function takeCard(ctx, sh) {
       <span class="chip accent">${esc(sh._engine)}</span><span class="muted">${sh.duration_s}s · ${esc(sh.start_mode)}</span>
       ${f ? `<img src="${media(f.file)}" style="height:40px;border-radius:4px" data-zoom="${media(f.file)}">` : sh.start_mode === "chain" ? `<span class="chip">frame from previous take</span>` : `<span class="chip bad">no frame</span>`}
       ${sh.end_frame ? `<span class="chip">end frame</span>` : ""}<span class="grow"></span>
-      <select id="face-${sh.id}" aria-label="Face correction model"><option value="keep" ${ctx.e._settings.face_model === "keep" ? "selected" : ""}>KEEP (main face, temporal)</option><option value="codeformer" ${ctx.e._settings.face_model === "codeformer" ? "selected" : ""}>CodeFormer (all faces)</option></select>
+      <select id="face-${sh.id}" aria-label="Face correction model"><option value="minimax_identity" ${ctx.e._settings.face_model === "minimax_identity" ? "selected" : ""}>Match character references · MiniMax H3</option><option value="keep" ${ctx.e._settings.face_model === "keep" ? "selected" : ""}>KEEP (main face, temporal)</option><option value="codeformer" ${ctx.e._settings.face_model === "codeformer" ? "selected" : ""}>CodeFormer (all faces)</option></select>
       <button data-more="1" data-shot="${sh.id}">Render more takes</button>
       <button data-next="1" data-shot="${sh.id}" title="extract the last frame of the selected take as the next shot's first frame">Last frame → next shot</button>
       <button data-lock="${sh.takes.locked ? 0 : 1}" data-shot="${sh.id}">${sh.takes.locked ? "Unlock" : "Lock"}</button></div>

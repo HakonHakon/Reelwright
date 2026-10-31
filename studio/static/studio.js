@@ -632,19 +632,25 @@ async function viewModels(view) {
     <h2>MiniMax cloud (optional, paid)</h2><p>Cloud generation sends your first frame and prompt to MiniMax and uses your paid API account. Set <code>${esc(cfg.minimax.api_key_env)}</code> in the server environment, then restart Studio.</p>
     <div class="card form-grid"><div><label>Default MiniMax model</label><select id="mm-model">${models.filter(m => m.engine === "minimax").map(m => `<option value="${esc(m.id)}" ${m.id === cfg.minimax.model ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></div>
     <div><label>Resolution</label><select id="mm-resolution">${["768P", "1080P"].map(x => `<option ${x === cfg.minimax.resolution ? "selected" : ""}>${x}</option>`).join("")}</select></div></div>
-    <h2>Face correction</h2><p>KEEP uses temporal information for a single main face. CodeFormer can restore multiple faces with adjustable identity fidelity. Install the chosen model separately; see STUDIO.md. Each correction adds a take for comparison.</p>
-    <div class="card form-grid"><div><label>Default correction model</label><select id="face-model"><option value="keep" ${face.model === "keep" ? "selected" : ""}>KEEP · temporal video restoration</option><option value="codeformer" ${face.model === "codeformer" ? "selected" : ""}>CodeFormer · multiple faces</option></select></div>
+    <h2>Face correction</h2><p>Match character references uses the uploaded character portraits and source take together with local MiniMax H3 and the Character Swap adapter. For single-character takes up to 15 seconds; adds a version for review and preserves the source soundtrack. KEEP uses temporal information for a single main face. CodeFormer can restore multiple faces with adjustable identity fidelity. Install the chosen model separately; see STUDIO.md. Each correction adds a take for comparison.</p>
+    <div class="card form-grid"><div><label>Default correction model</label><select id="face-model"><option value="minimax_identity" ${face.model === "minimax_identity" ? "selected" : ""}>MiniMax H3 · match character references</option><option value="keep" ${face.model === "keep" ? "selected" : ""}>KEEP · temporal video restoration</option><option value="codeformer" ${face.model === "codeformer" ? "selected" : ""}>CodeFormer · multiple faces</option></select></div>
     <div><label>Restorer Python executable (blank: Studio Python)</label><input id="face-python" value="${esc(face.python)}"></div>
     <div><label>KEEP installation folder</label><input id="keep-dir" value="${esc(face.keep_dir)}"></div>
     <div><label>CodeFormer installation folder</label><input id="codeformer-dir" value="${esc(face.codeformer_dir)}"></div>
     <div><label>CodeFormer identity fidelity (0–1)</label><input type="number" id="face-fidelity" min="0" max="1" step="0.05" value="${face.fidelity}"></div></div>
+    <details><summary>Local character reference files</summary><div class="form-grid">
+    <div><label>MiniMax Ref2VA checkpoint</label><input id="identity-unet" value="${esc(face.identity_unet)}"></div>
+    <div><label>Character Swap adapter</label><input id="identity-lora" value="${esc(face.identity_lora)}"></div>
+    <div><label>Eight-step Turbo adapter</label><input id="identity-turbo" value="${esc(face.identity_turbo_lora)}"></div></div></details>
     <button class="primary" id="save-models">Save model settings</button>`;
   $("#save-models").onclick = async () => {
     const user = {...settings.user,
       minimax: {...(settings.user.minimax || {}), model: $("#mm-model").value, resolution: $("#mm-resolution").value},
       face_correction: {...(settings.user.face_correction || {}), model: $("#face-model").value,
         python: $("#face-python").value.trim(), keep_dir: $("#keep-dir").value.trim(),
-        codeformer_dir: $("#codeformer-dir").value.trim(), fidelity: Number($("#face-fidelity").value)}};
+        codeformer_dir: $("#codeformer-dir").value.trim(), fidelity: Number($("#face-fidelity").value),
+        identity_unet: $("#identity-unet").value.trim(), identity_lora: $("#identity-lora").value.trim(),
+        identity_turbo_lora: $("#identity-turbo").value.trim()}};
     await PUT("/api/settings", user); toast("Model settings saved.");
   };
 }

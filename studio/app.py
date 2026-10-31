@@ -124,6 +124,12 @@ def _required_model_options(s):
         require("VAELoader", "vae_name", h["video_vae"], h["audio_vae"])
         if h.get("lora"):
             require("LoraLoaderModelOnly", "lora_name", h["lora"])
+    if s["face_correction"]["model"] == "minimax_identity":
+        face, h = s["face_correction"], s["minimax_local"]
+        require("UNETLoader", "unet_name", face["identity_unet"])
+        require("CLIPLoader", "clip_name", h["clip"])
+        require("VAELoader", "vae_name", h["video_vae"])
+        require("LoraLoaderModelOnly", "lora_name", face["identity_lora"], face["identity_turbo_lora"])
     return needed
 
 
@@ -667,8 +673,14 @@ def face_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default=
     if type(index) is not int or not 0 <= index < len(sh["takes"]["items"]):
         raise HTTPException(400, "Choose an existing take first")
     model = body.get("model") or _s()["face_correction"]["model"]
-    if model not in ("keep", "codeformer"):
+    if model not in ("keep", "codeformer", "minimax_identity"):
         raise HTTPException(400, "Unknown face correction model")
+    if model == "minimax_identity":
+        if len(sh.get("characters", [])) != 1:
+            raise HTTPException(400, "Character reference correction needs a single-character shot")
+        character = store.get_character(sid, sh["characters"][0]["id"])
+        if not character or not any(os.path.isfile(store.abs_media(p)) for p in character.get("refs", []) if p):
+            raise HTTPException(400, "Upload a reference photo for this character in Characters first")
     return _submit("face_correction", f"Face correction: {shot_id}", jobs.job_face_correction,
                    sid=sid, eid=eid, shot_id=shot_id,
                    source_file=sh["takes"]["items"][index]["file"], model=model)

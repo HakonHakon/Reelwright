@@ -276,3 +276,34 @@ def minimax_h3_i2v(s: dict, prompt: str, first_frame: str, frames: int, seed: in
         wf["17"] = {"class_type": "LoadImage", "inputs": {"image": end_frame}}
         wf["6"]["inputs"]["last_frame"] = ["17", 0]
     return wf
+
+
+def minimax_h3_reference_edit(s: dict, prompt: str, references: list[str], video: str,
+                             frames: int, seed: int, width: int, height: int,
+                             prefix: str = "studio/identity") -> dict:
+    """Character portraits and source performance condition the Ref2VA model together."""
+    cfg = copy.deepcopy(s)
+    face = cfg["face_correction"]
+    cfg["minimax_local"].update(unet=face["identity_unet"], lora=face["identity_turbo_lora"],
+                               steps=8, width=width, height=height)
+    wf = minimax_h3_i2v(cfg, prompt, references[0], frames, seed, prefix=prefix)
+    inputs = {"clip": ["2", 0], "vae": ["3", 0], "prompt": prompt, "width": width,
+              "height": height, "length": frames, "ref_image_size": "max",
+              "ref_videos.ref_video_0": ["18", 0]}
+    for i, image in enumerate(references):
+        nid = "5" if i == 0 else str(50 + i)
+        wf[nid] = {"class_type": "LoadImage", "inputs": {"image": image}}
+        inputs[f"ref_images.ref_image_{i}"] = [nid, 0]
+    wf["6"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
+    wf["17"] = {"class_type": "LoadVideo", "inputs": {"file": video}}
+    wf["18"] = {"class_type": "GetVideoComponents", "inputs": {"video": ["17", 0]}}
+    wf["19"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+        "model": ["16", 0], "lora_name": face["identity_lora"], "strength_model": 1.0}}
+    wf["9"]["inputs"].update(model=["19", 0], scheduler="normal")
+    wf["10"]["inputs"]["model"] = ["19", 0]
+    wf["8"]["inputs"]["sampler_name"] = "er_sde"
+    # The original soundtrack is remuxed by the caller.
+    wf.pop("4")
+    wf.pop("13")
+    wf["14"]["inputs"].pop("audio")
+    return wf

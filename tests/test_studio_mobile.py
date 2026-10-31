@@ -150,3 +150,29 @@ def test_installable_shell_and_offline_recovery(mobile_server):
         page.get_by_role('heading',name='Projects',exact=True).wait_for()
         assert len(requests.get(base+'/api/series').json())==1
         browser.close()
+
+
+def test_character_reference_correction_model_settings(mobile_server):
+    from studio import settings
+    base, sid, eid = mobile_server
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True)
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        page.route('**/api/status', lambda route: route.fulfill(json={'comfy': False, 'comfy_host': 'local',
+                    'ollama_models': [], 'loras': [], 'missing': []}))
+        page.goto(f'{base}/#/models')
+        page.locator('#face-model').select_option('minimax_identity')
+        page.get_by_text('Local character reference files', exact=True).tap()
+        page.locator('#identity-unet').fill('custom-ref2va.safetensors')
+        page.locator('#save-models').tap()
+        page.get_by_text('Model settings saved.', exact=True).wait_for()
+        cfg = settings.load()['face_correction']
+        assert cfg['model'] == 'minimax_identity'
+        assert cfg['identity_unet'] == 'custom-ref2va.safetensors'
+        assert cfg['identity_lora'] == 'h3_character_swap_v1.5.safetensors'
+        page.goto(f'{base}/#/s/{sid}/e/{eid}/takes')
+        assert page.locator('#face-S01_SH01').input_value() == 'minimax_identity'
+        assert not errors, errors
+        browser.close()

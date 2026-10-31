@@ -147,6 +147,9 @@ class Comfy:
                 for item in out.get(key, []) or []:
                     if not isinstance(item, dict) or not item.get("filename"):
                         continue
+                    # LoadVideo reports its input in history too; it is not a generated take.
+                    if item.get("type") == "input":
+                        continue
                     fn = item["filename"].lower()
                     if fn.endswith((".mp4", ".webm", ".mov", ".mkv")):
                         videos.append(item)

@@ -53,3 +53,36 @@ FL2VA INT8 weights, the Qwen3-VL NVFP4 encoder, native video/audio VAEs, and a
 4-step Turbo LoRA. These are separate from the paid MiniMax Hailuo API models.
 Downloads and the hardware check are logged in `.runtime/download-h3.log` and
 `.runtime/h3-inference-check.log`. No API key is used for this engine.
+
+## Android and iPhone home-screen app
+
+Mobile upload/crop fixes work at the existing HTTP address:
+http://192.168.1.133:8020/
+
+The installable PWA uses the local HTTPS reverse proxy:
+https://192.168.1.133:8443/
+
+Open the HTTP address first and tap **Install app** in the bottom navigation.
+Its instructions link to this computer's public local CA certificate at `/local-ca.crt`.
+Install/trust that certificate on each phone, then open the HTTPS address.
+Android: Chrome menu → Install app / Add to Home screen.
+iPhone/iPad: Safari Share → Add to Home Screen (enable Open as Web App if shown).
+
+The certificate trust step must be performed on the phone. On iPhone, installing the
+profile is followed by enabling full trust under Settings → General → About →
+Certificate Trust Settings. Android's CA import is under Security → Encryption &
+credentials, with menu names varying by manufacturer.
+
+Caddy runs as `reelwright-https.service` and automatically renews local server
+certificates. Its config and private CA keys remain in `.runtime/caddy/`; only the
+public root is served to phones. The per-installation public certificate is excluded
+from Git. Existing port 8020 continues working without certificate installation.
+
+```bash
+systemctl --user status reelwright-https
+journalctl --user -u reelwright-https -f
+```
+
+Uploads, saved projects and GPU generation require this PC and the same home
+network. The service worker caches only app assets and an offline explanation;
+it never caches project API responses/media or queues offline edits/uploads.

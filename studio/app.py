@@ -7,7 +7,7 @@ import shutil
 import time
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
@@ -328,7 +328,7 @@ def _decorate(sid: str, e: dict) -> dict:
     e["_runtime"] = planner.runtime_seconds(shots)
     e["_estimate_s"] = round(planner.estimate_render_seconds(shots, e["stats"].get("spf", {}), int(s["takes_per_shot"])))
     e["_settings"] = {"takes_per_shot": s["takes_per_shot"], "candidates_per_shot": s["candidates_per_shot"],
-                      "video": s["video"], "face_model": s["face_correction"]["model"], "ltx_max": s["ltx"]["max_seconds"], "wan_max": s["wan"]["max_seconds"]}
+                      "video": s["video"], "image": s["image"], "face_model": s["face_correction"]["model"], "ltx_max": s["ltx"]["max_seconds"], "wan_max": s["wan"]["max_seconds"]}
     return e
 
 
@@ -434,7 +434,10 @@ async def shot_upload_frame(sid: str, eid: str, shot_id: str, file: UploadFile =
     raw = await _save_upload(file, os.path.join(store.ep_dir(sid, eid), "uploads"))
     out_dir = os.path.join(store.ep_dir(sid, eid), "frames", shot_id)
     dst = os.path.join(out_dir, f"{'end' if end else 'u'}_{int(time.time() * 1000)}.png")
-    media.fit_image(raw, dst, s["image"]["width"], s["image"]["height"], json.loads(crop) if crop else None)
+    try:
+        media.fit_image(raw, dst, s["image"]["width"], s["image"]["height"], json.loads(crop) if crop else None)
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(400, "Could not read this photo or crop. Choose a valid JPEG, PNG, WebP or HEIC image.") from exc
     b = store.bible(sid)
 
     def apply(ep):
@@ -673,3 +676,34 @@ def face_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default=
 def video_models():
     from .providers import VIDEO_MODELS
     return VIDEO_MODELS
+
+
+
+@app.post("/api/image_preview")
+async def image_preview(file: UploadFile = File(...)):
+    data = await file.read(30 * 1024 * 1024 + 1)
+    if len(data) > 30 * 1024 * 1024:
+        raise HTTPException(413, "Choose a photo smaller than 30 MB")
+    try:
+        return Response(media.image_preview(data), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    except (OSError, ValueError) as exc:
+        raise HTTPException(415, "This photo could not be opened. Try a JPEG, PNG, WebP or HEIC image.") from exc
+
+
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse(os.path.join(HERE, "static", "sw.js"), media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
+@app.get("/api/mobile")
+def mobile_config():
+    return {"https_url": _s().get("mobile", {}).get("https_url", "")}
+
+
+@app.get("/local-ca.crt")
+def local_certificate():
+    path = os.path.join(HERE, "static", "reelwright-local-ca.crt")
+    if not os.path.isfile(path):
+        _404("local HTTPS certificate")
+    return FileResponse(path, media_type="application/x-x509-ca-cert", filename="Reelwright-Local-CA.crt")

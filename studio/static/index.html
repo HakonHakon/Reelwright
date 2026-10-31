@@ -2,8 +2,15 @@
 <html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Reelwright</title>
+<meta name="theme-color" content="#181a19">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Reelwright">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
 <meta name="color-scheme" content="dark light">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23181a19'/%3E%3Crect x='14' y='4' width='4' height='24' fill='%23d8341f'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/studio.css">
@@ -58,6 +65,11 @@
   </div>
 </div>
 
+<button id="menu-backdrop" aria-label="Close navigation" hidden></button>
+<nav class="mobile-nav" aria-label="App navigation">
+  <a href="#/">Projects</a><button id="mobile-search">Search</button><button id="mobile-jobs">Activity</button><button id="install-app">Install app</button>
+</nav>
+<div class="network-status" id="network-status" role="status" hidden>Connection lost. Reconnect to your home network to save or render.</div>
 <div class="toasts" id="toasts"></div>
 <div class="scrim" id="scrim"></div>
 <aside class="drawer" id="jobs">
@@ -76,8 +88,9 @@
   <button class="icon-btn lb-close" id="lb-close" style="color:#fff"><svg class="i"><use href="#i-x"/></svg></button>
   <div class="lb-bar"><span id="lb-count"></span><span class="kbd">← →</span><span class="kbd">Esc</span></div>
 </div>
-<div id="modal" class="modal hidden"><div class="modal-body" id="modal-body"></div></div>
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Reelwright dialog"><div class="modal-body" id="modal-body"></div></div>
 <script src="/static/studio.js"></script>
 <script src="/static/episode.js"></script>
+<script src="/static/app-install.js"></script>
 </body>
 </html>

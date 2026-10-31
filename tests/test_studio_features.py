@@ -296,3 +296,61 @@ def test_status_checks_local_h3_models(client, monkeypatch):
     assert client.get('/api/status').json()['missing'] == [missing]
     installed.add(missing)
     assert client.get('/api/status').json()['missing'] == []
+
+
+def test_phone_photo_orientation_and_crop(client, tmp_path):
+    import io
+    from PIL import Image
+    from studio import media
+    image = Image.new('RGB', (120, 80), 'red')
+    image.paste(Image.new('RGB', (60, 80), 'lime'), (60, 0))
+    exif = image.getexif(); exif[274] = 6
+    original = tmp_path / 'phone.jpg'; image.save(original, exif=exif)
+    preview = client.post('/api/image_preview', files={'file': ('phone.jpg', original.read_bytes(), 'image/jpeg')})
+    assert preview.status_code == 200 and preview.headers['cache-control'] == 'no-store'
+    assert Image.open(io.BytesIO(preview.content)).size == (80, 120)
+    output = tmp_path / 'crop.png'
+    media.fit_image(str(original), str(output), 80, 60, {'x': 0, 'y': .5, 'w': 1, 'h': .5})
+    pixel = Image.open(output).getpixel((40, 30))
+    assert pixel[1] > 220 and pixel[0] < 40
+
+
+def test_heic_preview_and_upload(client, tmp_path):
+    import io,json
+    from PIL import Image
+    from pillow_heif import from_pillow
+    photo = tmp_path / 'phone.heic'
+    from_pillow(Image.new('RGB', (120, 80), 'blue')).save(photo)
+    preview = client.post('/api/image_preview', files={'file': ('phone.heic', photo.read_bytes(), 'image/heic')})
+    assert preview.status_code == 200
+    assert Image.open(io.BytesIO(preview.content)).size == (120, 80)
+    sid,eid,sh = project(client)
+    response = client.post(f'/api/s/{sid}/e/{eid}/shots/{sh["id"]}/upload_frame',
+                           files={'file': ('phone.heic', photo.read_bytes(), 'image/heic')},
+                           data={'crop': json.dumps({'x': 0, 'y': 0, 'w': 1, 'h': 1})})
+    assert response.status_code == 200
+    candidate = response.json()['shots'][0]['frame']['candidates'][-1]
+    assert Image.open(store.abs_media(candidate['file'])).getpixel((100,100))[2] > 220
+
+
+def test_invalid_mobile_photo_and_crop_return_clear_errors(client, tmp_path):
+    import io,json
+    from PIL import Image
+    assert client.post('/api/image_preview', files={'file': ('broken.jpg', b'bad', 'image/jpeg')}).status_code == 415
+    sid,eid,sh=project(client)
+    data=io.BytesIO();Image.new('RGB',(64,64)).save(data,format='PNG')
+    response=client.post(f'/api/s/{sid}/e/{eid}/shots/{sh["id"]}/upload_frame',
+                         files={'file': ('photo.png',data.getvalue(),'image/png')},
+                         data={'crop':json.dumps({'x':0,'y':0,'w':-1,'h':1})})
+    assert response.status_code==400
+    assert len(store.get_episode(sid,eid)['shots'][0]['frame']['candidates'])==1
+
+
+def test_app_manifest_and_worker(client):
+    manifest=client.get('/static/manifest.webmanifest').json()
+    assert manifest['display']=='standalone' and manifest['scope']=='/'
+    assert {icon['sizes'] for icon in manifest['icons']}=={'192x192','512x512'}
+    worker=client.get('/sw.js')
+    assert worker.status_code==200
+    assert worker.headers['service-worker-allowed']=='/'
+    assert worker.headers['cache-control']=='no-cache'

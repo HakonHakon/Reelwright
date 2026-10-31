@@ -85,9 +85,14 @@ function toast(msg, bad) {
 }
 
 // ── modal + lightbox gallery ─────────────────────────────────────────────
-function modal(html) { $("#modal-body").innerHTML = html; $("#modal").classList.remove("hidden"); }
+let modalCleanup = null;
+function modal(html) { closeModal(); $("#lightbox").classList.remove("on"); document.body.classList.add("modal-open"); $("#modal-body").innerHTML = html; $("#modal").classList.remove("hidden"); }
 let askDone = null;
 function closeModal() {
+  document.body.classList.remove("modal-open");
+  const cleanup = modalCleanup; modalCleanup = null;
+  if (cleanup) cleanup();
+  $("#modal-body").classList.remove("crop-dialog");
   $("#modal").classList.add("hidden"); $("#modal-body").innerHTML = "";
   if (askDone) { const f = askDone; askDone = null; f(false); }
 }
@@ -161,7 +166,12 @@ async function getSeries(sid) {
 }
 function setCollapsed(c) { $("#app").classList.toggle("collapsed", c); store.set("rw-collapse", c ? "1" : "0"); }
 $("#collapse-btn").onclick = () => setCollapsed(!$("#app").classList.contains("collapsed"));
-$("#menu-btn").onclick = () => $("#app").classList.toggle("menu");
+function setMenu(open) {
+  $("#app").classList.toggle("menu", open); $("#menu-backdrop").hidden = !open;
+  $("#menu-btn").setAttribute("aria-expanded", String(open));
+}
+$("#menu-btn").onclick = () => setMenu(!$("#app").classList.contains("menu"));
+$("#menu-backdrop").onclick = () => setMenu(false);
 if (store.get("rw-collapse") === "1") setCollapsed(true);
 function setTheme(t) {
   document.documentElement.dataset.theme = t; store.set("rw-theme", t);
@@ -170,7 +180,7 @@ function setTheme(t) {
 $("#theme-btn").onclick = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
 setTheme(document.documentElement.dataset.theme || "light");
 const narrow = window.matchMedia("(max-width: 980px)");
-const syncNarrow = () => { $("#menu-btn").style.display = narrow.matches ? "" : "none"; };
+const syncNarrow = () => { $("#menu-btn").style.display = narrow.matches ? "" : "none"; if (!narrow.matches) setMenu(false); };
 narrow.addEventListener("change", syncNarrow); syncNarrow();
 
 // ── status + jobs drawer ─────────────────────────────────────────────────
@@ -217,7 +227,7 @@ async function pollJobs() {
       App.lastJobs[j.id] = j.status;
     }
     if (finished && App.refreshers.length) {
-      if (App.selecting) return;
+      if (App.selecting || App.interactionBusy || !$("#modal").classList.contains("hidden")) return;
       if (App.dirty) { if (!App.dirtyWarned) { toast("New results are ready - save your edits, then reload this section."); App.dirtyWarned = true; } }
       else App.refreshers.forEach((f) => f());
     }
@@ -301,10 +311,11 @@ document.addEventListener("keydown", (e) => {
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(true); return; }
   if (e.key === "Escape") {
-    if ($("#lightbox").classList.contains("on")) $("#lightbox").classList.remove("on");
+    if (!$("#modal").classList.contains("hidden")) closeModal();
+    else if ($("#lightbox").classList.contains("on")) $("#lightbox").classList.remove("on");
     else if ($("#palette").classList.contains("on")) openPalette(false);
     else if ($("#jobs").classList.contains("on")) openJobs(false);
-    else closeModal();
+    else { setMenu(false); closeModal(); }
     return;
   }
   if ($("#lightbox").classList.contains("on")) { if (e.key === "ArrowLeft") lbStep(-1); if (e.key === "ArrowRight") lbStep(1); return; }
@@ -319,11 +330,12 @@ document.addEventListener("keydown", (e) => {
 // ── router ───────────────────────────────────────────────────────────────
 const SKELETON = `<div class="skel h1"></div><div class="skel row-card"></div><div class="skel row-card"></div>`;
 async function route() {
+  closeModal();
   App.refreshers = []; App.selecting = false; App.dirty = false; App.dirtyWarned = false;
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
   const first = !App.route.length || App.route.join("/") !== parts.join("/");
   App.route = parts;
-  $("#app").classList.remove("menu");
+  setMenu(false);
   const view = $("#view");
   if (first) { view.innerHTML = SKELETON; view.style.animation = "none"; void view.offsetHeight; view.style.animation = ""; }
   renderNav();

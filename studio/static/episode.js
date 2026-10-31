@@ -129,6 +129,9 @@ async function tabShots(el, ctx) {
             <button class="link" data-dup="${i}" title="split: duplicate below">split</button><button class="link" data-merge="${i}" title="merge with next">merge</button>
             <button class="link danger" data-del="${i}">delete</button></div></td></tr>`;
       }).join("")}</tbody></table>`;
+    $$("table.shots tbody tr:not(.scene-row)", el).forEach(row => {
+      [...row.children].forEach((cell, index) => { cell.dataset.label = ["Shot", "Framing / camera", "Where / who", "Action", "Dialogue / sound", "Timing / source", "Actions"][index]; });
+    });
     bulkSelect(el, "[data-del]", async targets => {
       const indices = targets.map(t => +t.dataset.del).sort((a,b) => b-a);
       indices.forEach(i => shots.splice(i, 1)); App.dirty = true;
@@ -174,41 +177,123 @@ async function tabShots(el, ctx) {
 // ── 3. First frames ─────────────────────────────────────────────────────
 function cropModal(file, aspect) {
   return new Promise((resolve) => {
-    const url = URL.createObjectURL(file);
-    modal(`<h3>Crop to the video frame</h3><p class="muted small">Drag the box. Use the slider to resize.</p>
-      <div class="crop-wrap" id="cw"><img id="ci" src="${url}"><div class="crop-box" id="cb"></div></div>
-      <div class="row" style="margin-top:10px"><input type="range" id="cs" min="20" max="100" value="100" class="grow">
-      <button id="cn">Cancel</button><button class="primary" id="ck">Use this crop</button></div>`);
-    const img = $("#ci"), box = $("#cb");
-    let bx = 0, by = 0, bw = 0, bh = 0;
+    const url = URL.createObjectURL(file), urls = [url], controller = new AbortController();
+    let done = false, ready = false, triedPreview = false, drag = null, observer;
+    let bx = 0, by = 0, bw = 0, bh = 0, cx = 0.5, cy = 0.5;
+    modal(`<h3>Crop your photo</h3><p id="crop-status" class="muted small" aria-live="polite">Opening photo…</p>
+      <div class="crop-stage"><div class="crop-wrap" id="cw"><img id="ci" alt="Photo to crop" draggable="false"><div class="crop-box" id="cb" tabindex="0" role="group" aria-label="Crop area. Drag or use arrow keys to move."></div></div></div>
+      <div class="crop-controls"><label for="cs">Crop size</label><input type="range" id="cs" min="20" max="100" value="100" aria-label="Crop size">
+      <div class="row"><button id="cn">Cancel</button><button class="primary" id="ck" disabled>Use this crop</button></div></div>`);
+    $("#modal-body").classList.add("crop-dialog");
+    const img = $("#ci"), box = $("#cb"), slider = $("#cs"), confirm = $("#ck"), status = $("#crop-status");
+    const finish = (value) => {
+      if (done) return;
+      done = true; modalCleanup = null; controller.abort(); observer?.disconnect();
+      urls.forEach(u => URL.revokeObjectURL(u)); closeModal(); resolve(value);
+    };
+    modalCleanup = () => finish(null);
     const layout = () => {
-      const W = img.clientWidth, H = img.clientHeight, s = +$("#cs").value / 100;
-      if (W / H > aspect) { bh = H * s; bw = bh * aspect; } else { bw = W * s; bh = bw / aspect; }
-      bx = Math.min(Math.max(0, bx), W - bw); by = Math.min(Math.max(0, by), H - bh);
-      Object.assign(box.style, { left: bx + "px", top: by + "px", width: bw + "px", height: bh + "px" });
+      if (!ready || done) return;
+      const W = img.clientWidth, H = img.clientHeight, scale = Number(slider.value) / 100;
+      if (!W || !H) return;
+      if (W / H > aspect) { bh = H * scale; bw = bh * aspect; } else { bw = W * scale; bh = bw / aspect; }
+      bx = Math.max(0, Math.min(W - bw, cx * W - bw / 2));
+      by = Math.max(0, Math.min(H - bh, cy * H - bh / 2));
+      cx = (bx + bw / 2) / W; cy = (by + bh / 2) / H;
+      Object.assign(box.style, {left: `${bx}px`, top: `${by}px`, width: `${bw}px`, height: `${bh}px`});
     };
-    img.onload = () => { layout(); bx = (img.clientWidth - bw) / 2; by = (img.clientHeight - bh) / 2; layout(); };
-    $("#cs").oninput = layout;
-    let drag = null;
-    box.onmousedown = (e) => { drag = { x: e.clientX - bx, y: e.clientY - by }; e.preventDefault(); };
-    window.onmousemove = (e) => { if (drag) { bx = e.clientX - drag.x; by = e.clientY - drag.y; layout(); } };
-    window.onmouseup = () => { drag = null; };
-    $("#cn").onclick = () => { closeModal(); resolve(null); };
-    $("#ck").onclick = () => {
-      const W = img.clientWidth, H = img.clientHeight;
-      closeModal(); URL.revokeObjectURL(url);
-      resolve({ x: bx / W, y: by / H, w: bw / W, h: bh / H });
+    img.onload = () => {
+      if (done) return;
+      ready = true; confirm.disabled = false;
+      status.textContent = "Drag the frame with your finger. Adjust its size below.";
+      layout();
     };
+    img.onerror = async () => {
+      if (done) return;
+      ready = false; confirm.disabled = true;
+      if (triedPreview) { status.textContent = "This photo could not be opened. Choose another photo."; return; }
+      triedPreview = true; status.textContent = "Preparing photo…";
+      try {
+        const fd = new FormData(); fd.append("file", file);
+        const response = await fetch("/api/image_preview", {method: "POST", body: fd, signal: controller.signal});
+        if (!response.ok) { const data = await response.json(); throw new Error(data.detail || "Could not open photo"); }
+        const preview = URL.createObjectURL(await response.blob());
+        if (done) { URL.revokeObjectURL(preview); return; }
+        urls.push(preview); img.src = preview;
+      } catch (error) { if (!done) status.textContent = error.message; }
+    };
+    box.onpointerdown = (event) => {
+      if (!ready || (event.pointerType === "mouse" && event.button !== 0)) return;
+      drag = {id: event.pointerId, x: event.clientX, y: event.clientY, cx, cy};
+      box.setPointerCapture(event.pointerId); event.preventDefault();
+    };
+    box.onpointermove = (event) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      cx = drag.cx + (event.clientX - drag.x) / img.clientWidth;
+      cy = drag.cy + (event.clientY - drag.y) / img.clientHeight;
+      layout(); event.preventDefault();
+    };
+    box.onpointerup = box.onpointercancel = box.onlostpointercapture = () => { drag = null; };
+    box.onkeydown = (event) => {
+      const step = event.shiftKey ? 20 : 5;
+      if (event.key === "ArrowLeft") cx -= step / img.clientWidth;
+      else if (event.key === "ArrowRight") cx += step / img.clientWidth;
+      else if (event.key === "ArrowUp") cy -= step / img.clientHeight;
+      else if (event.key === "ArrowDown") cy += step / img.clientHeight;
+      else return;
+      layout(); event.preventDefault();
+    };
+    slider.oninput = layout;
+    observer = new ResizeObserver(layout); observer.observe(img);
+    const tap = (button, action) => {
+      let start = null;
+      button.onclick = action;
+      button.onpointerdown = event => {
+        if (event.pointerType !== "mouse") { start = {x: event.clientX, y: event.clientY}; event.preventDefault(); }
+      };
+      button.onpointercancel = () => { start = null; };
+      button.onpointerup = event => {
+        if (!start || event.pointerType === "mouse") return;
+        const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y); start = null;
+        if (moved < 12) {
+          event.preventDefault();
+          // Closing a touch dialog can otherwise send a compatibility click to the screen underneath.
+          const suppress = click => {
+            if (click.detail && Math.hypot(click.clientX - event.clientX, click.clientY - event.clientY) < 30) {
+              click.preventDefault(); click.stopImmediatePropagation(); document.removeEventListener("click", suppress, true);
+            }
+          };
+          document.addEventListener("click", suppress, true);
+          setTimeout(() => document.removeEventListener("click", suppress, true), 600);
+          action();
+        }
+      };
+    };
+    tap($("#cn"), () => finish(null));
+    tap(confirm, () => {
+      layout();
+      if (!ready || !img.clientWidth || !img.clientHeight) return;
+      finish({x: bx / img.clientWidth, y: by / img.clientHeight, w: bw / img.clientWidth, h: bh / img.clientHeight});
+    });
+    img.src = url;
   });
 }
 
 async function uploadFrame(ctx, shotId, file, end) {
-  const v = ctx.e._settings.video;
-  const crop = await cropModal(file, v.width / v.height);
-  if (!crop) return;
-  const fd = new FormData(); fd.append("file", file); fd.append("crop", JSON.stringify(crop)); if (end) fd.append("end", "1");
-  await FORM(`${ctx.base}/shots/${shotId}/upload_frame`, fd);
-  toast(end ? "End frame set." : "Uploaded and selected."); reload();
+  if (App.interactionBusy) return toast("Finish the current photo first.");
+  App.interactionBusy = true;
+  try {
+    const size = ctx.e._settings.image || ctx.e._settings.video;
+    const crop = await cropModal(file, size.width / size.height);
+    if (!crop) return;
+    modal(`<h3>Uploading photo…</h3><p role="status">Keep this screen open while your photo is saved.</p><progress aria-label="Uploading photo"></progress>`);
+    const fd = new FormData(); fd.append("file", file); fd.append("crop", JSON.stringify(crop)); if (end) fd.append("end", "1");
+    await FORM(`${ctx.base}/shots/${shotId}/upload_frame`, fd);
+    closeModal(); toast(end ? "End frame set." : "Uploaded and selected."); await reload();
+  } catch (error) {
+    closeModal();
+    if (!document.querySelector(".toast.bad")) toast(error.message || "Upload failed. Please try again.", true);
+  } finally { App.interactionBusy = false; }
 }
 
 function checkChip(c) {
@@ -273,14 +358,14 @@ function frameCard(ctx, sh) {
       ${sh.frame.locked ? `<span class="chip good">locked</span>` : ""}<span class="grow"></span>
       ${chained ? "" : `<select id="src-${sh.id}"><option value="">${sourceLabel(sh._source)}</option><option value="flux_lora">Flux + LoRA</option><option value="zimage">Z-Image</option><option value="qwen_refs">Reference photos</option></select>
       <button data-render="1" data-shot="${sh.id}">Render ${ctx.e._settings.candidates_per_shot} more</button>
-      <label class="btn" style="margin:0;color:var(--ink)">Upload<input type="file" accept="image/*" data-upframe="${sh.id}" hidden></label>`}
+      <label class="btn file-pick" style="margin:0;color:var(--ink)">Upload photo<input type="file" accept="image/*,.heic,.heif" data-upframe="${sh.id}" aria-label="Upload photo for ${esc(sh.id)}"></label>`}
       <button data-lock="${sh.frame.locked ? 0 : 1}" data-shot="${sh.id}">${sh.frame.locked ? "Unlock" : "Lock"}</button></div>
     <div class="muted small">${esc(sh.action)}${(sh.dialogue || []).length ? " · " + sh.dialogue.map((d) => esc(charName(ctx, d.speaker) + ": " + d.line)).join(" / ") : ""}</div>
     <details><summary>image prompt</summary><pre class="prompt">${esc(sh._image_prompt)}</pre></details>
     ${chained ? `<p class="muted">Chained: this shot starts from the last frame of ${esc("the previous shot's")} selected take (made at the Takes stage).</p>` : ""}
     <div class="row small" style="margin:6px 0">End frame (optional, LTX):
       ${sh.end_frame ? `<img src="${media(sh.end_frame)}" style="height:44px;border-radius:4px" data-zoom="${media(sh.end_frame)}"><button class="link" data-clearend="1" data-shot="${sh.id}">clear</button>` : `<span class="muted">none</span>`}
-      <label class="link" style="margin:0;cursor:pointer;color:var(--ink);text-decoration:underline">upload end frame<input type="file" accept="image/*" data-upend="${sh.id}" hidden></label>
+      <label class="btn file-pick" style="margin:0">Upload end frame<input type="file" accept="image/*,.heic,.heif" data-upend="${sh.id}" aria-label="Upload end frame for ${esc(sh.id)}"></label>
       <span class="grow"></span>refine strength <input id="dn-${sh.id}" type="number" min="0.1" max="0.8" step="0.05" value="0.3" style="width:64px"></div>
     <div class="cands"><div class="cands-in">${cands.map((c, k) => `<div class="cand ${sh.frame.selected === k ? "sel" : ""}">
       <div class="frame"><img src="${media(c.file)}" data-zoom="${media(c.file)}" loading="lazy"></div>
@@ -382,7 +467,7 @@ function takeCard(ctx, sh) {
       <button data-lock="${sh.takes.locked ? 0 : 1}" data-shot="${sh.id}">${sh.takes.locked ? "Unlock" : "Lock"}</button></div>
     <details><summary>motion prompt</summary><pre class="prompt">${esc(sh._motion_prompt)}</pre></details>
     <div class="cands"><div class="cands-in">${items.map((t, k) => `<div class="cand ${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? "sel" : ""}">
-      <div class="frame"><video controls preload="metadata" src="${media(t.file)}"></video></div>
+      <div class="frame"><video playsinline preload="metadata" controls preload="metadata" src="${media(t.file)}"></video></div>
       <div class="meta"><span class="code">${esc(sh.id)}/T${k + 1}</span>${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? `<span class="pick">picked</span>` : ""}<span>${esc(t.model || t.engine)}${t.face_correction ? " · " + esc(t.face_correction) + " corrected" : ""}, ${t.seconds}s, ${t.render_s}s render</span> ${(t.flags || []).map((x) => `<span class="chip warn">${esc(x)}</span>`).join(" ")}</div>
       <div class="acts">${sh.takes.selected === k ? "" : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
         <button data-face="${k}" data-shot="${sh.id}">Correct faces</button>
@@ -408,7 +493,7 @@ async function tabCut(el, ctx) {
     </div>
     <p class="muted small">Each selected take is trimmed, scaled to ${e._settings.video.width}x${e._settings.video.height} @ ${e._settings.video.fps} fps and loudness-normalised, then joined. Wan takes (silent) get a silent track.</p>
     ${o.final ? `<h2>Final film ${o.runtime ? "· " + fmtSec(o.runtime) : ""}</h2>
-      <video controls src="${media(o.final)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
+      <video playsinline preload="metadata" controls src="${media(o.final)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
       <div class="row" style="margin-top:8px"><a href="${media(o.final)}" download>final.mp4</a>${o.srt ? `<a href="${media(o.srt)}" download>subtitles (.srt)</a>` : ""}
         ${o.edl ? `<a href="${media(o.edl)}" download>edit list (.edl for DaVinci Resolve)</a>` : ""}${o.animatic ? `<a href="${media(o.animatic)}" download>animatic.mp4</a>` : ""}</div>
       <p class="muted small">In Resolve: import the takes folders as media, then File > Import > Timeline > the .edl.</p>` : ""}`;

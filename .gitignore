@@ -53,3 +53,6 @@ video_director_agent/user_settings.json
 
 # Local Linux runtimes and model installations
 .runtime/
+
+# This installation’s public local HTTPS CA
+studio/static/reelwright-local-ca.crt

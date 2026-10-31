@@ -50,3 +50,9 @@ studio_data/
 video_director_agent/state/
 video_director_agent/user_settings.json
 *.bak*
+
+# Local Linux runtimes and model installations
+.runtime/
+
+# This installation’s public local HTTPS CA
+studio/static/reelwright-local-ca.crt

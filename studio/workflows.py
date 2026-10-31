@@ -104,6 +104,24 @@ def qwen_edit_image(s: dict, prompt: str, seed: int, width: int, height: int, ba
     return wf
 
 
+def qwen_correct_face(s: dict, source_image: str, ref_images: list[str], character: dict,
+                      width: int, height: int, seed: int, prefix: str = "studio/face") -> dict:
+    """Edit the source frame in place, with separate portrait identity conditioning."""
+    prompt = (
+        f"Edit image 1. Correct the person's facial identity to match {character['name']} "
+        "in image 2. Image 1 is the performance frame; image 2 is the identity reference. "
+        "Keep the exact head position, head size, perspective, gaze, expression, eyelids and mouth "
+        "opening from image 1. Preserve the original body, hair placement, hat, glasses, clothing, "
+        "hands, microphone, camera, background and stage lighting from image 1. "
+        "Change the facial anatomy, nose, cheeks, jaw, lips, skin and distinguishing facial details "
+        "to the person in image 2, naturally integrated into the original head and neck. "
+        "Match the lighting, shadows and skin colour to image 1. Use image 2 only for identity; "
+        "do not copy its pose, expression, hands, objects or background. "
+        f"Character details: {character.get('appearance', '')}")
+    return qwen_edit_image(s, prompt, seed, width, height, 1,
+                           [source_image, *ref_images[:2]], prefix)
+
+
 def _latent(wf, s, vae_id, width, height, batch, init_image, use_sd3_latent):
     if init_image:
         wf["40"] = {"class_type": "LoadImage", "inputs": {"image": init_image}}
@@ -121,6 +139,25 @@ def _latent(wf, s, vae_id, width, height, batch, init_image, use_sd3_latent):
 
 
 # ── Video: LTX-2.3 image-to-video (two-stage, with audio) ───────────────
+
+def lipsync_video(video: str, audio: str, steps=20, guidance=1.5, seed=1247,
+                  prefix='studio/lipsync') -> dict:
+    return {
+        '1': {'class_type': 'LoadVideo', 'inputs': {'file': video}},
+        '2': {'class_type': 'LoadAudio', 'inputs': {'audio': audio}},
+        '3': {'class_type': 'ReelwrightLatentSync', 'inputs': {
+            'video': ['1', 0], 'audio': ['2', 0], 'steps': steps, 'guidance': guidance, 'seed': seed}},
+        '4': {'class_type': 'SaveVideo', 'inputs': {
+            'video': ['3', 0], 'filename_prefix': prefix, 'format': 'mp4', 'codec': 'auto'}},
+    }
+
+
+def separate_vocals(audio: str, prefix='studio/vocals') -> dict:
+    return {
+        '1': {'class_type': 'LoadAudio', 'inputs': {'audio': audio}},
+        '2': {'class_type': 'ReelwrightSeparateVocals', 'inputs': {'audio': ['1', 0]}},
+        '3': {'class_type': 'SaveAudio', 'inputs': {'audio': ['2', 0], 'filename_prefix': prefix}},
+    }
 
 def ltx_i2v(s: dict, prompt: str, first_frame: str, frames: int, seed: int,
             end_frame: str | None = None, voice_audio: str | None = None,
@@ -235,3 +272,75 @@ def wan_frames(seconds: float, fps: int) -> int:
     """Wan needs 4n+1 frames."""
     n = max(1, round(seconds * fps / 4))
     return 4 * n + 1
+
+
+def minimax_h3_frames(seconds: float) -> int:
+    """H3 uses a 17n+5 frame grid at 24 fps."""
+    n = max(5, round(seconds * 24))
+    return n + (5 - n % 17) % 17
+
+
+def minimax_h3_i2v(s: dict, prompt: str, first_frame: str, frames: int, seed: int,
+                   end_frame: str | None = None, prefix: str = "studio/take") -> dict:
+    """Local H3 FL2VA with native audio; follows Comfy's official I2V template."""
+    h = s["minimax_local"]
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": h["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": h["clip"], "type": "minimax", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": h["video_vae"]}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": h["audio_vae"]}},
+        "5": {"class_type": "LoadImage", "inputs": {"image": first_frame}},
+        "6": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {
+            "clip": ["2", 0], "vae": ["3", 0], "prompt": prompt,
+            "width": int(h["width"]), "height": int(h["height"]), "length": int(frames), "first_frame": ["5", 0]}},
+        "7": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
+        "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+        "9": {"class_type": "BasicScheduler", "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": int(h["steps"]), "denoise": 1.0}},
+        "10": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["6", 0]}},
+        "11": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["7", 0], "guider": ["10", 0], "sampler": ["8", 0], "sigmas": ["9", 0], "latent_image": ["6", 1]}},
+        "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+        "13": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}},
+        "14": {"class_type": "CreateVideo", "inputs": {"images": ["12", 0], "fps": 24.0, "audio": ["13", 0]}},
+        "15": {"class_type": "SaveVideo", "inputs": {"video": ["14", 0], "filename_prefix": prefix, "format": "auto", "codec": "auto"}},
+    }
+    if h.get("lora"):
+        wf["16"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["1", 0], "lora_name": h["lora"], "strength_model": 1.0}}
+        wf["9"]["inputs"]["model"] = ["16", 0]
+        wf["10"]["inputs"]["model"] = ["16", 0]
+    if end_frame:
+        wf["17"] = {"class_type": "LoadImage", "inputs": {"image": end_frame}}
+        wf["6"]["inputs"]["last_frame"] = ["17", 0]
+    return wf
+
+
+def minimax_h3_reference_edit(s: dict, prompt: str, references: list[str], video: str,
+                             frames: int, seed: int, width: int, height: int,
+                             prefix: str = "studio/identity") -> dict:
+    """Character portraits and source performance condition the Ref2VA model together."""
+    cfg = copy.deepcopy(s)
+    face = cfg["face_correction"]
+    cfg["minimax_local"].update(unet=face["identity_unet"], lora=face["identity_turbo_lora"],
+                               steps=8, width=width, height=height)
+    wf = minimax_h3_i2v(cfg, prompt, references[0], frames, seed, prefix=prefix)
+    inputs = {"clip": ["2", 0], "vae": ["3", 0], "prompt": prompt, "width": width,
+              "height": height, "length": frames, "ref_image_size": "max",
+              "ref_videos.ref_video_0": ["18", 0]}
+    for i, image in enumerate(references):
+        nid = "5" if i == 0 else str(50 + i)
+        wf[nid] = {"class_type": "LoadImage", "inputs": {"image": image}}
+        inputs[f"ref_images.ref_image_{i}"] = [nid, 0]
+    wf["6"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
+    wf["17"] = {"class_type": "LoadVideo", "inputs": {"file": video}}
+    wf["18"] = {"class_type": "GetVideoComponents", "inputs": {"video": ["17", 0]}}
+    wf["19"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+        "model": ["16", 0], "lora_name": face["identity_lora"], "strength_model": 1.0}}
+    wf["9"]["inputs"].update(model=["19", 0], scheduler="normal")
+    wf["10"]["inputs"]["model"] = ["19", 0]
+    wf["8"]["inputs"]["sampler_name"] = "er_sde"
+    # The original soundtrack is remuxed by the caller.
+    wf.pop("4")
+    wf.pop("13")
+    wf["14"]["inputs"].pop("audio")
+    return wf

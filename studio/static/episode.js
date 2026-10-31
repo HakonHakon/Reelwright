@@ -18,9 +18,23 @@ async function viewEpisode(view, sid, eid, tab) {
     <div class="tabs">${TABS.map(([k, label, gate], i) => `<a href="#/s/${sid}/e/${eid}/${k}" class="${k === tab ? "on" : ""} ${done[k] ? "done" : ""}"><span class="n">${done[k] ? ic("check") : i + 1}</span><span>${label.replace(/^\d+\.\s*/, "")}</span>${gate && g[gate] ? `<span class="gate chip good">approved</span>` : ""}</a>`).join("")}</div>
     <div class="progress"><div style="width:${Math.round((nDone / 6) * 100)}%"></div></div>
     <div id="tab"></div>`;
+  const deleteEpisode = document.createElement("button"); deleteEpisode.textContent = "Delete episode"; deleteEpisode.className = "danger";
+  $(".page-head", view).append(deleteEpisode);
+  deleteEpisode.onclick = async () => {
+    if (await ask(`Delete episode ${e.title}? Files are kept in a .deleted folder.`, "Delete", true)) {
+      await api("DELETE", ctx.base); location.hash = `#/s/${sid}`;
+    }
+  };
   const el = $("#tab");
   const fn = { story: tabStory, shots: tabShots, frames: tabFrames, animatic: tabAnimatic, takes: tabTakes, cut: tabCut }[tab] || tabStory;
   await fn(el, ctx);
+  if (tab === "frames" || tab === "takes") {
+    bulkSelect(el, "[data-rm]", async targets => {
+      const items = {};
+      for (const t of targets) (items[t.dataset.shot] ||= []).push(+t.dataset.rm);
+      await POST(`${ctx.base}/delete_assets`, {kind: tab === "frames" ? "frame" : "take", items});
+    }, reload, tab === "frames" ? "frames" : "takes");
+  }
 }
 
 const reload = () => route();
@@ -110,11 +124,18 @@ async function tabShots(el, ctx) {
               ${sh.duration_locked ? `<button class="link" data-unlock="${i}" title="locked - click to auto-compute">🔒</button>` : ""}</div>
             ${sel("start_mode", i, sh.start_mode, ["new", "punch_in", "reuse", "chain"], ["new frame (master)", "punch-in from scene master", "reuse master angle", "chain: last frame of prev take"])}
             ${sel("frame_source", i, sh.frame_source, ["", "flux_lora", "zimage", "qwen_refs", "auto", "upload"], ["source: inherit (" + sourceLabel(sh._source) + ")", "Flux + LoRA", "Z-Image", "Reference photos (Qwen Edit)", "Auto (LoRA > photos > Z-Image)", "Upload"])}
-            ${sel("engine", i, sh.engine, ["", "ltx", "wan"], ["engine: series default", "LTX-2.3", "Wan 2.2"])}</td>
+            ${sel("engine", i, sh.engine, ["", "minimax_local", "ltx", "wan", "minimax"], ["engine: series default", "MiniMax H3 (local)", "LTX-2.3", "Wan 2.2", "MiniMax (cloud)"])}</td>
           <td><div class="row" style="gap:2px"><button class="link" data-up="${i}" title="move up">↑</button><button class="link" data-down="${i}" title="move down">↓</button>
             <button class="link" data-dup="${i}" title="split: duplicate below">split</button><button class="link" data-merge="${i}" title="merge with next">merge</button>
             <button class="link danger" data-del="${i}">delete</button></div></td></tr>`;
       }).join("")}</tbody></table>`;
+    $$("table.shots tbody tr:not(.scene-row)", el).forEach(row => {
+      [...row.children].forEach((cell, index) => { cell.dataset.label = ["Shot", "Framing / camera", "Where / who", "Action", "Dialogue / sound", "Timing / source", "Actions"][index]; });
+    });
+    bulkSelect(el, "[data-del]", async targets => {
+      const indices = targets.map(t => +t.dataset.del).sort((a,b) => b-a);
+      indices.forEach(i => shots.splice(i, 1)); App.dirty = true;
+    }, render, "shots");
   };
   render();
   const payload = () => shots.map((sh) => ({ ...sh }));
@@ -156,41 +177,123 @@ async function tabShots(el, ctx) {
 // ── 3. First frames ─────────────────────────────────────────────────────
 function cropModal(file, aspect) {
   return new Promise((resolve) => {
-    const url = URL.createObjectURL(file);
-    modal(`<h3>Crop to the video frame</h3><p class="muted small">Drag the box. Use the slider to resize.</p>
-      <div class="crop-wrap" id="cw"><img id="ci" src="${url}"><div class="crop-box" id="cb"></div></div>
-      <div class="row" style="margin-top:10px"><input type="range" id="cs" min="20" max="100" value="100" class="grow">
-      <button id="cn">Cancel</button><button class="primary" id="ck">Use this crop</button></div>`);
-    const img = $("#ci"), box = $("#cb");
-    let bx = 0, by = 0, bw = 0, bh = 0;
+    const url = URL.createObjectURL(file), urls = [url], controller = new AbortController();
+    let done = false, ready = false, triedPreview = false, drag = null, observer;
+    let bx = 0, by = 0, bw = 0, bh = 0, cx = 0.5, cy = 0.5;
+    modal(`<h3>Crop your photo</h3><p id="crop-status" class="muted small" aria-live="polite">Opening photo…</p>
+      <div class="crop-stage"><div class="crop-wrap" id="cw"><img id="ci" alt="Photo to crop" draggable="false"><div class="crop-box" id="cb" tabindex="0" role="group" aria-label="Crop area. Drag or use arrow keys to move."></div></div></div>
+      <div class="crop-controls"><label for="cs">Crop size</label><input type="range" id="cs" min="20" max="100" value="100" aria-label="Crop size">
+      <div class="row"><button id="cn">Cancel</button><button class="primary" id="ck" disabled>Use this crop</button></div></div>`);
+    $("#modal-body").classList.add("crop-dialog");
+    const img = $("#ci"), box = $("#cb"), slider = $("#cs"), confirm = $("#ck"), status = $("#crop-status");
+    const finish = (value) => {
+      if (done) return;
+      done = true; modalCleanup = null; controller.abort(); observer?.disconnect();
+      urls.forEach(u => URL.revokeObjectURL(u)); closeModal(); resolve(value);
+    };
+    modalCleanup = () => finish(null);
     const layout = () => {
-      const W = img.clientWidth, H = img.clientHeight, s = +$("#cs").value / 100;
-      if (W / H > aspect) { bh = H * s; bw = bh * aspect; } else { bw = W * s; bh = bw / aspect; }
-      bx = Math.min(Math.max(0, bx), W - bw); by = Math.min(Math.max(0, by), H - bh);
-      Object.assign(box.style, { left: bx + "px", top: by + "px", width: bw + "px", height: bh + "px" });
+      if (!ready || done) return;
+      const W = img.clientWidth, H = img.clientHeight, scale = Number(slider.value) / 100;
+      if (!W || !H) return;
+      if (W / H > aspect) { bh = H * scale; bw = bh * aspect; } else { bw = W * scale; bh = bw / aspect; }
+      bx = Math.max(0, Math.min(W - bw, cx * W - bw / 2));
+      by = Math.max(0, Math.min(H - bh, cy * H - bh / 2));
+      cx = (bx + bw / 2) / W; cy = (by + bh / 2) / H;
+      Object.assign(box.style, {left: `${bx}px`, top: `${by}px`, width: `${bw}px`, height: `${bh}px`});
     };
-    img.onload = () => { layout(); bx = (img.clientWidth - bw) / 2; by = (img.clientHeight - bh) / 2; layout(); };
-    $("#cs").oninput = layout;
-    let drag = null;
-    box.onmousedown = (e) => { drag = { x: e.clientX - bx, y: e.clientY - by }; e.preventDefault(); };
-    window.onmousemove = (e) => { if (drag) { bx = e.clientX - drag.x; by = e.clientY - drag.y; layout(); } };
-    window.onmouseup = () => { drag = null; };
-    $("#cn").onclick = () => { closeModal(); resolve(null); };
-    $("#ck").onclick = () => {
-      const W = img.clientWidth, H = img.clientHeight;
-      closeModal(); URL.revokeObjectURL(url);
-      resolve({ x: bx / W, y: by / H, w: bw / W, h: bh / H });
+    img.onload = () => {
+      if (done) return;
+      ready = true; confirm.disabled = false;
+      status.textContent = "Drag the frame with your finger. Adjust its size below.";
+      layout();
     };
+    img.onerror = async () => {
+      if (done) return;
+      ready = false; confirm.disabled = true;
+      if (triedPreview) { status.textContent = "This photo could not be opened. Choose another photo."; return; }
+      triedPreview = true; status.textContent = "Preparing photo…";
+      try {
+        const fd = new FormData(); fd.append("file", file);
+        const response = await fetch("/api/image_preview", {method: "POST", body: fd, signal: controller.signal});
+        if (!response.ok) { const data = await response.json(); throw new Error(data.detail || "Could not open photo"); }
+        const preview = URL.createObjectURL(await response.blob());
+        if (done) { URL.revokeObjectURL(preview); return; }
+        urls.push(preview); img.src = preview;
+      } catch (error) { if (!done) status.textContent = error.message; }
+    };
+    box.onpointerdown = (event) => {
+      if (!ready || (event.pointerType === "mouse" && event.button !== 0)) return;
+      drag = {id: event.pointerId, x: event.clientX, y: event.clientY, cx, cy};
+      box.setPointerCapture(event.pointerId); event.preventDefault();
+    };
+    box.onpointermove = (event) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      cx = drag.cx + (event.clientX - drag.x) / img.clientWidth;
+      cy = drag.cy + (event.clientY - drag.y) / img.clientHeight;
+      layout(); event.preventDefault();
+    };
+    box.onpointerup = box.onpointercancel = box.onlostpointercapture = () => { drag = null; };
+    box.onkeydown = (event) => {
+      const step = event.shiftKey ? 20 : 5;
+      if (event.key === "ArrowLeft") cx -= step / img.clientWidth;
+      else if (event.key === "ArrowRight") cx += step / img.clientWidth;
+      else if (event.key === "ArrowUp") cy -= step / img.clientHeight;
+      else if (event.key === "ArrowDown") cy += step / img.clientHeight;
+      else return;
+      layout(); event.preventDefault();
+    };
+    slider.oninput = layout;
+    observer = new ResizeObserver(layout); observer.observe(img);
+    const tap = (button, action) => {
+      let start = null;
+      button.onclick = action;
+      button.onpointerdown = event => {
+        if (event.pointerType !== "mouse") { start = {x: event.clientX, y: event.clientY}; event.preventDefault(); }
+      };
+      button.onpointercancel = () => { start = null; };
+      button.onpointerup = event => {
+        if (!start || event.pointerType === "mouse") return;
+        const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y); start = null;
+        if (moved < 12) {
+          event.preventDefault();
+          // Closing a touch dialog can otherwise send a compatibility click to the screen underneath.
+          const suppress = click => {
+            if (click.detail && Math.hypot(click.clientX - event.clientX, click.clientY - event.clientY) < 30) {
+              click.preventDefault(); click.stopImmediatePropagation(); document.removeEventListener("click", suppress, true);
+            }
+          };
+          document.addEventListener("click", suppress, true);
+          setTimeout(() => document.removeEventListener("click", suppress, true), 600);
+          action();
+        }
+      };
+    };
+    tap($("#cn"), () => finish(null));
+    tap(confirm, () => {
+      layout();
+      if (!ready || !img.clientWidth || !img.clientHeight) return;
+      finish({x: bx / img.clientWidth, y: by / img.clientHeight, w: bw / img.clientWidth, h: bh / img.clientHeight});
+    });
+    img.src = url;
   });
 }
 
 async function uploadFrame(ctx, shotId, file, end) {
-  const v = ctx.e._settings.video;
-  const crop = await cropModal(file, v.width / v.height);
-  if (!crop) return;
-  const fd = new FormData(); fd.append("file", file); fd.append("crop", JSON.stringify(crop)); if (end) fd.append("end", "1");
-  await FORM(`${ctx.base}/shots/${shotId}/upload_frame`, fd);
-  toast(end ? "End frame set." : "Uploaded and selected."); reload();
+  if (App.interactionBusy) return toast("Finish the current photo first.");
+  App.interactionBusy = true;
+  try {
+    const size = ctx.e._settings.image || ctx.e._settings.video;
+    const crop = await cropModal(file, size.width / size.height);
+    if (!crop) return;
+    modal(`<h3>Uploading photo…</h3><p role="status">Keep this screen open while your photo is saved.</p><progress aria-label="Uploading photo"></progress>`);
+    const fd = new FormData(); fd.append("file", file); fd.append("crop", JSON.stringify(crop)); if (end) fd.append("end", "1");
+    await FORM(`${ctx.base}/shots/${shotId}/upload_frame`, fd);
+    closeModal(); toast(end ? "End frame set." : "Uploaded and selected."); await reload();
+  } catch (error) {
+    closeModal();
+    if (!document.querySelector(".toast.bad")) toast(error.message || "Upload failed. Please try again.", true);
+  } finally { App.interactionBusy = false; }
 }
 
 function checkChip(c) {
@@ -230,6 +333,7 @@ async function tabFrames(el, ctx) {
     if (ds.gate) setGate(ctx, ds.gate, ds.val === "1");
     if (ds.pick != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { select: +ds.pick }); reload(); }
     if (ds.rm != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { remove: +ds.rm }); reload(); }
+    if (ds.qwenface != null && ds.shot) startJob(`${ctx.base}/shots/${ds.shot}/frame_correction`, { index: +ds.qwenface });
     if (ds.refine && ds.shot) startJob(`${ctx.base}/shots/${ds.shot}/refine`, { index: +ds.idx, engine: ds.refine, denoise: parseFloat($(`#dn-${ds.shot}`)?.value || "0.3") });
     if (ds.lock && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { lock: ds.lock === "1" }); reload(); }
     if (ds.render && ds.shot) startJob(`${ctx.base}/frames`, { shot_ids: [ds.shot], force: true, source: $(`#src-${ds.shot}`).value });
@@ -255,19 +359,20 @@ function frameCard(ctx, sh) {
       ${sh.frame.locked ? `<span class="chip good">locked</span>` : ""}<span class="grow"></span>
       ${chained ? "" : `<select id="src-${sh.id}"><option value="">${sourceLabel(sh._source)}</option><option value="flux_lora">Flux + LoRA</option><option value="zimage">Z-Image</option><option value="qwen_refs">Reference photos</option></select>
       <button data-render="1" data-shot="${sh.id}">Render ${ctx.e._settings.candidates_per_shot} more</button>
-      <label class="btn" style="margin:0;color:var(--ink)">Upload<input type="file" accept="image/*" data-upframe="${sh.id}" hidden></label>`}
+      <label class="btn file-pick" style="margin:0;color:var(--ink)">Upload photo<input type="file" accept="image/*,.heic,.heif" data-upframe="${sh.id}" aria-label="Upload photo for ${esc(sh.id)}"></label>`}
       <button data-lock="${sh.frame.locked ? 0 : 1}" data-shot="${sh.id}">${sh.frame.locked ? "Unlock" : "Lock"}</button></div>
     <div class="muted small">${esc(sh.action)}${(sh.dialogue || []).length ? " · " + sh.dialogue.map((d) => esc(charName(ctx, d.speaker) + ": " + d.line)).join(" / ") : ""}</div>
     <details><summary>image prompt</summary><pre class="prompt">${esc(sh._image_prompt)}</pre></details>
     ${chained ? `<p class="muted">Chained: this shot starts from the last frame of ${esc("the previous shot's")} selected take (made at the Takes stage).</p>` : ""}
     <div class="row small" style="margin:6px 0">End frame (optional, LTX):
       ${sh.end_frame ? `<img src="${media(sh.end_frame)}" style="height:44px;border-radius:4px" data-zoom="${media(sh.end_frame)}"><button class="link" data-clearend="1" data-shot="${sh.id}">clear</button>` : `<span class="muted">none</span>`}
-      <label class="link" style="margin:0;cursor:pointer;color:var(--ink);text-decoration:underline">upload end frame<input type="file" accept="image/*" data-upend="${sh.id}" hidden></label>
+      <label class="btn file-pick" style="margin:0">Upload end frame<input type="file" accept="image/*,.heic,.heif" data-upend="${sh.id}" aria-label="Upload end frame for ${esc(sh.id)}"></label>
       <span class="grow"></span>refine strength <input id="dn-${sh.id}" type="number" min="0.1" max="0.8" step="0.05" value="0.3" style="width:64px"></div>
     <div class="cands"><div class="cands-in">${cands.map((c, k) => `<div class="cand ${sh.frame.selected === k ? "sel" : ""}">
       <div class="frame"><img src="${media(c.file)}" data-zoom="${media(c.file)}" loading="lazy"></div>
       <div class="meta"><span class="code">${esc(sh.id)}/${String.fromCharCode(65 + k)}</span>${sh.frame.selected === k ? `<span class="pick">picked</span>` : ""}<span>${sourceLabel(c.source)}${c.plate ? ", on location plate" : ""}</span> ${checkChip(c)}</div>
       <div class="acts">${sh.frame.selected === k ? ""  : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
+        <button data-qwenface="${k}" data-shot="${sh.id}" title="Correct this frame using the uploaded character portrait">Correct face · Qwen</button>
         <button data-refine="flux_lora" data-idx="${k}" data-shot="${sh.id}" title="img2img with the character LoRA">Refine Flux</button>
         <button data-refine="zimage" data-idx="${k}" data-shot="${sh.id}" title="img2img to match style">Refine Z</button>
         <button data-asend="${esc(c.file)}" data-shot="${sh.id}" title="use as this shot's end frame">as end</button>
@@ -312,10 +417,12 @@ async function tabAnimatic(el, ctx) {
 async function tabTakes(el, ctx) {
   const shots = ctx.e.shots;
   const spf = ctx.e.stats?.spf || {};
+  const models = await GET("/api/models");
   el.innerHTML = `
     ${!ctx.e.gates.frames ? `<div class="notice">First frames aren't approved yet. Shots without a selected frame are skipped.</div>` : ""}
     <div class="card row">
       <label class="row" style="margin:0">takes per shot <input id="ntakes" type="number" min="1" max="8" value="${ctx.e._settings.takes_per_shot}" style="width:60px"></label>
+      <label>Video model <select id="take-model"><option value="">Per-shot / project default</option>${models.map(m => `<option value="${esc(m.id)}" data-engine="${m.engine}">${esc(m.name)}</option>`).join("")}</select></label>
       <button class="primary" id="render-missing">Render shots without takes</button>
       <button id="render-checked">Render checked shots</button>
       <span class="muted small grow">Measured speed: ${Object.entries(spf).map(([k, v]) => `${k} ${v} s/frame`).join(", ") || "not measured yet"} · est. ${fmtSec(ctx.e._estimate_s)} for all</span>
@@ -323,11 +430,15 @@ async function tabTakes(el, ctx) {
     </div>
     ${shots.map((sh) => takeCard(ctx, sh)).join("")}`;
   const n = () => parseInt($("#ntakes").value) || 1;
-  $("#render-missing").onclick = () => startJob(`${ctx.base}/takes`, { takes: n() });
+  const modelChoice = () => {
+    const option = $("#take-model").selectedOptions[0];
+    return { engine: option.dataset.engine || "", model: option.value };
+  };
+  $("#render-missing").onclick = () => startJob(`${ctx.base}/takes`, { takes: n(), ...modelChoice() });
   $("#render-checked").onclick = () => {
     const ids = $$("input[data-chk]:checked").map((x) => x.dataset.chk);
     if (!ids.length) return toast("Tick some shots first", true);
-    startJob(`${ctx.base}/takes`, { shot_ids: ids, takes: n(), force: true });
+    startJob(`${ctx.base}/takes`, { shot_ids: ids, takes: n(), force: true, ...modelChoice() });
   };
   el.onclick = async (ev) => {
     const t = ev.target, ds = t.dataset;
@@ -336,7 +447,8 @@ async function tabTakes(el, ctx) {
     if (ds.pick != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { select: +ds.pick }); reload(); }
     if (ds.rm != null && ds.shot) { if (await ask("Remove this take from the list?", "Remove", true)) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { remove: +ds.rm }); reload(); } }
     if (ds.lock && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { lock: ds.lock === "1" }); reload(); }
-    if (ds.more && ds.shot) startJob(`${ctx.base}/takes`, { shot_ids: [ds.shot], takes: n(), force: true });
+    if (ds.more && ds.shot) startJob(`${ctx.base}/takes`, { shot_ids: [ds.shot], takes: n(), force: true, ...modelChoice() });
+    if (ds.face != null && ds.shot) startJob(`${ctx.base}/shots/${ds.shot}/face_correction`, { index: +ds.face, model: $(`#face-${ds.shot}`).value });
     if (ds.next && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/next_from_last`); toast("Next shot's first frame set from this take."); reload(); }
     if (ds.trim && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { trim_in: parseFloat($(`#ti-${ds.shot}`).value) || 0, trim_out: parseFloat($(`#to-${ds.shot}`).value) || 0 }); App.dirty = false; toast("Trim saved."); }
   };
@@ -351,14 +463,16 @@ function takeCard(ctx, sh) {
       <span class="chip accent">${esc(sh._engine)}</span><span class="muted">${sh.duration_s}s · ${esc(sh.start_mode)}</span>
       ${f ? `<img src="${media(f.file)}" style="height:40px;border-radius:4px" data-zoom="${media(f.file)}">` : sh.start_mode === "chain" ? `<span class="chip">frame from previous take</span>` : `<span class="chip bad">no frame</span>`}
       ${sh.end_frame ? `<span class="chip">end frame</span>` : ""}<span class="grow"></span>
+      <select id="face-${sh.id}" aria-label="Face correction model"><option value="qwen_identity" ${ctx.e._settings.face_model === "qwen_identity" ? "selected" : ""}>Qwen Image Edit · every frame</option><option value="minimax_identity" ${ctx.e._settings.face_model === "minimax_identity" ? "selected" : ""}>Match character references · MiniMax H3</option><option value="keep" ${ctx.e._settings.face_model === "keep" ? "selected" : ""}>KEEP (main face, temporal)</option><option value="codeformer" ${ctx.e._settings.face_model === "codeformer" ? "selected" : ""}>CodeFormer (all faces)</option></select>
       <button data-more="1" data-shot="${sh.id}">Render more takes</button>
       <button data-next="1" data-shot="${sh.id}" title="extract the last frame of the selected take as the next shot's first frame">Last frame → next shot</button>
       <button data-lock="${sh.takes.locked ? 0 : 1}" data-shot="${sh.id}">${sh.takes.locked ? "Unlock" : "Lock"}</button></div>
     <details><summary>motion prompt</summary><pre class="prompt">${esc(sh._motion_prompt)}</pre></details>
     <div class="cands"><div class="cands-in">${items.map((t, k) => `<div class="cand ${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? "sel" : ""}">
-      <div class="frame"><video controls preload="metadata" src="${media(t.file)}"></video></div>
-      <div class="meta"><span class="code">${esc(sh.id)}/T${k + 1}</span>${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? `<span class="pick">picked</span>` : ""}<span>${esc(t.engine)}, ${t.seconds}s, ${t.render_s}s render</span> ${(t.flags || []).map((x) => `<span class="chip warn">${esc(x)}</span>`).join(" ")}</div>
+      <div class="frame"><video playsinline preload="metadata" controls preload="metadata" src="${media(t.file)}"></video></div>
+      <div class="meta"><span class="code">${esc(sh.id)}/T${k + 1}</span>${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? `<span class="pick">picked</span>` : ""}<span>${esc(t.model || t.engine)}${t.face_correction ? " · " + esc(t.face_correction) + " corrected" : ""}, ${t.seconds}s, ${t.render_s}s render</span> ${(t.flags || []).map((x) => `<span class="chip warn">${esc(x)}</span>`).join(" ")}</div>
       <div class="acts">${sh.takes.selected === k ? "" : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
+        <button data-face="${k}" data-shot="${sh.id}">Correct faces</button>
         <button class="danger" data-rm="${k}" data-shot="${sh.id}">✕</button></div></div>`).join("") || `<p class="muted" style="padding:20px">No takes yet.</p>`}</div></div>
     ${items.length ? `<div class="row small" style="margin-top:8px">Trim selected take: in <input id="ti-${sh.id}" type="number" step="0.05" min="0" value="${sh.takes.trim_in || 0}" style="width:70px">s
       out <input id="to-${sh.id}" type="number" step="0.05" min="0" value="${sh.takes.trim_out || 0}" style="width:70px">s (cut from end)
@@ -372,24 +486,77 @@ async function tabCut(el, ctx) {
   el.innerHTML = `
     ${missing.length ? `<div class="notice">No takes yet for: ${esc(missing.join(", "))}. They'll be left out.</div>` : ""}
     <div class="card form-grid">
-      <div><label>Music bed (optional, looped under the film)</label><input type="file" id="mfile" accept="audio/*">
-        <div class="small muted">${m.file ? "current: " + esc(m.file.split("/").pop()) : "none"}</div></div>
+      <div><label>Music or voice recording</label><input type="file" id="mfile" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac">
+        <div id="music-current" class="small muted">${m.file ? "current: " + esc(m.file.split("/").pop()) : "none"}</div></div>
       <div><label>Music volume (0-1)</label><input id="mvol" type="number" step="0.05" min="0" max="1" value="${m.volume ?? 0.25}">
         <label class="row" style="margin-top:8px"><input type="checkbox" id="mduck" ${m.duck !== false ? "checked" : ""}> duck music under dialogue</label></div>
-      <div class="full row" style="margin-top:10px"><button id="msave">Save music settings</button><span class="grow"></span>
+      <div class="full row" style="margin-top:10px"><button id="msave">Save music settings</button>
+        <button id="lip-setup" ${m.file ? "" : "disabled"}>Lip-sync to uploaded audio</button><span class="grow"></span>
         <button class="primary" id="cut">Render final cut</button></div>
     </div>
     <p class="muted small">Each selected take is trimmed, scaled to ${e._settings.video.width}x${e._settings.video.height} @ ${e._settings.video.fps} fps and loudness-normalised, then joined. Wan takes (silent) get a silent track.</p>
     ${o.final ? `<h2>Final film ${o.runtime ? "· " + fmtSec(o.runtime) : ""}</h2>
-      <video controls src="${media(o.final)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
+      <video playsinline preload="metadata" controls src="${media(o.final)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
       <div class="row" style="margin-top:8px"><a href="${media(o.final)}" download>final.mp4</a>${o.srt ? `<a href="${media(o.srt)}" download>subtitles (.srt)</a>` : ""}
         ${o.edl ? `<a href="${media(o.edl)}" download>edit list (.edl for DaVinci Resolve)</a>` : ""}${o.animatic ? `<a href="${media(o.animatic)}" download>animatic.mp4</a>` : ""}</div>
-      <p class="muted small">In Resolve: import the takes folders as media, then File > Import > Timeline > the .edl.</p>` : ""}`;
+      <p class="muted small">In Resolve: import the takes folders as media, then File > Import > Timeline > the .edl.</p>` : ""}
+    ${(o.lipsync_versions || []).map((version, i) => `<div class="card"><h2>Lip-sync preview ${i + 1}</h2>
+      <p class="muted small">${esc(version.model)} · ${fmtSec(version.runtime)} · ${esc((version.audio_file || "").split("/").pop())} · ${version.isolated_vocals ? "isolated vocal guide" : "uploaded audio guide"}. The full uploaded music mix is used in this export.</p>
+      <video playsinline preload="metadata" controls src="${media(version.file)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
+      <div class="row"><a href="${media(version.file)}" download>Download MP4</a>
+        ${o.final === version.file ? `<span class="chip good">current final</span>` : `<button data-use-lipsync="${i}">Use as final</button>`}</div></div>`).join("")}
+    ${o.before_lipsync ? `<p><a href="${media(o.before_lipsync)}" download>Download original final before lip-sync</a></p>` : ""}`;
   $("#msave").onclick = async () => {
-    const fd = new FormData(); const f = $("#mfile").files[0]; if (f) fd.append("file", f);
+    const button = $("#msave"); button.disabled = true;
+    const fileInput = $("#mfile");
+    const fd = new FormData(); const f = fileInput.files[0]; if (f) fd.append("file", f);
     fd.append("volume", $("#mvol").value); fd.append("duck", $("#mduck").checked ? "true" : "false");
-    await FORM(`${ctx.base}/music`, fd); App.dirty = false; toast("Music saved."); reload();
+    let saved;
+    App.interactionBusy = true;
+    try { saved = await FORM(`${ctx.base}/music`, fd); }
+    finally { button.disabled = false; App.interactionBusy = false; }
+    if (!fileInput.isConnected) return toast("Music saved.");
+    ctx.e.music = saved; App.dirty = false;
+    if (f && $("#mfile").files[0] === f) $("#mfile").value = "";
+    $("#music-current").textContent = saved.file ? "current: " + saved.file.split("/").pop() : "none";
+    $("#lip-setup").disabled = !saved.file; toast("Music saved.");
+    if (f) {
+      const choice = ask("Would you like to lip-sync the video to the voice in this upload?", "Choose shots");
+      $("#ask-no").textContent = "Not now";
+      if (await choice) openLipSync(ctx);
+    }
   };
+  $("#lip-setup").onclick = () => openLipSync(ctx);
+  $$('[data-use-lipsync]', el).forEach(button => button.onclick = async () => {
+    await POST(`${ctx.base}/lipsync/select`, {index: +button.dataset.useLipsync}); reload();
+  });
   $("#cut").onclick = () => startJob(`${ctx.base}/cut`);
   App.refreshers.push(reload);
+}
+
+function openLipSync(ctx) {
+  const shots = ctx.e.shots.filter(sh => sh.characters?.length === 1 && sh.takes.items?.length);
+  if (!shots.length) return toast("Add takes to single-character shots first.", true);
+  const characters = [...new Set(shots.map(sh => sh.characters[0].id))];
+  modal(`<h2 style="margin-top:0">Lip-sync to your music or voice</h2>
+    <p>Choose who sings or speaks. Only checked shots are changed. A separate preview keeps your original takes and final available.</p>
+    <label for="lip-character">Character</label><select id="lip-character">${characters.map(id => `<option value="${esc(id)}">${esc(charName(ctx, id))}</option>`).join("")}</select>
+    <div style="max-height:30vh;overflow:auto;margin:12px 0">${shots.map(sh => `<label class="row" style="margin:6px 0"><input type="checkbox" data-lip-shot="${esc(sh.id)}" data-character="${esc(sh.characters[0].id)}" ${sh.characters[0].id === characters[0] ? "checked" : ""}>${esc(sh.id)} · ${esc(charName(ctx, sh.characters[0].id))}</label>`).join("")}</div>
+    <label for="lip-offset">Start in uploaded audio (seconds)</label><input id="lip-offset" type="number" min="0" step="0.1" value="0" style="width:100%">
+    <label class="row" style="margin:12px 0"><input type="checkbox" id="lip-vocals" checked> Isolate the singing voice from music</label>
+    <p class="muted small">Local LatentSync 1.6. The export replaces take audio with this upload at full volume. Vocal isolation guides the mouth; the full music mix stays in the export. Turn isolation off for a clean voice recording. Long audio is trimmed; short audio is padded with silence. Check the preview before using it as final.</p>
+    <div class="row"><button id="lip-cancel">Not now</button><button id="lip-run" class="primary">Run lip-sync</button></div>`);
+  $("#lip-character").onchange = ev => $$('[data-lip-shot]').forEach(box => { box.checked = box.dataset.character === ev.target.value; });
+  $("#lip-cancel").onclick = closeModal;
+  $("#lip-run").onclick = async () => {
+    const shot_ids = $$('[data-lip-shot]:checked').map(box => box.dataset.lipShot);
+    if (!shot_ids.length) return toast("Choose at least one shot.", true);
+    const audio_offset = Number($("#lip-offset").value);
+    if (!Number.isFinite(audio_offset) || audio_offset < 0) return toast("Enter a valid audio start.", true);
+    const isolate_vocals = $("#lip-vocals").checked;
+    const button = $("#lip-run"); button.disabled = true;
+    try {
+      await startJob(`${ctx.base}/lipsync`, {shot_ids, audio_offset, isolate_vocals}); closeModal();
+    } finally { button.disabled = false; }
+  };
 }

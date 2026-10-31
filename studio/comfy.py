@@ -71,7 +71,9 @@ class Comfy:
                         problems.append(f"node {nid}: input {name} links to missing node {value[0]}")
                     continue
                 opts = _combo_options(spec.get(name))
-                if opts and isinstance(value, str) and value not in opts and cls not in ("LoadImage", "LoadAudio"):
+                if (opts and isinstance(value, str) and value not in opts
+                        and cls not in ("LoadImage", "LoadAudio")
+                        and (cls, name) not in (("LoadImageMask", "image"), ("LoadVideo", "file"))):
                     problems.append(f"{cls}.{name}: '{value}' not found in ComfyUI")
         return problems
 
@@ -106,7 +108,7 @@ class Comfy:
 
     # ── execution ──
     def run(self, wf: dict, log=None, cancel=None, poll: float = 2.0, max_wait: int = 4 * 3600) -> dict:
-        """Queue a workflow and wait. Returns {'images': [...], 'videos': [...], 'seconds': float}."""
+        """Queue a workflow and wait. Returns images, videos, audios and elapsed seconds."""
         problems = self.validate(wf)
         if problems:
             raise ComfyError("Workflow does not match your ComfyUI:\n  " + "\n  ".join(problems))
@@ -141,18 +143,23 @@ class Comfy:
                 if not status.get("completed", True):
                     continue
                 break
-        images, videos = [], []
+        images, videos, audios = [], [], []
         for out in hist.get("outputs", {}).values():
-            for key in ("images", "videos", "gifs"):
+            for key in ("images", "videos", "gifs", "audio"):
                 for item in out.get(key, []) or []:
                     if not isinstance(item, dict) or not item.get("filename"):
+                        continue
+                    # LoadVideo reports its input in history too; it is not a generated take.
+                    if item.get("type") == "input":
                         continue
                     fn = item["filename"].lower()
                     if fn.endswith((".mp4", ".webm", ".mov", ".mkv")):
                         videos.append(item)
+                    elif fn.endswith((".wav", ".flac", ".mp3", ".opus", ".ogg", ".m4a")):
+                        audios.append(item)
                     elif fn.endswith((".png", ".jpg", ".jpeg", ".webp")) and item.get("type", "output") == "output":
                         images.append(item)
-        return {"images": images, "videos": videos, "seconds": time.time() - t0}
+        return {"images": images, "videos": videos, "audios": audios, "seconds": time.time() - t0}
 
 
 def load_template(path: str) -> dict:

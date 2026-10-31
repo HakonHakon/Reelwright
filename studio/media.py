@@ -1,11 +1,19 @@
 """ffmpeg / image helpers: fitting uploads, last frames, QC, animatic, final cut, SRT, EDL."""
 
+import io
+import math
 import json
 import os
 import subprocess
 import tempfile
 
-from PIL import Image
+from PIL import Image, ImageOps
+
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 
 
 class MediaError(RuntimeError):
@@ -32,6 +40,7 @@ def probe(ffprobe: str, path: str) -> dict:
         fps = float(n) / float(d or 1)
     return {
         "duration": float(data.get("format", {}).get("duration") or 0),
+        "video_duration": float(v.get("duration") or data.get("format", {}).get("duration") or 0),
         "has_audio": any(s.get("codec_type") == "audio" for s in data.get("streams", [])),
         "width": int(v.get("width") or 0), "height": int(v.get("height") or 0), "fps": fps,
     }
@@ -41,11 +50,20 @@ def probe(ffprobe: str, path: str) -> dict:
 
 def fit_image(src: str, dst: str, width: int, height: int, crop: dict | None = None) -> str:
     """Crop to the target aspect (centre, or a crop box in 0-1 fractions) and resize."""
-    im = Image.open(src).convert("RGB")
+    im = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
     W, H = im.size
     target = width / height
-    if crop and all(k in crop for k in ("x", "y", "w", "h")):
+    if crop:
+        if not isinstance(crop, dict) or not all(k in crop for k in ("x", "y", "w", "h")):
+            raise ValueError("Crop must contain x, y, w and h")
+        crop = {k: float(crop[k]) for k in ("x", "y", "w", "h")}
+        if (not all(math.isfinite(v) for v in crop.values()) or
+                crop["x"] < 0 or crop["y"] < 0 or crop["w"] <= 0 or crop["h"] <= 0 or
+                crop["x"] + crop["w"] > 1.00001 or crop["y"] + crop["h"] > 1.00001):
+            raise ValueError("Crop is outside the photo")
         box = (int(crop["x"] * W), int(crop["y"] * H), int((crop["x"] + crop["w"]) * W), int((crop["y"] + crop["h"]) * H))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            raise ValueError("Crop is too small")
         im = im.crop(box)
         W, H = im.size
     if W / H > target:
@@ -66,7 +84,7 @@ POSITION_X = {"left": 0.32, "center": 0.5, "right": 0.68, "background": 0.5, "fo
 def punch_crop(src: str, dst: str, width: int, height: int, fraction: float, position: str = "center",
                y_center: float = 0.42) -> str:
     """Crop a closer framing out of a master frame (same aspect), centred on the character's screen side."""
-    im = Image.open(src).convert("RGB")
+    im = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
     W, H = im.size
     cw = max(16, int(W * fraction))
     ch = int(cw * height / width)
@@ -242,3 +260,14 @@ def edl(title: str, events: list[dict], fps: int) -> str:
         lines.append("")
         rec += dur
     return "\n".join(lines)
+
+
+
+def image_preview(data: bytes) -> bytes:
+    """Browser-readable, correctly oriented preview, including iPhone HEIC photos."""
+    with Image.open(io.BytesIO(data)) as original:
+        image = ImageOps.exif_transpose(original).convert("RGB")
+        image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=90)
+        return output.getvalue()

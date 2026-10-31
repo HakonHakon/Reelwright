@@ -1,17 +1,18 @@
 """Studio web app: JSON API + a single-page UI (static/index.html)."""
 
 import json
+import math
 import os
 import re
 import shutil
 import time
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
-from . import jobs, llm, media, planner, prompts, store
+from . import jobs, llm, media, planner, prompts, store, providers
 from . import settings as settings_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +22,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="
 EDITABLE_SHOT_FIELDS = {
     "scene_id", "location_id", "time_of_day", "framing", "camera", "characters", "action", "dialogue",
     "sound", "action_seconds", "duration_s", "duration_locked", "start_mode", "frame_source", "engine",
-    "image_prompt_extra", "motion_prompt_extra", "image_prompt_override", "motion_prompt_override", "notes",
+    "video_model", "image_prompt_extra", "motion_prompt_extra", "image_prompt_override", "motion_prompt_override", "notes",
 }
 
 
@@ -73,6 +74,66 @@ def media_file(path: str):
 
 # ── status / settings / jobs ────────────────────────────────────────────
 
+def _required_model_options(s):
+    """Check configured render families, including existing project/shot overrides."""
+    sources, engines = set(), set()
+
+    def include_style(b):
+        style = b["style"]
+        sources.add(jobs._resolve_source({"frame_source": style["default_frame_source"], "characters": []}, b))
+        engines.add(style["default_engine"])
+
+    include_style({"style": {**store.DEFAULT_STYLE, **s.get("style_defaults", {})}, "characters": {}})
+    for series in store.list_series():
+        sid = series["id"]
+        b = store.bible(sid)
+        include_style(b)
+        for character in b["characters"].values():
+            if character.get("frame_source"):
+                sources.add(jobs._resolve_source({"characters": [{"id": character["id"]}]}, b))
+        for episode in store.list_episodes(sid):
+            for shot in (store.get_episode(sid, episode["id"]) or {}).get("shots", []):
+                sources.add(jobs._resolve_source(shot, b))
+                engines.add(shot.get("engine") or b["style"]["default_engine"])
+
+    needed = {}
+
+    def require(node, field, *names):
+        needed.setdefault((node, field), set()).update(names)
+
+    if "flux_lora" in sources:
+        require("UNETLoader", "unet_name", s["flux"]["unet"])
+        require("VAELoader", "vae_name", s["flux"]["vae"])
+    if "zimage" in sources:
+        require("UNETLoader", "unet_name", s["zimage"]["unet"])
+        require("CLIPLoader", "clip_name", s["zimage"]["clip"])
+        require("VAELoader", "vae_name", s["zimage"]["vae"])
+    if "qwen_refs" in sources or s["face_correction"]["model"] == "qwen_identity":
+        require("UNETLoader", "unet_name", s["qwen_edit"]["unet"])
+        require("CLIPLoader", "clip_name", s["qwen_edit"]["clip"])
+        require("VAELoader", "vae_name", s["qwen_edit"]["vae"])
+        require("LoraLoaderModelOnly", "lora_name", s["qwen_edit"]["lora"])
+    if "wan" in engines:
+        require("UNETLoader", "unet_name", s["wan"]["high"], s["wan"]["low"])
+        require("CLIPLoader", "clip_name", s["wan"]["text_encoder"])
+        require("VAELoader", "vae_name", s["wan"]["vae"])
+        require("LoraLoaderModelOnly", "lora_name", s["wan"]["high_lightning"], s["wan"]["low_lightning"])
+    if "minimax_local" in engines:
+        h = s["minimax_local"]
+        require("UNETLoader", "unet_name", h["unet"])
+        require("CLIPLoader", "clip_name", h["clip"])
+        require("VAELoader", "vae_name", h["video_vae"], h["audio_vae"])
+        if h.get("lora"):
+            require("LoraLoaderModelOnly", "lora_name", h["lora"])
+    if s["face_correction"]["model"] == "minimax_identity":
+        face, h = s["face_correction"], s["minimax_local"]
+        require("UNETLoader", "unet_name", face["identity_unet"])
+        require("CLIPLoader", "clip_name", h["clip"])
+        require("VAELoader", "vae_name", h["video_vae"])
+        require("LoraLoaderModelOnly", "lora_name", face["identity_lora"], face["identity_turbo_lora"])
+    return needed
+
+
 @app.get("/api/status")
 def status():
     s = _s()
@@ -83,12 +144,10 @@ def status():
     if alive:
         try:
             out["loras"] = c.options("LoraLoaderModelOnly", "lora_name")
-            needed = {("UNETLoader", "unet_name"): [s["flux"]["unet"], s["zimage"]["unet"], s["wan"]["high"], s["wan"]["low"]],
-                      ("CLIPLoader", "clip_name"): [s["zimage"]["clip"], s["wan"]["text_encoder"]],
-                      ("VAELoader", "vae_name"): [s["flux"]["vae"], s["wan"]["vae"]]}
+            needed = _required_model_options(s)
             for (node, inp), names in needed.items():
                 opts = set(c.options(node, inp))
-                out["missing"] += [n for n in names if n not in opts]
+                out["missing"] += sorted(n for n in names if n not in opts and n not in out["missing"])
         except Exception as exc:
             out["error"] = str(exc)
     for m in {s["planner_model"], s["vision_model"]}:
@@ -142,6 +201,10 @@ def series_get(sid: str):
 
 @app.put("/api/s/{sid}/style")
 def style_put(sid: str, body: dict = Body(...)):
+    try:
+        providers.validate_model(body.get("default_engine") or store.get_style(sid)["default_engine"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return store.save_style(sid, body)
 
 
@@ -168,9 +231,9 @@ def char_put(sid: str, cid: str, body: dict = Body(...)):
 
 @app.delete("/api/s/{sid}/characters/{cid}")
 def char_delete(sid: str, cid: str):
-    d = store.char_dir(sid, cid)
-    if os.path.isdir(d):
-        os.replace(d, os.path.join(os.path.dirname(d), f".deleted_{cid}_{int(time.time())}"))
+    _ensure_idle(sid)
+    store.get_character(sid, cid) or _404("character")
+    store.archive_dir(store.char_dir(sid, cid))
     return {"ok": True}
 
 
@@ -221,9 +284,9 @@ def loc_put(sid: str, lid: str, body: dict = Body(...)):
 
 @app.delete("/api/s/{sid}/locations/{lid}")
 def loc_delete(sid: str, lid: str):
-    d = store.loc_dir(sid, lid)
-    if os.path.isdir(d):
-        os.replace(d, os.path.join(os.path.dirname(d), f".deleted_{lid}_{int(time.time())}"))
+    _ensure_idle(sid)
+    store.get_location(sid, lid) or _404("location")
+    store.archive_dir(store.loc_dir(sid, lid))
     return {"ok": True}
 
 
@@ -256,7 +319,7 @@ def ep_create(sid: str, body: dict = Body(...)):
 
 
 def _decorate(sid: str, e: dict) -> dict:
-    s = _s()
+    s = settings_mod.for_episode(_s(), e)
     b = store.bible(sid)
     shots = sorted(e["shots"], key=lambda x: x.get("order", 0))
     for sh in shots:
@@ -272,7 +335,7 @@ def _decorate(sid: str, e: dict) -> dict:
     e["_runtime"] = planner.runtime_seconds(shots)
     e["_estimate_s"] = round(planner.estimate_render_seconds(shots, e["stats"].get("spf", {}), int(s["takes_per_shot"])))
     e["_settings"] = {"takes_per_shot": s["takes_per_shot"], "candidates_per_shot": s["candidates_per_shot"],
-                      "video": s["video"], "ltx_max": s["ltx"]["max_seconds"], "wan_max": s["wan"]["max_seconds"]}
+                      "video": s["video"], "image": s["image"], "face_model": s["face_correction"]["model"], "ltx_max": s["ltx"]["max_seconds"], "wan_max": s["wan"]["max_seconds"]}
     return e
 
 
@@ -312,6 +375,11 @@ def ep_shots(sid: str, eid: str, body: list = Body(...)):
     s = _s()
     b = store.bible(sid)
 
+    for inc in body:
+        try:
+            providers.validate_model(inc.get("engine") or b["style"].get("default_engine") or "ltx", inc.get("video_model") or "")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     def apply(e):
         old = {sh["id"]: sh for sh in e["shots"]}
         new_list = []
@@ -325,9 +393,13 @@ def ep_shots(sid: str, eid: str, body: list = Body(...)):
                     base[k] = inc[k]
             if not inc.get("duration_locked"):
                 eng = base.get("engine") or b["style"].get("default_engine") or "ltx"
-                cap = s["wan"]["max_seconds"] if eng == "wan" else s["ltx"]["max_seconds"]
+                cap = s[eng]["max_seconds"]
                 base["duration_s"] = planner.compute_duration(base, b, cap)
             new_list.append(base)
+        if {sh["id"] for sh in e["shots"]} - {sh.get("id") for sh in new_list}:
+            _ensure_idle(sid, eid)
+            e["gates"] = dict.fromkeys(e["gates"], False)
+            e["outputs"] = {}
         e["shots"] = new_list
         store.renumber_shots(e)
     return _decorate(sid, store.update_episode(sid, eid, apply))
@@ -365,11 +437,15 @@ async def shot_upload_frame(sid: str, eid: str, shot_id: str, file: UploadFile =
                             crop: str = Form(""), end: str = Form("")):
     s = _s()
     e = _ep(sid, eid)
+    s = settings_mod.for_episode(s, e)
     store.find_shot(e, shot_id)
     raw = await _save_upload(file, os.path.join(store.ep_dir(sid, eid), "uploads"))
     out_dir = os.path.join(store.ep_dir(sid, eid), "frames", shot_id)
     dst = os.path.join(out_dir, f"{'end' if end else 'u'}_{int(time.time() * 1000)}.png")
-    media.fit_image(raw, dst, s["image"]["width"], s["image"]["height"], json.loads(crop) if crop else None)
+    try:
+        media.fit_image(raw, dst, s["image"]["width"], s["image"]["height"], json.loads(crop) if crop else None)
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(400, "Could not read this photo or crop. Choose a valid JPEG, PNG, WebP or HEIC image.") from exc
     b = store.bible(sid)
 
     def apply(ep):
@@ -389,6 +465,7 @@ async def bulk_upload(sid: str, eid: str, files: list[UploadFile] = File(...)):
     """Files named by shot id (S03_SH02.png) become uploaded first frames."""
     s = _s()
     e = _ep(sid, eid)
+    s = settings_mod.for_episode(s, e)
     ids = {sh["id"].upper(): sh["id"] for sh in e["shots"]}
     matched, skipped = [], []
     b = store.bible(sid)
@@ -425,16 +502,16 @@ def shot_frame(sid: str, eid: str, shot_id: str, body: dict = Body(...)):
         if body.get("clear_end"):
             sh["end_frame"] = ""
         if "remove" in body:
-            i = int(body["remove"])
-            cands = sh["frame"]["candidates"]
-            if 0 <= i < len(cands):
-                cands.pop(i)
-                sel = sh["frame"].get("selected")
-                if sel is not None:
-                    sh["frame"]["selected"] = None if sel == i else (sel - 1 if sel > i else sel)
+            _ensure_idle(sid, eid)
+            store.remove_assets(sh["frame"], "candidates", [int(body["remove"])])
+            ep["gates"].update({"frames": False, "animatic": False, "takes": False})
+            ep["outputs"] = {}
         if "set_end" in body:
             sh["end_frame"] = body["set_end"]
-    return _decorate(sid, store.update_episode(sid, eid, apply))
+    try:
+        return _decorate(sid, store.update_episode(sid, eid, apply))
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/refine")
@@ -444,11 +521,43 @@ def shot_refine(sid: str, eid: str, shot_id: str, body: dict = Body(...)):
                    denoise=float(body.get("denoise") or 0.3))
 
 
+@app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/frame_correction")
+def frame_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default={})):
+    sh = store.find_shot(_ep(sid, eid), shot_id)
+    index = body.get("index", sh["frame"].get("selected"))
+    if type(index) is not int or not 0 <= index < len(sh["frame"]["candidates"]):
+        raise HTTPException(400, "Choose an existing frame first")
+    _correction_character(sid, sh)
+    return _submit("frame_correction", f"Qwen face correction: {shot_id}", jobs.job_frame_correction,
+                   sid=sid, eid=eid, shot_id=shot_id,
+                   source_file=sh["frame"]["candidates"][index]["file"])
+
+
+def _correction_character(sid, sh):
+    if len(sh.get("characters", [])) != 1:
+        raise HTTPException(400, "Character reference correction needs a single-character shot")
+    character = store.get_character(sid, sh["characters"][0]["id"])
+    if not character or not any(os.path.isfile(store.abs_media(p)) for p in character.get("refs", []) if p):
+        raise HTTPException(400, "Upload a reference photo for this character in Characters first")
+    return character
+
+
 # takes
 @app.post("/api/s/{sid}/e/{eid}/takes")
 def ep_takes(sid: str, eid: str, body: dict = Body(default={})):
+    _ep(sid, eid)
+    try:
+        if body.get("engine"):
+            providers.validate_model(body["engine"], body.get("model") or "")
+        elif body.get("model"):
+            raise ValueError("Choose an engine with the model")
+        if not 1 <= int(body.get("takes") or _s()["takes_per_shot"]) <= 8:
+            raise ValueError("Takes per shot must be between 1 and 8")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
     return _submit("takes", f"Takes {eid}", jobs.job_takes, sid=sid, eid=eid,
-                   shot_ids=body.get("shot_ids") or [], takes=body.get("takes"), force=bool(body.get("force")))
+                   shot_ids=body.get("shot_ids") or [], takes=body.get("takes"), force=bool(body.get("force")),
+                   engine_override=body.get("engine") or "", model_override=body.get("model") or "")
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/take")
@@ -465,13 +574,14 @@ def shot_take(sid: str, eid: str, shot_id: str, body: dict = Body(...)):
             if k in body:
                 t[k] = max(0.0, float(body[k] or 0))
         if "remove" in body:
-            i = int(body["remove"])
-            if 0 <= i < len(t["items"]):
-                t["items"].pop(i)
-                sel = t.get("selected")
-                if sel is not None:
-                    t["selected"] = None if sel == i else (sel - 1 if sel > i else sel)
-    return _decorate(sid, store.update_episode(sid, eid, apply))
+            _ensure_idle(sid, eid)
+            store.remove_assets(t, "items", [int(body["remove"])])
+            ep["gates"]["takes"] = False
+            ep["outputs"] = {}
+    try:
+        return _decorate(sid, store.update_episode(sid, eid, apply))
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/next_from_last")
@@ -512,9 +622,17 @@ def ep_cut(sid: str, eid: str):
 @app.post("/api/s/{sid}/e/{eid}/music")
 async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: float = Form(0.25),
                    duck: str = Form("true")):
+    _ep(sid, eid)
     rel = None
     if file is not None and file.filename:
         p = await _save_upload(file, os.path.join(store.ep_dir(sid, eid), "uploads"))
+        try:
+            info = media.probe(_s()['ffprobe'], p)
+            if not info['has_audio'] or not math.isfinite(info['duration']) or info['duration'] <= 0:
+                raise ValueError('Upload a playable music or voice file')
+        except (ValueError, media.MediaError) as exc:
+            os.unlink(p)
+            raise HTTPException(400, 'Upload a playable music or voice file') from exc
         rel = store.rel(p)
 
     def apply(e):
@@ -524,3 +642,147 @@ async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: fl
         m["volume"] = float(volume)
         m["duck"] = duck.lower() in ("1", "true", "yes", "on")
     return store.update_episode(sid, eid, apply)["music"]
+
+
+@app.post('/api/s/{sid}/e/{eid}/lipsync')
+def ep_lipsync(sid: str, eid: str, body: dict = Body(default={})):
+    from . import lipsync
+    episode = _ep(sid, eid)
+    audio_file = (episode.get('music') or {}).get('file')
+    if not audio_file or not os.path.isfile(store.abs_media(audio_file)):
+        raise HTTPException(400, 'Upload music or a voice recording in Cut first')
+    try:
+        offset = float(body.get('audio_offset', 0))
+        info = media.probe(_s()['ffprobe'], store.abs_media(audio_file))
+        if not info['has_audio'] or not math.isfinite(offset) or not 0 <= offset < info['duration']:
+            raise ValueError('Audio start must be within the uploaded recording')
+        timeline = lipsync.plan_episode(episode, body.get('shot_ids'), _s())
+        isolate = body.get('isolate_vocals', True)
+        if type(isolate) is not bool:
+            raise ValueError('Vocal isolation must be on or off')
+    except (ValueError, TypeError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _submit('lipsync', f'Lip-sync {eid}', lipsync.render, sid=sid, eid=eid, timeline=timeline,
+                   audio_file=audio_file, audio_offset=offset, isolate_vocals=isolate)
+
+
+@app.post('/api/s/{sid}/e/{eid}/lipsync/select')
+def select_lipsync(sid: str, eid: str, body: dict = Body(...)):
+    episode = _ep(sid, eid)
+    versions = episode.get('outputs', {}).get('lipsync_versions', [])
+    index = body.get('index')
+    if type(index) is not int or not 0 <= index < len(versions):
+        raise HTTPException(400, 'Choose an existing lip-sync preview')
+    version = versions[index]
+    if not os.path.isfile(store.abs_media(version['file'])):
+        raise HTTPException(400, 'The lip-sync preview file is missing')
+    def apply(ep):
+        outputs = ep.setdefault('outputs', {})
+        outputs.setdefault('before_lipsync', outputs.get('final'))
+        outputs.update(final=version['file'], runtime=version['runtime'])
+    return store.update_episode(sid, eid, apply)['outputs']
+
+
+# Deletion is recoverable and blocked while jobs can still write into the project.
+def _ensure_idle(sid, eid=None):
+    for job in jobs.QUEUE.list():
+        params = job.get("params", {})
+        if job["status"] in ("queued", "running") and params.get("sid") == sid:
+            if eid is None or params.get("eid") in (None, eid):
+                raise HTTPException(409, "Cancel or finish this project's active jobs before deleting.")
+
+
+@app.delete("/api/s/{sid}")
+def series_delete(sid: str):
+    _ensure_idle(sid)
+    store.get_series(sid) or _404("project")
+    store.archive_dir(store.series_dir(sid))
+    return {"ok": True}
+
+
+@app.delete("/api/s/{sid}/e/{eid}")
+def episode_delete(sid: str, eid: str):
+    _ensure_idle(sid, eid)
+    _ep(sid, eid)
+    store.archive_dir(store.ep_dir(sid, eid))
+    return {"ok": True}
+
+
+@app.post("/api/s/{sid}/e/{eid}/delete_assets")
+def delete_assets(sid: str, eid: str, body: dict = Body(...)):
+    _ensure_idle(sid, eid)
+    kind = body.get("kind")
+    if kind not in ("frame", "take"):
+        raise HTTPException(400, "kind must be frame or take")
+    def apply(ep):
+        # Validate the entire request before changing any shot.
+        for shot_id, indices in body.get("items", {}).items():
+            sh = store.find_shot(ep, shot_id)
+            group = sh["frame" if kind == "frame" else "takes"]
+            values = group["candidates" if kind == "frame" else "items"]
+            if any(type(i) is not int or i < 0 or i >= len(values) for i in indices):
+                raise ValueError("invalid asset index")
+        for shot_id, indices in body.get("items", {}).items():
+            sh = store.find_shot(ep, shot_id)
+            store.remove_assets(sh["frame" if kind == "frame" else "takes"],
+                                "candidates" if kind == "frame" else "items", indices)
+        ep["gates"].update({"frames": False, "animatic": False, "takes": False} if kind == "frame" else {"takes": False})
+        ep["outputs"] = {}
+    try:
+        return _decorate(sid, store.update_episode(sid, eid, apply))
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/face_correction")
+def face_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default={})):
+    sh = store.find_shot(_ep(sid, eid), shot_id)
+    index = body.get("index", sh["takes"].get("selected"))
+    index = 0 if index is None else index
+    if type(index) is not int or not 0 <= index < len(sh["takes"]["items"]):
+        raise HTTPException(400, "Choose an existing take first")
+    model = body.get("model") or _s()["face_correction"]["model"]
+    if model not in ("keep", "codeformer", "minimax_identity", "qwen_identity"):
+        raise HTTPException(400, "Unknown face correction model")
+    if model in ("minimax_identity", "qwen_identity"):
+        _correction_character(sid, sh)
+    return _submit("face_correction", f"Face correction: {shot_id}", jobs.job_face_correction,
+                   sid=sid, eid=eid, shot_id=shot_id,
+                   source_file=sh["takes"]["items"][index]["file"], model=model)
+
+
+@app.get("/api/models")
+def video_models():
+    from .providers import VIDEO_MODELS
+    return VIDEO_MODELS
+
+
+
+@app.post("/api/image_preview")
+async def image_preview(file: UploadFile = File(...)):
+    data = await file.read(30 * 1024 * 1024 + 1)
+    if len(data) > 30 * 1024 * 1024:
+        raise HTTPException(413, "Choose a photo smaller than 30 MB")
+    try:
+        return Response(media.image_preview(data), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    except (OSError, ValueError) as exc:
+        raise HTTPException(415, "This photo could not be opened. Try a JPEG, PNG, WebP or HEIC image.") from exc
+
+
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse(os.path.join(HERE, "static", "sw.js"), media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
+@app.get("/api/mobile")
+def mobile_config():
+    return {"https_url": _s().get("mobile", {}).get("https_url", "")}
+
+
+@app.get("/local-ca.crt")
+def local_certificate():
+    path = os.path.join(HERE, "static", "reelwright-local-ca.crt")
+    if not os.path.isfile(path):
+        _404("local HTTPS certificate")
+    return FileResponse(path, media_type="application/x-x509-ca-cert", filename="Reelwright-Local-CA.crt")

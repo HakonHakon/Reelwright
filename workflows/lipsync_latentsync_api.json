@@ -1,0 +1,10 @@
+{
+  "1": {"class_type": "LoadVideo", "inputs": {"file": "your_video.mp4"}},
+  "2": {"class_type": "LoadAudio", "inputs": {"audio": "your_music.wav"}},
+  "3": {"class_type": "ReelwrightSeparateVocals", "inputs": {"audio": ["2", 0]}},
+  "4": {
+    "class_type": "ReelwrightLatentSync",
+    "inputs": {"video": ["1", 0], "audio": ["3", 0], "soundtrack": ["2", 0], "steps": 20, "guidance": 1.5, "seed": 1247}
+  },
+  "5": {"class_type": "SaveVideo", "inputs": {"video": ["4", 0], "filename_prefix": "Reelwright/lipsync", "format": "mp4", "codec": "auto"}}
+}

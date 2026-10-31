@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 
 from . import comfy as comfy_mod
-from . import llm, media, planner, prompts, store, workflows
+from . import llm, media, planner, prompts, store, workflows, providers
 from . import settings as settings_mod
 
 
@@ -302,6 +302,7 @@ def _ep_path(sid, eid, *parts):
 def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
     s, c = _ctx()
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     b = store.bible(sid)
     shots = [sh for sh in e["shots"] if (not shot_ids or sh["id"] in shot_ids)]
     todo = []
@@ -475,6 +476,7 @@ def job_refine(job, sid, eid, shot_id, cand_index, engine="flux_lora", denoise=0
     _gpu_prepare(job, s, c)
     b = store.bible(sid)
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     sh = store.find_shot(e, shot_id)
     cand = sh["frame"]["candidates"][int(cand_index)]
     name = c.upload(store.abs_media(cand["file"]), f"studio_{eid}_{shot_id}_refine_{int(time.time())}.png")
@@ -526,10 +528,11 @@ def _anchor_end(s, sh) -> bool:
     return sh.get("start_mode") == "punch_in" or (sh.get("framing") or "").lower() in prompts.CLOSE_FRAMINGS
 
 
-def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False):
+def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_override="", model_override=""):
     s, c = _ctx()
     b = store.bible(sid)
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     shots = sorted(e["shots"], key=lambda x: x["order"])
     todo = [sh for sh in shots if (not shot_ids or sh["id"] in shot_ids)
             and not (sh["takes"].get("locked") and not force)
@@ -537,7 +540,11 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False):
     if not todo:
         job.say("Nothing to render.")
         return
-    _gpu_prepare(job, s, c)
+    engines = {engine_override or sh.get("engine") or b["style"].get("default_engine") or "ltx" for sh in todo}
+    for engine in engines:
+        providers.validate_model(engine, model_override if engine_override else "")
+    if engines != {"minimax"}:
+        _gpu_prepare(job, s, c)
     n_takes = int(takes or s["takes_per_shot"])
     job.progress = [0, len(todo) * n_takes]
     done = 0
@@ -546,8 +553,8 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False):
         job.check()
         e = store.get_episode(sid, eid)  # refresh: chained shots need the latest previous take
         sh = store.find_shot(e, sh["id"])
-        engine = sh.get("engine") or b["style"].get("default_engine") or "ltx"
-        if last_engine and engine != last_engine:
+        engine = engine_override or sh.get("engine") or b["style"].get("default_engine") or "ltx"
+        if last_engine and engine != last_engine and last_engine != "minimax":
             c.free()
         last_engine = engine
 
@@ -555,21 +562,40 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False):
         if not first:
             done += n_takes
             continue
-        first_name = c.upload(first, f"studio_{eid}_{sh['id']}_first.png")
+        first_name = None if engine == "minimax" else c.upload(first, f"studio_{eid}_{sh['id']}_first.png")
         end_name = None
-        if sh.get("end_frame"):
+        if engine != "minimax" and sh.get("end_frame"):
             end_name = c.upload(store.abs_media(sh["end_frame"]), f"studio_{eid}_{sh['id']}_end.png")
-        elif engine != "wan" and _anchor_end(s, sh):
+        elif engine == "ltx" and _anchor_end(s, sh):
             end_name = first_name
             job.say(f"{sh['id']}: end anchored to the first frame (hold the framing)")
-        max_s = float(s["wan"]["max_seconds"] if engine == "wan" else s["ltx"]["max_seconds"])
+        max_s = float(s[engine]["max_seconds"])
         seconds = min(float(sh.get("duration_s") or 3), max_s)
         out_dir = _ep_path(sid, eid, "takes", sh["id"])
         for t in range(n_takes):
             job.check()
             seed = _seed()
             prefix = f"studio/{eid}/{sh['id']}"
-            if engine == "wan":
+            if engine == "minimax":
+                model = model_override or sh.get("video_model") or s["minimax"]["model"]
+                path, elapsed, model = providers.minimax_generate(
+                    job, s, first, prompts.motion_prompt(sh, b, engine), seconds, out_dir, model)
+                info = media.probe(s["ffprobe"], path)
+                frames = max(1, round(info["duration"] * info["fps"]))
+                item = {"file": store.rel(path), "engine": engine, "model": model,
+                        "seed": None, "frames": frames, "seconds": round(info["duration"], 2),
+                        "render_s": round(elapsed), "flags": media.qc_video(path, info["duration"], info["duration"]),
+                        "first_frame": store.rel(first), "sig": store.bible_signature(b, sh), "created": store.now()}
+                store.update_episode(sid, eid, lambda ep: store.find_shot(ep, sh["id"])["takes"]["items"].append(item))
+                done += 1
+                job.progress = [done, len(todo) * n_takes]
+                continue
+            if engine == "minimax_local":
+                seconds = max(4.0, seconds)
+                frames = workflows.minimax_h3_frames(seconds)
+                wf = workflows.minimax_h3_i2v(s, prompts.motion_prompt(sh, b, engine), first_name,
+                                             frames, seed, end_name, prefix)
+            elif engine == "wan":
                 frames = workflows.wan_frames(seconds, int(s["wan"]["fps"]))
                 wf = workflows.wan_i2v(s, prompts.motion_prompt(sh, b, "wan"), first_name, frames, seed,
                                        prompts.video_loras(sh, b), prefix)
@@ -592,7 +618,7 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False):
             flags = media.qc_video(path, seconds, info["duration"])
             spf = res["seconds"] / max(1, frames)
             job.say(f"  done in {res['seconds']:.0f}s ({spf:.2f} s/frame){' - flags: ' + ', '.join(flags) if flags else ''}")
-            item = {"file": store.rel(path), "engine": engine, "seed": seed, "frames": frames,
+            item = {"file": store.rel(path), "engine": engine, "model": "MiniMax-H3" if engine == "minimax_local" else engine, "seed": seed, "frames": frames,
                     "seconds": round(info["duration"], 2), "render_s": round(res["seconds"]),
                     "flags": flags, "first_frame": store.rel(first),
                     "sig": store.bible_signature(b, sh), "created": store.now()}
@@ -636,6 +662,7 @@ def _first_frame_for(job, s, sid, eid, e, sh):
 def job_animatic(job, sid, eid):
     s, _ = _ctx()
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     items = []
     for sh in sorted(e["shots"], key=lambda x: x["order"]):
         sel = _selected_frame(sh) or (sh["frame"]["candidates"][0] if sh["frame"]["candidates"] else None)
@@ -654,6 +681,7 @@ def job_animatic(job, sid, eid):
 def job_cut(job, sid, eid):
     s, _ = _ctx()
     e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
     b = store.bible(sid)
     v = s["video"]
     work = _ep_path(sid, eid, "out", "work")
@@ -703,3 +731,69 @@ def job_cut(job, sid, eid):
         final=store.rel(final), srt=store.rel(os.path.join(out_dir, "final.srt")),
         edl=store.rel(os.path.join(out_dir, "final.edl")), runtime=round(t, 2)))
     job.say(f"Final cut: {t:.1f}s -> {final}")
+
+
+def job_frame_correction(job, sid, eid, shot_id, source_file):
+    from . import face_correction
+    s, c = _ctx()
+    sh = store.find_shot(store.get_episode(sid, eid), shot_id)
+    if not any(x["file"] == source_file for x in sh["frame"]["candidates"]):
+        raise ValueError("Source frame was removed")
+    if len(sh.get("characters", [])) != 1:
+        raise ValueError("Character reference correction needs a single-character shot")
+    character = store.get_character(sid, sh["characters"][0]["id"])
+    if not character:
+        raise ValueError("The shot's character was removed")
+    _gpu_prepare(job, s, c)
+    destination = os.path.join(_ep_path(sid, eid, "frames", shot_id), f"qwen_{uuid.uuid4().hex}.png")
+    job.say(f"Correcting {character['name']} with Qwen Image Edit and the uploaded portrait")
+    face_correction.qwen_correct_image(job, s, store.abs_media(source_file), destination, character, client=c)
+    job.check()
+    def apply(ep):
+        shot = store.find_shot(ep, shot_id)
+        shot["frame"]["candidates"].append({"file": store.rel(destination), "source": "qwen_identity",
+            "source_frame": source_file, "character_refs": list(character["refs"]),
+            "sig": store.bible_signature(store.bible(sid), shot), "seed": 224147, "check": None})
+        ep["gates"]["frames"] = False
+    store.update_episode(sid, eid, apply)
+    job.say("Qwen-corrected frame added for review. Original retained.")
+
+
+def job_face_correction(job, sid, eid, shot_id, source_file, model="keep"):
+    from . import face_correction
+    s, c = _ctx()
+    sh = store.find_shot(store.get_episode(sid, eid), shot_id)
+    original = next((x for x in sh["takes"]["items"] if x["file"] == source_file), None)
+    if original is None:
+        raise ValueError("Source take was removed")
+    if c.alive():
+        c.free()
+    llm.unload(s["ollama_host"], [s["planner_model"], s["vision_model"]])
+    destination = os.path.join(_ep_path(sid, eid, "takes", shot_id), f"face_{uuid.uuid4().hex}.mp4")
+    started = time.monotonic()
+    if model in ("minimax_identity", "qwen_identity"):
+        if len(sh.get("characters", [])) != 1:
+            raise ValueError("Character reference correction needs a single-character shot")
+        character = store.get_character(sid, sh["characters"][0]["id"])
+        if not character:
+            raise ValueError("The shot's character was removed")
+        correct = face_correction.qwen_correct_take if model == "qwen_identity" else face_correction.match_identity
+        correct(job, s, store.abs_media(source_file), destination, character)
+    else:
+        face_correction.restore(job, s, store.abs_media(source_file), destination, model)
+    job.check()
+    item = {**original, "file": store.rel(destination), "source_take": source_file,
+            "face_correction": model, "created": store.now(), "render_s": round(time.monotonic() - started)}
+    if model == "minimax_identity":
+        item.update(model="MiniMax H3 · character references", engine="minimax_local",
+                    character_refs=list(character["refs"]), flags=["Character likeness needs review"])
+    elif model == "qwen_identity":
+        item.update(model="Qwen Image Edit · every frame", engine="qwen_identity",
+                    character_refs=list(character["refs"]), flags=["Character likeness and motion need review"])
+    def apply(ep):
+        take = store.find_shot(ep, shot_id)["takes"]
+        take["items"].append(item)
+        # Keep the user's original pick until they review the restored version.
+        ep["gates"]["takes"] = False
+    store.update_episode(sid, eid, apply)
+    job.say("Corrected take added for review. Original retained.")

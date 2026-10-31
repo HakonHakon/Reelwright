@@ -79,6 +79,26 @@ DEFAULTS = {
         "max_seconds": 5,
         "negative": "blurry, static, deformed, extra fingers, watermark, subtitles, text",
     },
+    "minimax_local": {
+        "unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "clip": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+        "lora": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+        "steps": 4, "width": 608, "height": 352, "max_seconds": 15,
+    },
+    "minimax": {
+        "model": "MiniMax-Hailuo-2.3", "resolution": "768P",
+        "api_key_env": "MINIMAX_API_KEY", "base_url": "https://api.minimax.io/v1",
+        "poll_seconds": 5, "timeout_seconds": 1800, "max_seconds": 10,
+    },
+    "face_correction": {
+        "model": "qwen_identity", "keep_dir": "", "codeformer_dir": "",
+        "python": "", "fidelity": 0.8,
+        "identity_unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "identity_lora": "h3_character_swap_v1.5.safetensors",
+        "identity_turbo_lora": "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+    },
     "loudness_lufs": -16,
     "continuity": {
         "punch_in_denoise": 0.32,   # low: keep the master's face, age and clothes; only re-sharpen
@@ -161,3 +181,21 @@ def raw_user() -> dict:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
             return json.load(f)
     return {}
+
+
+def for_episode(s: dict, episode: dict) -> dict:
+    """Apply a project's portrait/landscape output sizes without changing other projects."""
+    if not episode.get('video') and not episode.get('image'):
+        return s
+    import math
+    result = copy.deepcopy(s)
+    for key in ('video', 'image'):
+        if episode.get(key):
+            result[key].update(episode[key])
+    if episode.get('video'):
+        ratio = result['video']['width'] / result['video']['height']
+        h3 = result['minimax_local']
+        pixels = h3['width'] * h3['height']
+        h3['width'] = max(32, round(math.sqrt(pixels * ratio) / 32) * 32)
+        h3['height'] = max(32, round(math.sqrt(pixels / ratio) / 32) * 32)
+    return result

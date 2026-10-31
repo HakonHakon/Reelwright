@@ -33,6 +33,44 @@ async function api(method, url, body, isForm) {
 const GET = (u) => api("GET", u), POST = (u, b) => api("POST", u, b ?? {}), PUT = (u, b) => api("PUT", u, b);
 const FORM = (u, fd) => api("POST", u, fd, true);
 
+// A shared selection control for every deletable collection.
+function bulkSelect(root, selector, remove, refresh = route, label = "items") {
+  const targets = $$(selector, root);
+  if (!targets.length) return;
+  const bar = document.createElement("div");
+  bar.className = "row bulk-actions";
+  bar.innerHTML = `<label><input type="checkbox" aria-label="Select all ${esc(label)}"> Select all ${esc(label)}</label><button class="danger" disabled>Delete selected</button><span class="muted small"></span>`;
+  root.prepend(bar);
+  const boxes = targets.map((target, i) => {
+    const box = document.createElement("input"); box.type = "checkbox";
+    box.className = "bulk-check"; box.setAttribute("aria-label", `Select ${label} ${i + 1}`);
+    box.addEventListener("click", e => e.stopPropagation());
+    if (target.tagName === "A") {
+      const wrap = document.createElement("div"); target.replaceWith(wrap); wrap.append(box, target);
+    } else target.before(box);
+    return box;
+  });
+  const all = $("input", bar), button = $("button", bar), count = $("span", bar);
+  const sync = () => {
+    const n = boxes.filter(b => b.checked).length;
+    button.disabled = !n; count.textContent = `${n} selected`;
+    all.checked = n === boxes.length; all.indeterminate = n > 0 && n < boxes.length;
+    App.selecting = n > 0;
+  };
+  boxes.forEach(b => b.addEventListener("change", sync));
+  all.onchange = () => { boxes.forEach(b => { b.checked = all.checked; }); sync(); };
+  button.onclick = async (event) => {
+    event.stopPropagation();
+    const selected = targets.filter((_, i) => boxes[i].checked);
+    if (!(await ask(`Delete ${selected.length} selected ${label}?`, "Delete selected", true))) return;
+    button.disabled = true;
+    try { await remove(selected); App.selecting = false; await refresh(); }
+    catch { App.selecting = false; await refresh(); }
+  };
+}
+const VIDEO_ENGINES = ["minimax_local", "ltx", "wan", "minimax"];
+const engineOptions = (current) => VIDEO_ENGINES.map(x => `<option value="${x}" ${x === current ? "selected" : ""}>${esc({minimax_local:"MiniMax H3 (local)",ltx:"LTX-2.3",wan:"Wan 2.2",minimax:"MiniMax (cloud)"}[x])}</option>`).join("");
+
 // ── toasts ───────────────────────────────────────────────────────────────
 function toast(msg, bad) {
   const d = document.createElement("div");
@@ -47,9 +85,14 @@ function toast(msg, bad) {
 }
 
 // ── modal + lightbox gallery ─────────────────────────────────────────────
-function modal(html) { $("#modal-body").innerHTML = html; $("#modal").classList.remove("hidden"); }
+let modalCleanup = null;
+function modal(html) { closeModal(); $("#lightbox").classList.remove("on"); document.body.classList.add("modal-open"); $("#modal-body").innerHTML = html; $("#modal").classList.remove("hidden"); }
 let askDone = null;
 function closeModal() {
+  document.body.classList.remove("modal-open");
+  const cleanup = modalCleanup; modalCleanup = null;
+  if (cleanup) cleanup();
+  $("#modal-body").classList.remove("crop-dialog");
   $("#modal").classList.add("hidden"); $("#modal-body").innerHTML = "";
   if (askDone) { const f = askDone; askDone = null; f(false); }
 }
@@ -94,7 +137,7 @@ function crumbs(parts) {
 }
 
 function sourceLabel(s) {
-  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Reference photos (Qwen Edit)", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master" }[s] || s || "inherit";
+  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Reference photos (Qwen Edit)", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master" }[s] || s || "inherit";
 }
 
 // ── sidebar ──────────────────────────────────────────────────────────────
@@ -105,7 +148,7 @@ function renderNav() {
     const on = location.hash.replace(/\/(story|shots|frames|animatic|takes|cut)$/, "") === href.replace(/\/(story|shots|frames|animatic|takes|cut)$/, "");
     return `<a class="nav-item ${sub ? "sub" : ""} ${on ? "on" : ""}" href="${href}" data-i="${esc(label.trim().charAt(0).toUpperCase())}" title="${esc(label)}"><span class="lbl">${esc(label)}</span>${extra}</a>`;
   };
-  let html = item("#/", "folder", "Projects") + item("#/settings", "settings", "Settings");
+  let html = item("#/", "folder", "Projects") + item("#/settings", "settings", "Settings") + item("#/models", "settings", "Models");
   if (d) {
     const chars = Object.values(d.bible.characters), locs = Object.values(d.bible.locations);
     html += `<div class="nav-sec">${esc(d.series.name)}</div>` +
@@ -123,7 +166,12 @@ async function getSeries(sid) {
 }
 function setCollapsed(c) { $("#app").classList.toggle("collapsed", c); store.set("rw-collapse", c ? "1" : "0"); }
 $("#collapse-btn").onclick = () => setCollapsed(!$("#app").classList.contains("collapsed"));
-$("#menu-btn").onclick = () => $("#app").classList.toggle("menu");
+function setMenu(open) {
+  $("#app").classList.toggle("menu", open); $("#menu-backdrop").hidden = !open;
+  $("#menu-btn").setAttribute("aria-expanded", String(open));
+}
+$("#menu-btn").onclick = () => setMenu(!$("#app").classList.contains("menu"));
+$("#menu-backdrop").onclick = () => setMenu(false);
 if (store.get("rw-collapse") === "1") setCollapsed(true);
 function setTheme(t) {
   document.documentElement.dataset.theme = t; store.set("rw-theme", t);
@@ -132,7 +180,7 @@ function setTheme(t) {
 $("#theme-btn").onclick = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
 setTheme(document.documentElement.dataset.theme || "light");
 const narrow = window.matchMedia("(max-width: 980px)");
-const syncNarrow = () => { $("#menu-btn").style.display = narrow.matches ? "" : "none"; };
+const syncNarrow = () => { $("#menu-btn").style.display = narrow.matches ? "" : "none"; if (!narrow.matches) setMenu(false); };
 narrow.addEventListener("change", syncNarrow); syncNarrow();
 
 // ── status + jobs drawer ─────────────────────────────────────────────────
@@ -179,6 +227,7 @@ async function pollJobs() {
       App.lastJobs[j.id] = j.status;
     }
     if (finished && App.refreshers.length) {
+      if (App.selecting || App.interactionBusy || !$("#modal").classList.contains("hidden")) return;
       if (App.dirty) { if (!App.dirtyWarned) { toast("New results are ready - save your edits, then reload this section."); App.dirtyWarned = true; } }
       else App.refreshers.forEach((f) => f());
     }
@@ -262,10 +311,11 @@ document.addEventListener("keydown", (e) => {
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(true); return; }
   if (e.key === "Escape") {
-    if ($("#lightbox").classList.contains("on")) $("#lightbox").classList.remove("on");
+    if (!$("#modal").classList.contains("hidden")) closeModal();
+    else if ($("#lightbox").classList.contains("on")) $("#lightbox").classList.remove("on");
     else if ($("#palette").classList.contains("on")) openPalette(false);
     else if ($("#jobs").classList.contains("on")) openJobs(false);
-    else closeModal();
+    else { setMenu(false); closeModal(); }
     return;
   }
   if ($("#lightbox").classList.contains("on")) { if (e.key === "ArrowLeft") lbStep(-1); if (e.key === "ArrowRight") lbStep(1); return; }
@@ -280,16 +330,18 @@ document.addEventListener("keydown", (e) => {
 // ── router ───────────────────────────────────────────────────────────────
 const SKELETON = `<div class="skel h1"></div><div class="skel row-card"></div><div class="skel row-card"></div>`;
 async function route() {
-  App.refreshers = []; App.dirty = false; App.dirtyWarned = false;
+  closeModal();
+  App.refreshers = []; App.selecting = false; App.dirty = false; App.dirtyWarned = false;
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
   const first = !App.route.length || App.route.join("/") !== parts.join("/");
   App.route = parts;
-  $("#app").classList.remove("menu");
+  setMenu(false);
   const view = $("#view");
   if (first) { view.innerHTML = SKELETON; view.style.animation = "none"; void view.offsetHeight; view.style.animation = ""; }
   renderNav();
   try {
     if (!parts.length) return await viewHome(view);
+    if (parts[0] === "models") return await viewModels(view);
     if (parts[0] === "settings") return await viewSettings(view);
     if (parts[0] === "s") {
       const sid = parts[1];
@@ -306,7 +358,7 @@ async function route() {
   }
 }
 window.addEventListener("hashchange", route);
-$("#view").addEventListener("input", (e) => { if (!e.target.matches("input[type=file]")) App.dirty = true; });
+$("#view").addEventListener("input", (e) => { if (!e.target.matches("input[type=file], .bulk-check, .bulk-actions input, input[data-chk]")) App.dirty = true; });
 window.addEventListener("beforeunload", (e) => { if (App.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
 // ── shared bits ──────────────────────────────────────────────────────────
@@ -344,6 +396,12 @@ async function viewHome(view) {
     const name = $("#new-series").value.trim(); if (!name) return toast("Give the project a name", true);
     const s = await POST("/api/series", { name }); location.hash = `#/s/${s.id}`;
   };
+  bulkSelect(view, ".sheet", async targets => {
+    for (const target of targets) {
+      const sid = target.getAttribute("href").split("/").at(-1);
+      await api("DELETE", `/api/s/${sid}`); delete App.sd[sid];
+    }
+  }, route, "projects");
   $("#add-series").onclick = create; onEnter("#new-series", create);
 }
 
@@ -364,6 +422,20 @@ async function viewSeries(view, sid) {
     <div class="section-head"><h2>Locations</h2></div>
     <div class="prints wide">${locs.map((l) => printFig(locThumb(l), l.name, `#/s/${sid}/l/${l.id}`, `${l.draft ? "draft, " : ""}${Object.keys(l.variants || {}).join(", ") || "no variants"}`)).join("")}</div>
     ${addCard("new-loc", "Location name", "add-loc", "Add location")}`;
+  const deleteProject = document.createElement("button"); deleteProject.className = "danger";
+  deleteProject.textContent = "Delete project"; $(".page-head", view).append(deleteProject);
+  deleteProject.onclick = async () => {
+    if (await ask(`Delete ${d.series.name} and all its episodes? Files are kept in a .deleted folder.`, "Delete project", true)) {
+      await api("DELETE", `/api/s/${sid}`); delete App.sd[sid]; location.hash = "#/";
+    }
+  };
+  bulkSelect(view, ".eprow, .prints a", async targets => {
+    for (const target of targets) {
+      const parts = target.getAttribute("href").split("/");
+      const kind = parts[3], id = parts[4];
+      await api("DELETE", kind === "e" ? `/api/s/${sid}/e/${id}` : `/api/s/${sid}/${kind === "c" ? "characters" : "locations"}/${id}`);
+    }
+  }, route, "episodes, characters and locations");
   const addEp = async () => { const e = await POST(`/api/s/${sid}/episodes`, { title: $("#new-ep").value || "New episode" }); location.hash = `#/s/${sid}/e/${e.id}/story`; };
   const addChar = async () => { const c = await POST(`/api/s/${sid}/characters`, { name: $("#new-char").value || "New character" }); location.hash = `#/s/${sid}/c/${c.id}`; };
   const addLoc = async () => { const l = await POST(`/api/s/${sid}/locations`, { name: $("#new-loc").value || "New location" }); location.hash = `#/s/${sid}/l/${l.id}`; };
@@ -456,6 +528,9 @@ async function viewCharacter(view, sid, cid) {
     if (t.dataset.ref) { await POST(`/api/s/${sid}/characters/${cid}/refs`, { add: t.dataset.ref }); route(); }
     if (t.dataset.unref) { await POST(`/api/s/${sid}/characters/${cid}/refs`, { remove: t.dataset.unref }); route(); }
   };
+  bulkSelect(view, "[data-unref]", async targets => {
+    for (const t of targets) await POST(`/api/s/${sid}/characters/${cid}/refs`, { remove: t.dataset.unref });
+  }, route, "references");
   App.refreshers.push(route);
 }
 
@@ -517,7 +592,7 @@ async function viewStyle(view, sid) {
       <div class="full"><label>Colour grade (end of every image prompt)</label><input id="f-grade" value="${esc(st.grade)}"></div>
       <div class="full"><label>Negative prompt (images)</label><input id="f-neg" value="${esc(st.negative)}"></div>
       <div><label>Default first-frame source</label>${sourceSelect("f-src", st.default_frame_source, false)}</div>
-      <div><label>Default video engine</label><select id="f-eng">${["ltx", "wan"].map((o) => `<option value="${o}" ${o === st.default_engine ? "selected" : ""}>${o === "ltx" ? "LTX-2.3 (sound, dialogue)" : "Wan 2.2 (silent, 4-step)"}</option>`).join("")}</select></div>
+      <div><label>Default video engine</label><select id="f-eng">${engineOptions(st.default_engine)}</select></div>
       <div class="full"><label>Music policy (notes)</label><input id="f-music" value="${esc(st.music_policy)}"></div>
       <div class="full"><label>Props - one per line, "id: description"</label><textarea id="f-props">${esc((d.bible.props || []).map((p) => `${p.id}: ${p.description}`).join("\n"))}</textarea></div>
       <div class="full" style="margin-top:12px"><button class="primary" id="save">Save</button></div>
@@ -543,6 +618,41 @@ async function viewSettings(view) {
   $("#save").onclick = async () => {
     let obj; try { obj = JSON.parse($("#user").value || "{}"); } catch (e) { return toast("Invalid JSON: " + e.message, true); }
     await PUT("/api/settings", obj); toast("Saved."); refreshStatus(); route();
+  };
+}
+
+async function viewModels(view) {
+  crumbs([["Models", null]]);
+  const [settings, models] = await Promise.all([GET("/api/settings"), GET("/api/models")]);
+  const cfg = settings.effective, face = cfg.face_correction;
+  view.innerHTML = `<h1>Models</h1><h2>Video generation</h2>
+    <p>Choose a model when rendering in Takes, or set a default engine in Style &amp; props.</p>
+    <div class="card">${models.map(m => `<p>${esc(m.name)}</p>`).join("")}</div>
+    <h2>Lip-sync · local</h2><p>LatentSync 1.6 synchronizes existing shots to an uploaded music or voice recording. Optional Demucs vocal isolation separates the singing voice for guidance while keeping the full music mix in the export. Upload audio in Cut, choose the character and shots, then review the new version. Runs in ComfyUI on this PC with no paid API.</p>
+    <h2>MiniMax H3 · local</h2><p>Generates video and sound on this PC through ComfyUI, with no API key or per-generation API fee. Uses quantized open weights and 4-step Turbo sampling. Local clips are at least 4 seconds; trim shorter shots in Takes. Model weight license: <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE" target="_blank" rel="noopener">MiniMax H3 Community License</a>.</p>
+    <h2>MiniMax cloud (optional, paid)</h2><p>Cloud generation sends your first frame and prompt to MiniMax and uses your paid API account. Set <code>${esc(cfg.minimax.api_key_env)}</code> in the server environment, then restart Studio.</p>
+    <div class="card form-grid"><div><label>Default MiniMax model</label><select id="mm-model">${models.filter(m => m.engine === "minimax").map(m => `<option value="${esc(m.id)}" ${m.id === cfg.minimax.model ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></div>
+    <div><label>Resolution</label><select id="mm-resolution">${["768P", "1080P"].map(x => `<option ${x === cfg.minimax.resolution ? "selected" : ""}>${x}</option>`).join("")}</select></div></div>
+    <h2>Face correction</h2><p>Qwen Image Edit corrects each original frame using the uploaded character portrait and retains the source soundtrack. It is also available on First frames. MiniMax H3 edits single-character videos up to 15 seconds. KEEP restores a single main face over time; CodeFormer restores multiple faces. Each correction adds a version for review and retains your original. See STUDIO.md for model installation.</p>
+    <div class="card form-grid"><div><label>Default correction model</label><select id="face-model"><option value="qwen_identity" ${face.model === "qwen_identity" ? "selected" : ""}>Qwen Image Edit · every frame</option><option value="minimax_identity" ${face.model === "minimax_identity" ? "selected" : ""}>MiniMax H3 · match character references</option><option value="keep" ${face.model === "keep" ? "selected" : ""}>KEEP · temporal video restoration</option><option value="codeformer" ${face.model === "codeformer" ? "selected" : ""}>CodeFormer · multiple faces</option></select></div>
+    <div><label>Restorer Python executable (blank: Studio Python)</label><input id="face-python" value="${esc(face.python)}"></div>
+    <div><label>KEEP installation folder</label><input id="keep-dir" value="${esc(face.keep_dir)}"></div>
+    <div><label>CodeFormer installation folder</label><input id="codeformer-dir" value="${esc(face.codeformer_dir)}"></div>
+    <div><label>CodeFormer identity fidelity (0–1)</label><input type="number" id="face-fidelity" min="0" max="1" step="0.05" value="${face.fidelity}"></div></div>
+    <details><summary>Local character reference files</summary><div class="form-grid">
+    <div><label>MiniMax Ref2VA checkpoint</label><input id="identity-unet" value="${esc(face.identity_unet)}"></div>
+    <div><label>Character Swap adapter</label><input id="identity-lora" value="${esc(face.identity_lora)}"></div>
+    <div><label>Eight-step Turbo adapter</label><input id="identity-turbo" value="${esc(face.identity_turbo_lora)}"></div></div></details>
+    <button class="primary" id="save-models">Save model settings</button>`;
+  $("#save-models").onclick = async () => {
+    const user = {...settings.user,
+      minimax: {...(settings.user.minimax || {}), model: $("#mm-model").value, resolution: $("#mm-resolution").value},
+      face_correction: {...(settings.user.face_correction || {}), model: $("#face-model").value,
+        python: $("#face-python").value.trim(), keep_dir: $("#keep-dir").value.trim(),
+        codeformer_dir: $("#codeformer-dir").value.trim(), fidelity: Number($("#face-fidelity").value),
+        identity_unet: $("#identity-unet").value.trim(), identity_lora: $("#identity-lora").value.trim(),
+        identity_turbo_lora: $("#identity-turbo").value.trim()}};
+    await PUT("/api/settings", user); toast("Model settings saved.");
   };
 }
 

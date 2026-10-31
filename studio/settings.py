@@ -93,7 +93,7 @@ DEFAULTS = {
         "poll_seconds": 5, "timeout_seconds": 1800, "max_seconds": 10,
     },
     "face_correction": {
-        "model": "keep", "keep_dir": "", "codeformer_dir": "",
+        "model": "qwen_identity", "keep_dir": "", "codeformer_dir": "",
         "python": "", "fidelity": 0.8,
         "identity_unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         "identity_lora": "h3_character_swap_v1.5.safetensors",

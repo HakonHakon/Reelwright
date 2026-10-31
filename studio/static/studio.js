@@ -137,7 +137,7 @@ function crumbs(parts) {
 }
 
 function sourceLabel(s) {
-  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Reference photos (Qwen Edit)", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master" }[s] || s || "inherit";
+  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Reference photos (Qwen Edit)", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master" }[s] || s || "inherit";
 }
 
 // ── sidebar ──────────────────────────────────────────────────────────────
@@ -628,12 +628,13 @@ async function viewModels(view) {
   view.innerHTML = `<h1>Models</h1><h2>Video generation</h2>
     <p>Choose a model when rendering in Takes, or set a default engine in Style &amp; props.</p>
     <div class="card">${models.map(m => `<p>${esc(m.name)}</p>`).join("")}</div>
+    <h2>Lip-sync · local</h2><p>LatentSync 1.6 synchronizes existing shots to an uploaded music or voice recording. Optional Demucs vocal isolation separates the singing voice for guidance while keeping the full music mix in the export. Upload audio in Cut, choose the character and shots, then review the new version. Runs in ComfyUI on this PC with no paid API.</p>
     <h2>MiniMax H3 · local</h2><p>Generates video and sound on this PC through ComfyUI, with no API key or per-generation API fee. Uses quantized open weights and 4-step Turbo sampling. Local clips are at least 4 seconds; trim shorter shots in Takes. Model weight license: <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE" target="_blank" rel="noopener">MiniMax H3 Community License</a>.</p>
     <h2>MiniMax cloud (optional, paid)</h2><p>Cloud generation sends your first frame and prompt to MiniMax and uses your paid API account. Set <code>${esc(cfg.minimax.api_key_env)}</code> in the server environment, then restart Studio.</p>
     <div class="card form-grid"><div><label>Default MiniMax model</label><select id="mm-model">${models.filter(m => m.engine === "minimax").map(m => `<option value="${esc(m.id)}" ${m.id === cfg.minimax.model ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></div>
     <div><label>Resolution</label><select id="mm-resolution">${["768P", "1080P"].map(x => `<option ${x === cfg.minimax.resolution ? "selected" : ""}>${x}</option>`).join("")}</select></div></div>
-    <h2>Face correction</h2><p>Match character references uses the uploaded character portraits and source take together with local MiniMax H3 and the Character Swap adapter. For single-character takes up to 15 seconds; adds a version for review and preserves the source soundtrack. KEEP uses temporal information for a single main face. CodeFormer can restore multiple faces with adjustable identity fidelity. Install the chosen model separately; see STUDIO.md. Each correction adds a take for comparison.</p>
-    <div class="card form-grid"><div><label>Default correction model</label><select id="face-model"><option value="minimax_identity" ${face.model === "minimax_identity" ? "selected" : ""}>MiniMax H3 · match character references</option><option value="keep" ${face.model === "keep" ? "selected" : ""}>KEEP · temporal video restoration</option><option value="codeformer" ${face.model === "codeformer" ? "selected" : ""}>CodeFormer · multiple faces</option></select></div>
+    <h2>Face correction</h2><p>Qwen Image Edit corrects each original frame using the uploaded character portrait and retains the source soundtrack. It is also available on First frames. MiniMax H3 edits single-character videos up to 15 seconds. KEEP restores a single main face over time; CodeFormer restores multiple faces. Each correction adds a version for review and retains your original. See STUDIO.md for model installation.</p>
+    <div class="card form-grid"><div><label>Default correction model</label><select id="face-model"><option value="qwen_identity" ${face.model === "qwen_identity" ? "selected" : ""}>Qwen Image Edit · every frame</option><option value="minimax_identity" ${face.model === "minimax_identity" ? "selected" : ""}>MiniMax H3 · match character references</option><option value="keep" ${face.model === "keep" ? "selected" : ""}>KEEP · temporal video restoration</option><option value="codeformer" ${face.model === "codeformer" ? "selected" : ""}>CodeFormer · multiple faces</option></select></div>
     <div><label>Restorer Python executable (blank: Studio Python)</label><input id="face-python" value="${esc(face.python)}"></div>
     <div><label>KEEP installation folder</label><input id="keep-dir" value="${esc(face.keep_dir)}"></div>
     <div><label>CodeFormer installation folder</label><input id="codeformer-dir" value="${esc(face.codeformer_dir)}"></div>

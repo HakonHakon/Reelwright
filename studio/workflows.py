@@ -104,6 +104,24 @@ def qwen_edit_image(s: dict, prompt: str, seed: int, width: int, height: int, ba
     return wf
 
 
+def qwen_correct_face(s: dict, source_image: str, ref_images: list[str], character: dict,
+                      width: int, height: int, seed: int, prefix: str = "studio/face") -> dict:
+    """Edit the source frame in place, with separate portrait identity conditioning."""
+    prompt = (
+        f"Edit image 1. Correct the person's facial identity to match {character['name']} "
+        "in image 2. Image 1 is the performance frame; image 2 is the identity reference. "
+        "Keep the exact head position, head size, perspective, gaze, expression, eyelids and mouth "
+        "opening from image 1. Preserve the original body, hair placement, hat, glasses, clothing, "
+        "hands, microphone, camera, background and stage lighting from image 1. "
+        "Change the facial anatomy, nose, cheeks, jaw, lips, skin and distinguishing facial details "
+        "to the person in image 2, naturally integrated into the original head and neck. "
+        "Match the lighting, shadows and skin colour to image 1. Use image 2 only for identity; "
+        "do not copy its pose, expression, hands, objects or background. "
+        f"Character details: {character.get('appearance', '')}")
+    return qwen_edit_image(s, prompt, seed, width, height, 1,
+                           [source_image, *ref_images[:2]], prefix)
+
+
 def _latent(wf, s, vae_id, width, height, batch, init_image, use_sd3_latent):
     if init_image:
         wf["40"] = {"class_type": "LoadImage", "inputs": {"image": init_image}}
@@ -121,6 +139,25 @@ def _latent(wf, s, vae_id, width, height, batch, init_image, use_sd3_latent):
 
 
 # ── Video: LTX-2.3 image-to-video (two-stage, with audio) ───────────────
+
+def lipsync_video(video: str, audio: str, steps=20, guidance=1.5, seed=1247,
+                  prefix='studio/lipsync') -> dict:
+    return {
+        '1': {'class_type': 'LoadVideo', 'inputs': {'file': video}},
+        '2': {'class_type': 'LoadAudio', 'inputs': {'audio': audio}},
+        '3': {'class_type': 'ReelwrightLatentSync', 'inputs': {
+            'video': ['1', 0], 'audio': ['2', 0], 'steps': steps, 'guidance': guidance, 'seed': seed}},
+        '4': {'class_type': 'SaveVideo', 'inputs': {
+            'video': ['3', 0], 'filename_prefix': prefix, 'format': 'mp4', 'codec': 'auto'}},
+    }
+
+
+def separate_vocals(audio: str, prefix='studio/vocals') -> dict:
+    return {
+        '1': {'class_type': 'LoadAudio', 'inputs': {'audio': audio}},
+        '2': {'class_type': 'ReelwrightSeparateVocals', 'inputs': {'audio': ['1', 0]}},
+        '3': {'class_type': 'SaveAudio', 'inputs': {'audio': ['2', 0], 'filename_prefix': prefix}},
+    }
 
 def ltx_i2v(s: dict, prompt: str, first_frame: str, frames: int, seed: int,
             end_frame: str | None = None, voice_audio: str | None = None,

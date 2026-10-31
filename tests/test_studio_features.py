@@ -377,22 +377,24 @@ def test_portrait_episode_upload_keeps_its_own_dimensions(client):
     assert Image.open(store.abs_media(file)).size==(512,910)
 
 
-def test_character_identity_correction_uses_uploaded_portrait(client, monkeypatch, tmp_path):
+@pytest.mark.parametrize('model', ['minimax_identity', 'qwen_identity'])
+def test_character_identity_correction_uses_uploaded_portrait(client, monkeypatch, tmp_path, model):
     from studio import app as app_module, face_correction
     sid, eid, sh = project(client)
     url = f'/api/s/{sid}/e/{eid}/shots/{sh["id"]}/face_correction'
-    assert client.post(url, json={'model': 'minimax_identity'}).status_code == 400
+    assert client.post(url, json={'model': model}).status_code == 400
     photo = tmp_path / 'hakon.png'
     photo.write_bytes(b'portrait')
     character = store.new_character('Hakon', refs=[store.rel(str(photo))])
     store.save_character(sid, character)
     store.update_episode(sid, eid, lambda e: e['shots'][0].update(characters=[{'id': character['id']}]))
     monkeypatch.setattr(app_module, '_submit', lambda *args, **kw: kw)
-    response = client.post(url, json={'model': 'minimax_identity', 'index': 2})
+    response = client.post(url, json={'model': model, 'index': 2})
     assert response.status_code == 200
     assert response.json()['source_file'] == 'take2.mp4'
     calls = []
-    monkeypatch.setattr(face_correction, 'match_identity', lambda *args: calls.append(args))
+    method = 'qwen_correct_take' if model == 'qwen_identity' else 'match_identity'
+    monkeypatch.setattr(face_correction, method, lambda *args: calls.append(args))
     monkeypatch.setattr(jobs.comfy_mod.Comfy, 'alive', lambda *args: False)
     monkeypatch.setattr(jobs.llm, 'unload', lambda *args: None)
     jobs.job_face_correction(jobs.Job('face', 'test', None, {}), **response.json())
@@ -400,7 +402,82 @@ def test_character_identity_correction_uses_uploaded_portrait(client, monkeypatc
     takes = store.get_episode(sid, eid)['shots'][0]['takes']
     assert takes['selected'] == 2 and takes['items'][2]['file'] == 'take2.mp4'
     assert takes['items'][-1]['character_refs'] == character['refs']
-    assert takes['items'][-1]['face_correction'] == 'minimax_identity'
+    assert takes['items'][-1]['face_correction'] == model
+
+
+def test_qwen_frame_correction_keeps_original_and_routes_identity(client, monkeypatch, tmp_path):
+    from studio import app as app_module, face_correction
+    sid, eid, sh = project(client)
+    url = f'/api/s/{sid}/e/{eid}/shots/{sh["id"]}/frame_correction'
+    assert client.post(url, json={'index': -1}).status_code == 400
+    assert client.post(url, json={'index': 0}).status_code == 400
+    photo = tmp_path / 'maryam.png'; photo.write_bytes(b'portrait')
+    character = store.new_character('Maryam', refs=[store.rel(str(photo))])
+    store.save_character(sid, character)
+    store.update_episode(sid, eid, lambda e: e['shots'][0].update(characters=[{'id': character['id']}]))
+    monkeypatch.setattr(app_module, '_submit', lambda *args, **kw: kw)
+    params = client.post(url, json={'index': 0}).json()
+    calls = []
+    monkeypatch.setattr(face_correction, 'qwen_correct_image', lambda *args, **kw: calls.append(args))
+    monkeypatch.setattr(jobs, '_gpu_prepare', lambda *args: None)
+    jobs.job_frame_correction(jobs.Job('frame', 'test', None, {}), **params)
+    frame = store.get_episode(sid, eid)['shots'][0]['frame']
+    assert frame['selected'] == 0 and frame['candidates'][0]['file'] == 'first.png'
+    assert frame['candidates'][-1]['source_frame'] == 'first.png'
+    assert calls[0][-1]['refs'] == character['refs']
+
+
+def test_qwen_graph_distinguishes_performance_and_identity():
+    from studio import workflows
+    graph = workflows.qwen_correct_face(settings.load(), 'performance.png', ['portrait.png'],
+                                        {'name': 'Maryam'}, 512, 912, 224147)
+    assert graph['50']['inputs']['image'] == 'performance.png'
+    assert graph['51']['inputs']['image'] == 'portrait.png'
+    assert graph['4']['inputs']['image1'] == ['50', 0]
+    assert graph['4']['inputs']['image2'] == ['51', 0]
+    assert 'Image 1 is the performance frame' in graph['4']['inputs']['prompt']
+
+
+def test_uploaded_mask_is_not_rejected_by_cached_file_list():
+    from studio.comfy import Comfy
+    client = Comfy('unused')
+    client._object_info = {'LoadImageMask': {'input': {'required': {
+        'image': [['old.png']], 'channel': [['red', 'green', 'blue', 'alpha']]}}}}
+    graph = {'1': {'class_type': 'LoadImageMask',
+                   'inputs': {'image': 'newly_uploaded.png', 'channel': 'red'}}}
+    assert client.validate(graph) == []
+    graph['1']['inputs']['channel'] = 'invalid'
+    assert len(client.validate(graph)) == 1
+
+
+def test_qwen_take_edits_every_frame_and_copies_audio(client, monkeypatch, tmp_path):
+    import shutil
+    import subprocess
+    from studio import face_correction, comfy, media
+    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+        pytest.skip('requires ffmpeg and ffprobe')
+    source, destination = tmp_path / 'source.mp4', tmp_path / 'result.mp4'
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+                    'testsrc2=s=64x96:r=30:d=0.5', '-f', 'lavfi', '-i',
+                    'sine=frequency=440:duration=0.5', '-c:v', 'libx264', '-c:a', 'aac', str(source)], check=True)
+    monkeypatch.setattr(face_correction, 'qwen_references', lambda *args: ['portrait.png'])
+    frames = []
+    def correct(job, cfg, src, dest, character, **kw):
+        frames.append(src)
+        assert kw['references'] == ['portrait.png']
+        shutil.copyfile(src, dest)
+    monkeypatch.setattr(face_correction, 'qwen_correct_image', correct)
+    cfg = settings.load(); cfg.update(ffmpeg=shutil.which('ffmpeg'), ffprobe=shutil.which('ffprobe'))
+    job = jobs.Job('face', 'test', None, {})
+    face_correction.qwen_correct_take(job, cfg, str(source), str(destination), {'name': 'Maryam'})
+    assert len(frames) == 15 and job.progress == [15, 15]
+    info = media.probe('ffprobe', str(destination))
+    assert (info['width'], info['height'], info['fps']) == (64, 96, 30)
+    assert abs(info['duration'] - media.probe('ffprobe', str(source))['duration']) < .04
+    def audio_hash(path):
+        return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-map', '0:a:0',
+                                       '-c:a', 'copy', '-f', 'hash', '-hash', 'sha256', '-'])
+    assert audio_hash(source) == audio_hash(destination)
 
 
 def test_reference_identity_edit_preserves_source_soundtrack(client, monkeypatch, tmp_path):

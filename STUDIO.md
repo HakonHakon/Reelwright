@@ -39,6 +39,44 @@ Uses the repo .venv plus your ComfyUI and Ollama.
 
 ## Models, face correction and deletion
 
+### Lip-sync after uploading music
+
+In **Cut**, upload a song or voice recording and choose **Save music settings**.
+Studio asks whether to set up lip-sync. **Not now** saves the audio without running
+any model. **Choose shots** opens the character and shot picker. You can also use
+**Lip-sync to uploaded audio** later. Select single-character shots, set the start
+time in the recording, and choose **Run lip-sync**. Demucs vocal isolation is on by
+default for music; turn it off for an already clean voice recording.
+
+LatentSync 1.6 runs each chosen shot against the corresponding audio segment.
+Other shots retain their picture. The export uses the full uploaded music mix at
+full volume, replacing take audio; bed volume and ducking apply only to the ordinary
+final-cut render. Short recordings are padded with silence, long recordings are
+trimmed. Review the separate lip-sync preview and choose **Use as final** to select
+it. Original takes and the previous final remain available. A missing face or model
+failure leaves the original final selected. Singing, profiles and microphones
+covering the mouth can reduce accuracy; inspect the preview.
+
+Install locally with Python 3.10 and an NVIDIA GPU (LatentSync 1.6 needs about 18 GB
+VRAM; this installation uses an RTX 3090):
+
+```sh
+python scripts/install_lipsync.py --python /path/to/python3.10 --comfy /path/to/ComfyUI
+```
+
+The installer creates an isolated `.runtime/lipsync-env`, downloads the
+[ByteDance LatentSync 1.6](https://github.com/bytedance/LatentSync) checkpoint,
+Whisper tiny, SD VAE and face detector, and caches the
+[Demucs htdemucs](https://github.com/facebookresearch/demucs) vocal separator.
+Restart ComfyUI and Studio after installation. No paid API or media upload to a
+remote service is involved. Model dependencies do not modify ComfyUI's Python environment.
+
+The ComfyUI nodes are **Lip sync · LatentSync 1.6** and **Isolate singing voice · Demucs**.
+`workflows/lipsync_latentsync_api.json` is a ready API graph: replace its video/audio
+filenames with uploaded ComfyUI input names. Its vocal guide drives the model, and
+the optional **soundtrack** socket retains the full music in the output.
+For clean speech, connect LoadAudio directly to LatentSync's audio socket.
+
 The **Models** page lists local LTX/Wan and MiniMax Hailuo 2.3, 2.3 Fast and 02.
 In **Takes**, choose a video model for the current render, or leave the per-shot/project
 engine in effect. The override affects only that render; the take records its actual model.
@@ -51,9 +89,18 @@ This integration uses first frames only; end frames, local LoRAs and voice sampl
 not passed to MiniMax. Cancelling stops local polling; an already submitted cloud job
 may continue and incur charges.
 
+Face correction defaults to **Qwen Image Edit · every frame**. In First frames,
+**Correct face · Qwen** edits an existing image using its shot's uploaded character
+portrait. In Takes, **Correct faces** edits every decoded frame with Qwen and
+reassembles the clip with the source audio copied unchanged. Both operations add
+reviewable candidates and retain the original selection. Qwen correction requires
+a single-character shot with an uploaded portrait. It uses the `qwen_edit` model
+settings (2509 FP8, Qwen-VL encoder, VAE and four-step Lightning adapter) and runs
+locally through ComfyUI. A full take is substantially slower than a still image.
+
 **Correct faces** on each take creates an additional take without changing the original
 or your selected take. Review it and use **Pick this** if it is better.
-The default **KEEP** is intended for temporal consistency on a single main face;
+**KEEP** is intended for temporal consistency on a single main face;
 **CodeFormer** supports multiple detected faces and an identity fidelity control.
 Neither is a guaranteed improvement for stylised characters or identity errors.
 Frame rate and original audio are retained.
@@ -94,6 +141,7 @@ entry but keeps the media on disk. Selection indices are adjusted after removal 
 review gates/exports are invalidated. Finish or cancel active project jobs before deletion.
 
 ## MiniMax H3 local generation
+
 
 Choose **MiniMax H3 · local, audio, no API fees** in Takes, or **MiniMax H3 (local)**
 as the project's default engine in Style & props. Engine id: `minimax_local`;

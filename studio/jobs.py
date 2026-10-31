@@ -733,6 +733,32 @@ def job_cut(job, sid, eid):
     job.say(f"Final cut: {t:.1f}s -> {final}")
 
 
+def job_frame_correction(job, sid, eid, shot_id, source_file):
+    from . import face_correction
+    s, c = _ctx()
+    sh = store.find_shot(store.get_episode(sid, eid), shot_id)
+    if not any(x["file"] == source_file for x in sh["frame"]["candidates"]):
+        raise ValueError("Source frame was removed")
+    if len(sh.get("characters", [])) != 1:
+        raise ValueError("Character reference correction needs a single-character shot")
+    character = store.get_character(sid, sh["characters"][0]["id"])
+    if not character:
+        raise ValueError("The shot's character was removed")
+    _gpu_prepare(job, s, c)
+    destination = os.path.join(_ep_path(sid, eid, "frames", shot_id), f"qwen_{uuid.uuid4().hex}.png")
+    job.say(f"Correcting {character['name']} with Qwen Image Edit and the uploaded portrait")
+    face_correction.qwen_correct_image(job, s, store.abs_media(source_file), destination, character, client=c)
+    job.check()
+    def apply(ep):
+        shot = store.find_shot(ep, shot_id)
+        shot["frame"]["candidates"].append({"file": store.rel(destination), "source": "qwen_identity",
+            "source_frame": source_file, "character_refs": list(character["refs"]),
+            "sig": store.bible_signature(store.bible(sid), shot), "seed": 224147, "check": None})
+        ep["gates"]["frames"] = False
+    store.update_episode(sid, eid, apply)
+    job.say("Qwen-corrected frame added for review. Original retained.")
+
+
 def job_face_correction(job, sid, eid, shot_id, source_file, model="keep"):
     from . import face_correction
     s, c = _ctx()
@@ -745,13 +771,14 @@ def job_face_correction(job, sid, eid, shot_id, source_file, model="keep"):
     llm.unload(s["ollama_host"], [s["planner_model"], s["vision_model"]])
     destination = os.path.join(_ep_path(sid, eid, "takes", shot_id), f"face_{uuid.uuid4().hex}.mp4")
     started = time.monotonic()
-    if model == "minimax_identity":
+    if model in ("minimax_identity", "qwen_identity"):
         if len(sh.get("characters", [])) != 1:
             raise ValueError("Character reference correction needs a single-character shot")
         character = store.get_character(sid, sh["characters"][0]["id"])
         if not character:
             raise ValueError("The shot's character was removed")
-        face_correction.match_identity(job, s, store.abs_media(source_file), destination, character)
+        correct = face_correction.qwen_correct_take if model == "qwen_identity" else face_correction.match_identity
+        correct(job, s, store.abs_media(source_file), destination, character)
     else:
         face_correction.restore(job, s, store.abs_media(source_file), destination, model)
     job.check()
@@ -760,6 +787,9 @@ def job_face_correction(job, sid, eid, shot_id, source_file, model="keep"):
     if model == "minimax_identity":
         item.update(model="MiniMax H3 · character references", engine="minimax_local",
                     character_refs=list(character["refs"]), flags=["Character likeness needs review"])
+    elif model == "qwen_identity":
+        item.update(model="Qwen Image Edit · every frame", engine="qwen_identity",
+                    character_refs=list(character["refs"]), flags=["Character likeness and motion need review"])
     def apply(ep):
         take = store.find_shot(ep, shot_id)["takes"]
         take["items"].append(item)

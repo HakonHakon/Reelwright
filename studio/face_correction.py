@@ -5,8 +5,87 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from pathlib import Path
+
+from PIL import Image, ImageOps
 
 from . import media
+
+
+def qwen_references(client, character, token):
+    from . import store
+
+    refs = [store.abs_media(p) for p in character.get("refs", [])
+            if p and os.path.isfile(store.abs_media(p))][:2]
+    if not refs:
+        raise ValueError("Upload a reference photo for this character in Characters first")
+    return [client.upload(p, f"qwen_{token}_ref{i}{Path(p).suffix}") for i, p in enumerate(refs)]
+
+
+def qwen_correct_image(job, settings, source, destination, character, client=None,
+                       references=None, seed=224147):
+    """Correct an actual source frame; no animated portrait or face warping."""
+    from . import comfy, workflows
+
+    client = client or comfy.Comfy(settings["comfy_host"])
+    token = uuid.uuid4().hex
+    references = references or qwen_references(client, character, token)
+    job.check()
+    with tempfile.TemporaryDirectory(prefix="reelwright_qwen_image_") as work:
+        image = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
+        size = image.size
+        width, height = [max(16, round(n / 16) * 16) for n in size]
+        prepared = os.path.join(work, "source.png")
+        image.resize((width, height), Image.Resampling.LANCZOS).save(prepared)
+        original = client.upload(prepared, f"qwen_{token}_source.png")
+        graph = workflows.qwen_correct_face(settings, original, references, character,
+                                            width, height, seed)
+        result = client.run(graph, cancel=lambda: job.cancel_flag)
+        if len(result["images"]) != 1:
+            raise RuntimeError("Qwen face correction did not produce one corrected frame")
+        rendered = client.download(result["images"][0], os.path.join(work, "corrected.png"))
+        job.check()
+        os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+        with Image.open(rendered) as corrected:
+            corrected.convert("RGB").resize(size, Image.Resampling.LANCZOS).save(destination)
+    return destination
+
+
+def qwen_correct_take(job, settings, source, destination, character):
+    """Apply Qwen to every decoded frame and retain the source audio bitstream."""
+    from . import comfy
+
+    info = media.probe(settings["ffprobe"], source)
+    if info["fps"] <= 0:
+        raise ValueError("Cannot determine source frame rate")
+    client = comfy.Comfy(settings["comfy_host"])
+    references = qwen_references(client, character, uuid.uuid4().hex)
+    with tempfile.TemporaryDirectory(prefix="reelwright_qwen_take_") as work:
+        original, corrected = Path(work) / "original", Path(work) / "corrected"
+        original.mkdir(); corrected.mkdir()
+        media._run([settings["ffmpeg"], "-y", "-v", "error", "-i", source,
+                    "-map", "0:v:0", "-fps_mode", "passthrough", str(original / "%06d.png")])
+        frames = sorted(original.glob("*.png"))
+        if not frames:
+            raise ValueError("Source take contains no video frames")
+        job.progress = [0, len(frames)]
+        for i, frame in enumerate(frames):
+            job.check()
+            qwen_correct_image(job, settings, str(frame), str(corrected / frame.name), character,
+                               client=client, references=references)
+            job.progress = [i + 1, len(frames)]
+            job.say(f"Qwen Image Edit: frame {i + 1}/{len(frames)}")
+        job.check()
+        os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+        media._run([settings["ffmpeg"], "-y", "-v", "error", "-framerate", str(info["fps"]),
+                    "-i", str(corrected / "%06d.png"), "-i", source,
+                    "-map", "0:v:0", "-map", "1:a:0?", "-frames:v", str(len(frames)),
+                    "-t", str(len(frames) / info["fps"]), "-c:v", "libx264", "-crf", "16",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", destination])
+        result = media.probe(settings["ffprobe"], destination)
+        if abs(result["duration"] - info["duration"]) > max(.15, 2 / info["fps"]):
+            raise RuntimeError("Qwen correction changed the clip duration; original take retained")
+    return destination
 
 
 def match_identity(job, settings, source, destination, character):

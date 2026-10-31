@@ -40,6 +40,7 @@ def probe(ffprobe: str, path: str) -> dict:
         fps = float(n) / float(d or 1)
     return {
         "duration": float(data.get("format", {}).get("duration") or 0),
+        "video_duration": float(v.get("duration") or data.get("format", {}).get("duration") or 0),
         "has_audio": any(s.get("codec_type") == "audio" for s in data.get("streams", [])),
         "width": int(v.get("width") or 0), "height": int(v.get("height") or 0), "fps": fps,
     }

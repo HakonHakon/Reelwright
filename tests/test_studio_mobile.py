@@ -174,5 +174,89 @@ def test_character_reference_correction_model_settings(mobile_server):
         assert cfg['identity_lora'] == 'h3_character_swap_v1.5.safetensors'
         page.goto(f'{base}/#/s/{sid}/e/{eid}/takes')
         assert page.locator('#face-S01_SH01').input_value() == 'minimax_identity'
+        page.goto(f'{base}/#/models')
+        page.locator('#face-model').select_option('qwen_identity')
+        page.locator('#save-models').tap()
+        page.get_by_text('Model settings saved.', exact=True).wait_for()
+        page.goto(f'{base}/#/s/{sid}/e/{eid}/takes')
+        assert page.locator('#face-S01_SH01').input_value() == 'qwen_identity'
+        from studio import store
+        store.update_episode(sid, eid, lambda e: e['shots'][0]['frame']['candidates'].append(
+            {'file': 'source.png', 'source': 'upload'}))
+        page.goto(f'{base}/#/s/{sid}/e/{eid}/frames')
+        sent = []
+        def submit(route):
+            sent.append(route.request.post_data_json)
+            route.fulfill(json={'id': 'qwen-test'})
+        page.route('**/frame_correction', submit)
+        page.locator('[data-qwenface="0"]').tap()
+        assert sent == [{'index': 0}]
+        assert not errors, errors
+        browser.close()
+
+
+@pytest.mark.parametrize('engine', ['chromium', 'webkit'])
+def test_music_upload_asks_before_lipsync_and_selects_the_singer(mobile_server, engine, monkeypatch):
+    import shutil
+    import subprocess
+    import wave
+    from pathlib import Path
+    from studio import store, planner, settings
+    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+        pytest.skip('requires ffmpeg and ffprobe')
+    base, sid, eid = mobile_server
+    for name in ['Hakon', 'Maryam']:
+        store.save_character(sid, store.new_character(name))
+    def prepare(ep):
+        ep['shots'][0]['characters'] = [{'id': 'hakon'}]
+        ep['shots'][0]['takes']['items'] = [{'file': 'hakon.mp4'}]
+        second = planner.new_shot(id='S02_SH01', order=1)
+        second['characters'] = [{'id': 'maryam'}]
+        second['takes']['items'] = [{'file': 'maryam.mp4'}]
+        ep['shots'].append(second)
+    store.update_episode(sid, eid, prepare)
+    for name in ['hakon', 'maryam']:
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+                        'color=c=blue:s=64x96:r=30:d=1', '-c:v', 'libx264',
+                        str(Path(settings.DATA_ROOT) / f'{name}.mp4')], check=True)
+    wav = io.BytesIO()
+    with wave.open(wav, 'wb') as audio:
+        audio.setnchannels(1); audio.setsampwidth(2); audio.setframerate(16000)
+        audio.writeframes(b'\x00\x00' * 16000)
+    upload = {'name': 'song.wav', 'mimeType': 'audio/wav', 'buffer': wav.getvalue()}
+    with playwright.sync_playwright() as p:
+        browser = getattr(p, engine).launch(headless=True)
+        page = browser.new_page(viewport={'width':390, 'height':844}, is_mobile=True, has_touch=True)
+        errors, submitted = [], []
+        page.on('pageerror', lambda e: errors.append(str(e)))
+        page.route('**/api/status', lambda route: route.fulfill(json={'comfy':False, 'comfy_host':'local',
+                    'ollama_models':[], 'loras':[], 'missing':[]}))
+        def submit(*args, **params):
+            submitted.append({'shot_ids': [c['shot_id'] for c in params['timeline'] if c['sync']],
+                              'audio_offset': params['audio_offset'], 'isolate_vocals': params['isolate_vocals']})
+            return {'id': 'lip-test', 'title': 'Lip-sync test'}
+        monkeypatch.setattr('studio.app._submit', submit)
+        page.goto(f'{base}/#/s/{sid}/e/{eid}/cut')
+        page.locator('#mfile').set_input_files(upload)
+        page.locator('#msave').tap()
+        page.get_by_text('Would you like to lip-sync the video to the voice in this upload?', exact=True).wait_for()
+        assert not submitted
+        page.locator('#ask-no').tap()
+        assert not submitted
+        # Saving volume alone must not prompt or submit again.
+        page.locator('#mvol').fill('0.5'); page.locator('#msave').tap()
+        playwright.expect(page.locator('#modal')).to_be_hidden()
+        page.locator('#mfile').set_input_files(upload)
+        page.locator('#msave').tap(); page.locator('#ask-yes').tap()
+        page.locator('#lip-character').select_option('maryam')
+        assert page.locator('[data-lip-shot="S02_SH01"]').is_checked()
+        assert not page.locator('[data-lip-shot="S01_SH01"]').is_checked()
+        page.locator('#lip-offset').fill('0.2')
+        page.locator('#lip-vocals').uncheck()
+        assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
+        with page.expect_request('**/lipsync'):
+            page.locator('#lip-run').tap()
+        playwright.expect(page.locator('#modal')).to_be_hidden()
+        assert submitted == [{'shot_ids':['S02_SH01'], 'audio_offset':.2, 'isolate_vocals':False}]
         assert not errors, errors
         browser.close()

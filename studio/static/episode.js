@@ -333,6 +333,7 @@ async function tabFrames(el, ctx) {
     if (ds.gate) setGate(ctx, ds.gate, ds.val === "1");
     if (ds.pick != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { select: +ds.pick }); reload(); }
     if (ds.rm != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { remove: +ds.rm }); reload(); }
+    if (ds.qwenface != null && ds.shot) startJob(`${ctx.base}/shots/${ds.shot}/frame_correction`, { index: +ds.qwenface });
     if (ds.refine && ds.shot) startJob(`${ctx.base}/shots/${ds.shot}/refine`, { index: +ds.idx, engine: ds.refine, denoise: parseFloat($(`#dn-${ds.shot}`)?.value || "0.3") });
     if (ds.lock && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { lock: ds.lock === "1" }); reload(); }
     if (ds.render && ds.shot) startJob(`${ctx.base}/frames`, { shot_ids: [ds.shot], force: true, source: $(`#src-${ds.shot}`).value });
@@ -371,6 +372,7 @@ function frameCard(ctx, sh) {
       <div class="frame"><img src="${media(c.file)}" data-zoom="${media(c.file)}" loading="lazy"></div>
       <div class="meta"><span class="code">${esc(sh.id)}/${String.fromCharCode(65 + k)}</span>${sh.frame.selected === k ? `<span class="pick">picked</span>` : ""}<span>${sourceLabel(c.source)}${c.plate ? ", on location plate" : ""}</span> ${checkChip(c)}</div>
       <div class="acts">${sh.frame.selected === k ? ""  : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
+        <button data-qwenface="${k}" data-shot="${sh.id}" title="Correct this frame using the uploaded character portrait">Correct face · Qwen</button>
         <button data-refine="flux_lora" data-idx="${k}" data-shot="${sh.id}" title="img2img with the character LoRA">Refine Flux</button>
         <button data-refine="zimage" data-idx="${k}" data-shot="${sh.id}" title="img2img to match style">Refine Z</button>
         <button data-asend="${esc(c.file)}" data-shot="${sh.id}" title="use as this shot's end frame">as end</button>
@@ -461,7 +463,7 @@ function takeCard(ctx, sh) {
       <span class="chip accent">${esc(sh._engine)}</span><span class="muted">${sh.duration_s}s · ${esc(sh.start_mode)}</span>
       ${f ? `<img src="${media(f.file)}" style="height:40px;border-radius:4px" data-zoom="${media(f.file)}">` : sh.start_mode === "chain" ? `<span class="chip">frame from previous take</span>` : `<span class="chip bad">no frame</span>`}
       ${sh.end_frame ? `<span class="chip">end frame</span>` : ""}<span class="grow"></span>
-      <select id="face-${sh.id}" aria-label="Face correction model"><option value="minimax_identity" ${ctx.e._settings.face_model === "minimax_identity" ? "selected" : ""}>Match character references · MiniMax H3</option><option value="keep" ${ctx.e._settings.face_model === "keep" ? "selected" : ""}>KEEP (main face, temporal)</option><option value="codeformer" ${ctx.e._settings.face_model === "codeformer" ? "selected" : ""}>CodeFormer (all faces)</option></select>
+      <select id="face-${sh.id}" aria-label="Face correction model"><option value="qwen_identity" ${ctx.e._settings.face_model === "qwen_identity" ? "selected" : ""}>Qwen Image Edit · every frame</option><option value="minimax_identity" ${ctx.e._settings.face_model === "minimax_identity" ? "selected" : ""}>Match character references · MiniMax H3</option><option value="keep" ${ctx.e._settings.face_model === "keep" ? "selected" : ""}>KEEP (main face, temporal)</option><option value="codeformer" ${ctx.e._settings.face_model === "codeformer" ? "selected" : ""}>CodeFormer (all faces)</option></select>
       <button data-more="1" data-shot="${sh.id}">Render more takes</button>
       <button data-next="1" data-shot="${sh.id}" title="extract the last frame of the selected take as the next shot's first frame">Last frame → next shot</button>
       <button data-lock="${sh.takes.locked ? 0 : 1}" data-shot="${sh.id}">${sh.takes.locked ? "Unlock" : "Lock"}</button></div>
@@ -484,11 +486,12 @@ async function tabCut(el, ctx) {
   el.innerHTML = `
     ${missing.length ? `<div class="notice">No takes yet for: ${esc(missing.join(", "))}. They'll be left out.</div>` : ""}
     <div class="card form-grid">
-      <div><label>Music bed (optional, looped under the film)</label><input type="file" id="mfile" accept="audio/*">
-        <div class="small muted">${m.file ? "current: " + esc(m.file.split("/").pop()) : "none"}</div></div>
+      <div><label>Music or voice recording</label><input type="file" id="mfile" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac">
+        <div id="music-current" class="small muted">${m.file ? "current: " + esc(m.file.split("/").pop()) : "none"}</div></div>
       <div><label>Music volume (0-1)</label><input id="mvol" type="number" step="0.05" min="0" max="1" value="${m.volume ?? 0.25}">
         <label class="row" style="margin-top:8px"><input type="checkbox" id="mduck" ${m.duck !== false ? "checked" : ""}> duck music under dialogue</label></div>
-      <div class="full row" style="margin-top:10px"><button id="msave">Save music settings</button><span class="grow"></span>
+      <div class="full row" style="margin-top:10px"><button id="msave">Save music settings</button>
+        <button id="lip-setup" ${m.file ? "" : "disabled"}>Lip-sync to uploaded audio</button><span class="grow"></span>
         <button class="primary" id="cut">Render final cut</button></div>
     </div>
     <p class="muted small">Each selected take is trimmed, scaled to ${e._settings.video.width}x${e._settings.video.height} @ ${e._settings.video.fps} fps and loudness-normalised, then joined. Wan takes (silent) get a silent track.</p>
@@ -496,12 +499,64 @@ async function tabCut(el, ctx) {
       <video playsinline preload="metadata" controls src="${media(o.final)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
       <div class="row" style="margin-top:8px"><a href="${media(o.final)}" download>final.mp4</a>${o.srt ? `<a href="${media(o.srt)}" download>subtitles (.srt)</a>` : ""}
         ${o.edl ? `<a href="${media(o.edl)}" download>edit list (.edl for DaVinci Resolve)</a>` : ""}${o.animatic ? `<a href="${media(o.animatic)}" download>animatic.mp4</a>` : ""}</div>
-      <p class="muted small">In Resolve: import the takes folders as media, then File > Import > Timeline > the .edl.</p>` : ""}`;
+      <p class="muted small">In Resolve: import the takes folders as media, then File > Import > Timeline > the .edl.</p>` : ""}
+    ${(o.lipsync_versions || []).map((version, i) => `<div class="card"><h2>Lip-sync preview ${i + 1}</h2>
+      <p class="muted small">${esc(version.model)} · ${fmtSec(version.runtime)} · ${esc((version.audio_file || "").split("/").pop())} · ${version.isolated_vocals ? "isolated vocal guide" : "uploaded audio guide"}. The full uploaded music mix is used in this export.</p>
+      <video playsinline preload="metadata" controls src="${media(version.file)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
+      <div class="row"><a href="${media(version.file)}" download>Download MP4</a>
+        ${o.final === version.file ? `<span class="chip good">current final</span>` : `<button data-use-lipsync="${i}">Use as final</button>`}</div></div>`).join("")}
+    ${o.before_lipsync ? `<p><a href="${media(o.before_lipsync)}" download>Download original final before lip-sync</a></p>` : ""}`;
   $("#msave").onclick = async () => {
-    const fd = new FormData(); const f = $("#mfile").files[0]; if (f) fd.append("file", f);
+    const button = $("#msave"); button.disabled = true;
+    const fileInput = $("#mfile");
+    const fd = new FormData(); const f = fileInput.files[0]; if (f) fd.append("file", f);
     fd.append("volume", $("#mvol").value); fd.append("duck", $("#mduck").checked ? "true" : "false");
-    await FORM(`${ctx.base}/music`, fd); App.dirty = false; toast("Music saved."); reload();
+    let saved;
+    App.interactionBusy = true;
+    try { saved = await FORM(`${ctx.base}/music`, fd); }
+    finally { button.disabled = false; App.interactionBusy = false; }
+    if (!fileInput.isConnected) return toast("Music saved.");
+    ctx.e.music = saved; App.dirty = false;
+    if (f && $("#mfile").files[0] === f) $("#mfile").value = "";
+    $("#music-current").textContent = saved.file ? "current: " + saved.file.split("/").pop() : "none";
+    $("#lip-setup").disabled = !saved.file; toast("Music saved.");
+    if (f) {
+      const choice = ask("Would you like to lip-sync the video to the voice in this upload?", "Choose shots");
+      $("#ask-no").textContent = "Not now";
+      if (await choice) openLipSync(ctx);
+    }
   };
+  $("#lip-setup").onclick = () => openLipSync(ctx);
+  $$('[data-use-lipsync]', el).forEach(button => button.onclick = async () => {
+    await POST(`${ctx.base}/lipsync/select`, {index: +button.dataset.useLipsync}); reload();
+  });
   $("#cut").onclick = () => startJob(`${ctx.base}/cut`);
   App.refreshers.push(reload);
+}
+
+function openLipSync(ctx) {
+  const shots = ctx.e.shots.filter(sh => sh.characters?.length === 1 && sh.takes.items?.length);
+  if (!shots.length) return toast("Add takes to single-character shots first.", true);
+  const characters = [...new Set(shots.map(sh => sh.characters[0].id))];
+  modal(`<h2 style="margin-top:0">Lip-sync to your music or voice</h2>
+    <p>Choose who sings or speaks. Only checked shots are changed. A separate preview keeps your original takes and final available.</p>
+    <label for="lip-character">Character</label><select id="lip-character">${characters.map(id => `<option value="${esc(id)}">${esc(charName(ctx, id))}</option>`).join("")}</select>
+    <div style="max-height:30vh;overflow:auto;margin:12px 0">${shots.map(sh => `<label class="row" style="margin:6px 0"><input type="checkbox" data-lip-shot="${esc(sh.id)}" data-character="${esc(sh.characters[0].id)}" ${sh.characters[0].id === characters[0] ? "checked" : ""}>${esc(sh.id)} · ${esc(charName(ctx, sh.characters[0].id))}</label>`).join("")}</div>
+    <label for="lip-offset">Start in uploaded audio (seconds)</label><input id="lip-offset" type="number" min="0" step="0.1" value="0" style="width:100%">
+    <label class="row" style="margin:12px 0"><input type="checkbox" id="lip-vocals" checked> Isolate the singing voice from music</label>
+    <p class="muted small">Local LatentSync 1.6. The export replaces take audio with this upload at full volume. Vocal isolation guides the mouth; the full music mix stays in the export. Turn isolation off for a clean voice recording. Long audio is trimmed; short audio is padded with silence. Check the preview before using it as final.</p>
+    <div class="row"><button id="lip-cancel">Not now</button><button id="lip-run" class="primary">Run lip-sync</button></div>`);
+  $("#lip-character").onchange = ev => $$('[data-lip-shot]').forEach(box => { box.checked = box.dataset.character === ev.target.value; });
+  $("#lip-cancel").onclick = closeModal;
+  $("#lip-run").onclick = async () => {
+    const shot_ids = $$('[data-lip-shot]:checked').map(box => box.dataset.lipShot);
+    if (!shot_ids.length) return toast("Choose at least one shot.", true);
+    const audio_offset = Number($("#lip-offset").value);
+    if (!Number.isFinite(audio_offset) || audio_offset < 0) return toast("Enter a valid audio start.", true);
+    const isolate_vocals = $("#lip-vocals").checked;
+    const button = $("#lip-run"); button.disabled = true;
+    try {
+      await startJob(`${ctx.base}/lipsync`, {shot_ids, audio_offset, isolate_vocals}); closeModal();
+    } finally { button.disabled = false; }
+  };
 }

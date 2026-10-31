@@ -1,6 +1,7 @@
 """Studio web app: JSON API + a single-page UI (static/index.html)."""
 
 import json
+import math
 import os
 import re
 import shutil
@@ -107,7 +108,7 @@ def _required_model_options(s):
         require("UNETLoader", "unet_name", s["zimage"]["unet"])
         require("CLIPLoader", "clip_name", s["zimage"]["clip"])
         require("VAELoader", "vae_name", s["zimage"]["vae"])
-    if "qwen_refs" in sources:
+    if "qwen_refs" in sources or s["face_correction"]["model"] == "qwen_identity":
         require("UNETLoader", "unet_name", s["qwen_edit"]["unet"])
         require("CLIPLoader", "clip_name", s["qwen_edit"]["clip"])
         require("VAELoader", "vae_name", s["qwen_edit"]["vae"])
@@ -520,6 +521,27 @@ def shot_refine(sid: str, eid: str, shot_id: str, body: dict = Body(...)):
                    denoise=float(body.get("denoise") or 0.3))
 
 
+@app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/frame_correction")
+def frame_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default={})):
+    sh = store.find_shot(_ep(sid, eid), shot_id)
+    index = body.get("index", sh["frame"].get("selected"))
+    if type(index) is not int or not 0 <= index < len(sh["frame"]["candidates"]):
+        raise HTTPException(400, "Choose an existing frame first")
+    _correction_character(sid, sh)
+    return _submit("frame_correction", f"Qwen face correction: {shot_id}", jobs.job_frame_correction,
+                   sid=sid, eid=eid, shot_id=shot_id,
+                   source_file=sh["frame"]["candidates"][index]["file"])
+
+
+def _correction_character(sid, sh):
+    if len(sh.get("characters", [])) != 1:
+        raise HTTPException(400, "Character reference correction needs a single-character shot")
+    character = store.get_character(sid, sh["characters"][0]["id"])
+    if not character or not any(os.path.isfile(store.abs_media(p)) for p in character.get("refs", []) if p):
+        raise HTTPException(400, "Upload a reference photo for this character in Characters first")
+    return character
+
+
 # takes
 @app.post("/api/s/{sid}/e/{eid}/takes")
 def ep_takes(sid: str, eid: str, body: dict = Body(default={})):
@@ -600,9 +622,17 @@ def ep_cut(sid: str, eid: str):
 @app.post("/api/s/{sid}/e/{eid}/music")
 async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: float = Form(0.25),
                    duck: str = Form("true")):
+    _ep(sid, eid)
     rel = None
     if file is not None and file.filename:
         p = await _save_upload(file, os.path.join(store.ep_dir(sid, eid), "uploads"))
+        try:
+            info = media.probe(_s()['ffprobe'], p)
+            if not info['has_audio'] or not math.isfinite(info['duration']) or info['duration'] <= 0:
+                raise ValueError('Upload a playable music or voice file')
+        except (ValueError, media.MediaError) as exc:
+            os.unlink(p)
+            raise HTTPException(400, 'Upload a playable music or voice file') from exc
         rel = store.rel(p)
 
     def apply(e):
@@ -612,6 +642,45 @@ async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: fl
         m["volume"] = float(volume)
         m["duck"] = duck.lower() in ("1", "true", "yes", "on")
     return store.update_episode(sid, eid, apply)["music"]
+
+
+@app.post('/api/s/{sid}/e/{eid}/lipsync')
+def ep_lipsync(sid: str, eid: str, body: dict = Body(default={})):
+    from . import lipsync
+    episode = _ep(sid, eid)
+    audio_file = (episode.get('music') or {}).get('file')
+    if not audio_file or not os.path.isfile(store.abs_media(audio_file)):
+        raise HTTPException(400, 'Upload music or a voice recording in Cut first')
+    try:
+        offset = float(body.get('audio_offset', 0))
+        info = media.probe(_s()['ffprobe'], store.abs_media(audio_file))
+        if not info['has_audio'] or not math.isfinite(offset) or not 0 <= offset < info['duration']:
+            raise ValueError('Audio start must be within the uploaded recording')
+        timeline = lipsync.plan_episode(episode, body.get('shot_ids'), _s())
+        isolate = body.get('isolate_vocals', True)
+        if type(isolate) is not bool:
+            raise ValueError('Vocal isolation must be on or off')
+    except (ValueError, TypeError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _submit('lipsync', f'Lip-sync {eid}', lipsync.render, sid=sid, eid=eid, timeline=timeline,
+                   audio_file=audio_file, audio_offset=offset, isolate_vocals=isolate)
+
+
+@app.post('/api/s/{sid}/e/{eid}/lipsync/select')
+def select_lipsync(sid: str, eid: str, body: dict = Body(...)):
+    episode = _ep(sid, eid)
+    versions = episode.get('outputs', {}).get('lipsync_versions', [])
+    index = body.get('index')
+    if type(index) is not int or not 0 <= index < len(versions):
+        raise HTTPException(400, 'Choose an existing lip-sync preview')
+    version = versions[index]
+    if not os.path.isfile(store.abs_media(version['file'])):
+        raise HTTPException(400, 'The lip-sync preview file is missing')
+    def apply(ep):
+        outputs = ep.setdefault('outputs', {})
+        outputs.setdefault('before_lipsync', outputs.get('final'))
+        outputs.update(final=version['file'], runtime=version['runtime'])
+    return store.update_episode(sid, eid, apply)['outputs']
 
 
 # Deletion is recoverable and blocked while jobs can still write into the project.
@@ -673,14 +742,10 @@ def face_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default=
     if type(index) is not int or not 0 <= index < len(sh["takes"]["items"]):
         raise HTTPException(400, "Choose an existing take first")
     model = body.get("model") or _s()["face_correction"]["model"]
-    if model not in ("keep", "codeformer", "minimax_identity"):
+    if model not in ("keep", "codeformer", "minimax_identity", "qwen_identity"):
         raise HTTPException(400, "Unknown face correction model")
-    if model == "minimax_identity":
-        if len(sh.get("characters", [])) != 1:
-            raise HTTPException(400, "Character reference correction needs a single-character shot")
-        character = store.get_character(sid, sh["characters"][0]["id"])
-        if not character or not any(os.path.isfile(store.abs_media(p)) for p in character.get("refs", []) if p):
-            raise HTTPException(400, "Upload a reference photo for this character in Characters first")
+    if model in ("minimax_identity", "qwen_identity"):
+        _correction_character(sid, sh)
     return _submit("face_correction", f"Face correction: {shot_id}", jobs.job_face_correction,
                    sid=sid, eid=eid, shot_id=shot_id,
                    source_file=sh["takes"]["items"][index]["file"], model=model)

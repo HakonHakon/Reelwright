@@ -73,6 +73,53 @@ def media_file(path: str):
 
 # ── status / settings / jobs ────────────────────────────────────────────
 
+def _required_model_options(s):
+    """Check configured render families, including existing project/shot overrides."""
+    sources, engines = set(), set()
+
+    def include_style(b):
+        style = b["style"]
+        sources.add(jobs._resolve_source({"frame_source": style["default_frame_source"], "characters": []}, b))
+        engines.add(style["default_engine"])
+
+    include_style({"style": {**store.DEFAULT_STYLE, **s.get("style_defaults", {})}, "characters": {}})
+    for series in store.list_series():
+        sid = series["id"]
+        b = store.bible(sid)
+        include_style(b)
+        for character in b["characters"].values():
+            if character.get("frame_source"):
+                sources.add(jobs._resolve_source({"characters": [{"id": character["id"]}]}, b))
+        for episode in store.list_episodes(sid):
+            for shot in (store.get_episode(sid, episode["id"]) or {}).get("shots", []):
+                sources.add(jobs._resolve_source(shot, b))
+                engines.add(shot.get("engine") or b["style"]["default_engine"])
+
+    needed = {}
+
+    def require(node, field, *names):
+        needed.setdefault((node, field), set()).update(names)
+
+    if "flux_lora" in sources:
+        require("UNETLoader", "unet_name", s["flux"]["unet"])
+        require("VAELoader", "vae_name", s["flux"]["vae"])
+    if "zimage" in sources:
+        require("UNETLoader", "unet_name", s["zimage"]["unet"])
+        require("CLIPLoader", "clip_name", s["zimage"]["clip"])
+        require("VAELoader", "vae_name", s["zimage"]["vae"])
+    if "qwen_refs" in sources:
+        require("UNETLoader", "unet_name", s["qwen_edit"]["unet"])
+        require("CLIPLoader", "clip_name", s["qwen_edit"]["clip"])
+        require("VAELoader", "vae_name", s["qwen_edit"]["vae"])
+        require("LoraLoaderModelOnly", "lora_name", s["qwen_edit"]["lora"])
+    if "wan" in engines:
+        require("UNETLoader", "unet_name", s["wan"]["high"], s["wan"]["low"])
+        require("CLIPLoader", "clip_name", s["wan"]["text_encoder"])
+        require("VAELoader", "vae_name", s["wan"]["vae"])
+        require("LoraLoaderModelOnly", "lora_name", s["wan"]["high_lightning"], s["wan"]["low_lightning"])
+    return needed
+
+
 @app.get("/api/status")
 def status():
     s = _s()
@@ -83,12 +130,10 @@ def status():
     if alive:
         try:
             out["loras"] = c.options("LoraLoaderModelOnly", "lora_name")
-            needed = {("UNETLoader", "unet_name"): [s["flux"]["unet"], s["zimage"]["unet"], s["wan"]["high"], s["wan"]["low"]],
-                      ("CLIPLoader", "clip_name"): [s["zimage"]["clip"], s["wan"]["text_encoder"]],
-                      ("VAELoader", "vae_name"): [s["flux"]["vae"], s["wan"]["vae"]]}
+            needed = _required_model_options(s)
             for (node, inp), names in needed.items():
                 opts = set(c.options(node, inp))
-                out["missing"] += [n for n in names if n not in opts]
+                out["missing"] += sorted(n for n in names if n not in opts and n not in out["missing"])
         except Exception as exc:
             out["error"] = str(exc)
     for m in {s["planner_model"], s["vision_model"]}:

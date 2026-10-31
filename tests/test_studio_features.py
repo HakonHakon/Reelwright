@@ -211,3 +211,33 @@ def test_minimax_failed_task_does_not_download(client, monkeypatch, tmp_path):
     monkeypatch.setattr(providers.requests, "get", lambda *a, **kw: pytest.fail("Must not download a failed task"))
     with pytest.raises(RuntimeError, match="generation failed"):
         providers.minimax_generate(jobs.Job("takes", "test", None, {}), settings.load(), str(image), "move", 6, str(tmp_path))
+
+
+def mock_installed_render_models(monkeypatch, missing=()):
+    from studio import comfy, llm
+    s = settings.load()
+    installed = {group[key] for group in (s['flux'], s['zimage'], s['wan'], s['qwen_edit'])
+                 for key in group if isinstance(group[key], str) and group[key].endswith('.safetensors')}
+    installed.difference_update(missing)
+    monkeypatch.setattr(comfy.Comfy, 'alive', lambda self: True)
+    monkeypatch.setattr(comfy.Comfy, 'options', lambda *args: list(installed))
+    monkeypatch.setattr(llm, 'installed', lambda *args: [s['planner_model'], s['vision_model']])
+
+
+def test_status_does_not_require_unused_flux(client, monkeypatch):
+    settings.save({'style_defaults': {'default_engine': 'wan', 'default_frame_source': 'zimage'}})
+    mock_installed_render_models(monkeypatch, missing=[settings.DEFAULTS['flux']['unet']])
+    sid = client.post('/api/series', json={'name': 'Z-Image project'}).json()['id']
+    assert client.get('/api/status').json()['missing'] == []
+    client.put(f'/api/s/{sid}/style', json={'default_frame_source': 'flux_lora'})
+    assert settings.DEFAULTS['flux']['unet'] in client.get('/api/status').json()['missing']
+
+
+def test_status_checks_shot_overrides_and_selected_missing_models(client, monkeypatch):
+    settings.save({'style_defaults': {'default_engine': 'wan', 'default_frame_source': 'zimage'}})
+    sid, eid, sh = project(client)
+    missing = [settings.DEFAULTS['flux']['unet'], settings.DEFAULTS['wan']['high_lightning']]
+    mock_installed_render_models(monkeypatch, missing=missing)
+    assert client.get('/api/status').json()['missing'] == [settings.DEFAULTS['wan']['high_lightning']]
+    store.update_episode(sid, eid, lambda e: e['shots'][0].update(frame_source='flux_lora'))
+    assert set(client.get('/api/status').json()['missing']) == set(missing)

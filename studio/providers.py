@@ -8,6 +8,7 @@ import uuid
 import requests
 
 VIDEO_MODELS = [
+    {"engine": "minimax_local", "id": "MiniMax-H3", "name": "MiniMax H3 · local, audio, no API fees"},
     {"engine": "ltx", "id": "ltx", "name": "LTX-2.3 · local, audio"},
     {"engine": "wan", "id": "wan", "name": "Wan 2.2 · local, silent"},
     {"engine": "minimax", "id": "MiniMax-Hailuo-2.3", "name": "MiniMax Hailuo 2.3 · cloud"},

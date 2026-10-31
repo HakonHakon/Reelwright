@@ -45,3 +45,11 @@ Installed local model families:
 Ollama is managed by `reelwright-ollama.service`. The UI/backend services are set to
 start automatically for the user account. Checks and install logs are in `.runtime/`;
 small generated verification clips are in `studio_data/setup-checks/`.
+
+## MiniMax H3 local
+
+The local H3 engine uses native ComfyUI `MiniMaxH3ImageToVideo` nodes, quantized
+FL2VA INT8 weights, the Qwen3-VL NVFP4 encoder, native video/audio VAEs, and a
+4-step Turbo LoRA. These are separate from the paid MiniMax Hailuo API models.
+Downloads and the hardware check are logged in `.runtime/download-h3.log` and
+`.runtime/h3-inference-check.log`. No API key is used for this engine.

@@ -241,3 +241,58 @@ def test_status_checks_shot_overrides_and_selected_missing_models(client, monkey
     assert client.get('/api/status').json()['missing'] == [settings.DEFAULTS['wan']['high_lightning']]
     store.update_episode(sid, eid, lambda e: e['shots'][0].update(frame_source='flux_lora'))
     assert set(client.get('/api/status').json()['missing']) == set(missing)
+
+
+def test_local_h3_workflow_has_native_audio_and_end_frame(client):
+    from studio import workflows
+    s = settings.load()
+    frames = workflows.minimax_h3_frames(4)
+    assert (frames - 5) % 17 == 0 and frames >= 96
+    wf = workflows.minimax_h3_i2v(s, 'A character waves and says hello', 'first.png', frames, 42, 'last.png')
+    assert wf['6']['class_type'] == 'MiniMaxH3ImageToVideo'
+    assert wf['6']['inputs']['last_frame'] == ['17', 0]
+    assert wf['10']['inputs']['model'] == ['16', 0]
+    assert wf['14']['inputs']['audio'] == ['13', 0]
+    assert wf['13']['class_type'] == 'VAEDecodeAudio'
+    assert not any('Cloud' in n['class_type'] for n in wf.values())
+    providers.validate_model('minimax_local', 'MiniMax-H3')
+
+
+def test_local_h3_job_does_not_call_paid_api(client, monkeypatch):
+    sid, eid, sh = project(client)
+    graphs = []
+    class LocalComfy:
+        def upload(self, *a): return 'first.png'
+        def run(self, wf, **kw):
+            graphs.append(wf)
+            return {'videos': [{'filename': 'local.mp4'}], 'seconds': 1}
+        def free(self): pass
+    monkeypatch.setattr(jobs, '_ctx', lambda: (settings.load(), LocalComfy()))
+    monkeypatch.setattr(jobs, '_gpu_prepare', lambda *a: None)
+    monkeypatch.setattr(jobs, '_first_frame_for', lambda *a: '/tmp/first.png')
+    monkeypatch.setattr(jobs, '_save_outputs', lambda *a: [os.path.join(settings.DATA_ROOT, 'local.mp4')])
+    monkeypatch.setattr(jobs.media, 'probe', lambda *a: {'duration': 107/24, 'fps': 24, 'has_audio': True})
+    monkeypatch.setattr(jobs.media, 'qc_video', lambda *a: [])
+    monkeypatch.setattr(providers, 'minimax_generate', lambda *a: pytest.fail('Local H3 must not use the paid API'))
+    jobs.job_takes(jobs.Job('takes', 'test', None, {}), sid, eid, takes=1, force=True,
+                   engine_override='minimax_local', model_override='MiniMax-H3')
+    assert graphs[0]['6']['class_type'] == 'MiniMaxH3ImageToVideo'
+    take = store.get_episode(sid, eid)['shots'][0]['takes']['items'][-1]
+    assert take['engine'] == 'minimax_local' and take['model'] == 'MiniMax-H3'
+
+
+def test_status_checks_local_h3_models(client, monkeypatch):
+    settings.save({'style_defaults': {'default_engine': 'minimax_local', 'default_frame_source': 'zimage'}})
+    from studio import comfy, llm
+    from studio.app import _required_model_options
+    s = settings.load()
+    required = _required_model_options(s)
+    installed = {name for names in required.values() for name in names}
+    missing = s['minimax_local']['unet']
+    installed.remove(missing)
+    monkeypatch.setattr(comfy.Comfy, 'alive', lambda self: True)
+    monkeypatch.setattr(comfy.Comfy, 'options', lambda *a: sorted(installed))
+    monkeypatch.setattr(llm, 'installed', lambda *a: [s['planner_model'], s['vision_model']])
+    assert client.get('/api/status').json()['missing'] == [missing]
+    installed.add(missing)
+    assert client.get('/api/status').json()['missing'] == []

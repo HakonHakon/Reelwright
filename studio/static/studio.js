@@ -68,8 +68,8 @@ function bulkSelect(root, selector, remove, refresh = route, label = "items") {
     catch { App.selecting = false; await refresh(); }
   };
 }
-const VIDEO_ENGINES = ["ltx", "wan", "minimax"];
-const engineOptions = (current) => VIDEO_ENGINES.map(x => `<option value="${x}" ${x === current ? "selected" : ""}>${esc({ltx:"LTX-2.3",wan:"Wan 2.2",minimax:"MiniMax (cloud)"}[x])}</option>`).join("");
+const VIDEO_ENGINES = ["minimax_local", "ltx", "wan", "minimax"];
+const engineOptions = (current) => VIDEO_ENGINES.map(x => `<option value="${x}" ${x === current ? "selected" : ""}>${esc({minimax_local:"MiniMax H3 (local)",ltx:"LTX-2.3",wan:"Wan 2.2",minimax:"MiniMax (cloud)"}[x])}</option>`).join("");
 
 // ── toasts ───────────────────────────────────────────────────────────────
 function toast(msg, bad) {
@@ -616,7 +616,8 @@ async function viewModels(view) {
   view.innerHTML = `<h1>Models</h1><h2>Video generation</h2>
     <p>Choose a model when rendering in Takes, or set a default engine in Style &amp; props.</p>
     <div class="card">${models.map(m => `<p>${esc(m.name)}</p>`).join("")}</div>
-    <h2>MiniMax</h2><p>Cloud generation sends your first frame and prompt to MiniMax and uses your paid API account. Set <code>${esc(cfg.minimax.api_key_env)}</code> in the server environment, then restart Studio.</p>
+    <h2>MiniMax H3 · local</h2><p>Generates video and sound on this PC through ComfyUI, with no API key or per-generation API fee. Uses quantized open weights and 4-step Turbo sampling. Local clips are at least 4 seconds; trim shorter shots in Takes. Model weight license: <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE" target="_blank" rel="noopener">MiniMax H3 Community License</a>.</p>
+    <h2>MiniMax cloud (optional, paid)</h2><p>Cloud generation sends your first frame and prompt to MiniMax and uses your paid API account. Set <code>${esc(cfg.minimax.api_key_env)}</code> in the server environment, then restart Studio.</p>
     <div class="card form-grid"><div><label>Default MiniMax model</label><select id="mm-model">${models.filter(m => m.engine === "minimax").map(m => `<option value="${esc(m.id)}" ${m.id === cfg.minimax.model ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></div>
     <div><label>Resolution</label><select id="mm-resolution">${["768P", "1080P"].map(x => `<option ${x === cfg.minimax.resolution ? "selected" : ""}>${x}</option>`).join("")}</select></div></div>
     <h2>Face correction</h2><p>KEEP uses temporal information for a single main face. CodeFormer can restore multiple faces with adjustable identity fidelity. Install the chosen model separately; see STUDIO.md. Each correction adds a take for comparison.</p>

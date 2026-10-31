@@ -79,6 +79,14 @@ DEFAULTS = {
         "max_seconds": 5,
         "negative": "blurry, static, deformed, extra fingers, watermark, subtitles, text",
     },
+    "minimax_local": {
+        "unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "clip": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+        "lora": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+        "steps": 4, "width": 608, "height": 352, "max_seconds": 15,
+    },
     "minimax": {
         "model": "MiniMax-Hailuo-2.3", "resolution": "768P",
         "api_key_env": "MINIMAX_API_KEY", "base_url": "https://api.minimax.io/v1",

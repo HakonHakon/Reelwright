@@ -75,3 +75,23 @@ until **Save shot list**. Project, episode, character and location deletion move
 folder to a hidden `.deleted_*` sibling for manual recovery. Asset removal detaches the
 entry but keeps the media on disk. Selection indices are adjusted after removal and
 review gates/exports are invalidated. Finish or cancel active project jobs before deletion.
+
+## MiniMax H3 local generation
+
+Choose **MiniMax H3 · local, audio, no API fees** in Takes, or **MiniMax H3 (local)**
+as the project's default engine in Style & props. Engine id: `minimax_local`;
+model id: `MiniMax-H3`. This path runs ComfyUI nodes entirely on your machine.
+It does not call MiniMax's hosted API, Context-IR service or 2K service.
+The Hailuo cloud choices remain separate and require explicit selection and an API key.
+
+The default local setup uses the Comfy-Org H3 pruned INT8 FL2VA model, NVFP4 Qwen3-VL
+encoder, INT8 video VAE, FP32 audio VAE, and 4-step Turbo LoRA. Model files come from
+https://huggingface.co/Comfy-Org/MiniMax-H3 . The upstream I2V template is at
+https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_i2v.json .
+Weights retain the MiniMax H3 license: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE .
+
+Resolution defaults to 608×352 to fit the RTX 3090; change `minimax_local.width` and
+`minimax_local.height` in Settings to multiples of 32 for higher resolutions.
+Clips use 24 fps and the model's 17n+5 frame grid, with a 4-second minimum and
+15-second cap. An optional end frame is passed to H3. Native audio is retained.
+The first run loads large models and can take several minutes.

@@ -124,7 +124,7 @@ async function tabShots(el, ctx) {
               ${sh.duration_locked ? `<button class="link" data-unlock="${i}" title="locked - click to auto-compute">🔒</button>` : ""}</div>
             ${sel("start_mode", i, sh.start_mode, ["new", "punch_in", "reuse", "chain"], ["new frame (master)", "punch-in from scene master", "reuse master angle", "chain: last frame of prev take"])}
             ${sel("frame_source", i, sh.frame_source, ["", "flux_lora", "zimage", "qwen_refs", "auto", "upload"], ["source: inherit (" + sourceLabel(sh._source) + ")", "Flux + LoRA", "Z-Image", "Reference photos (Qwen Edit)", "Auto (LoRA > photos > Z-Image)", "Upload"])}
-            ${sel("engine", i, sh.engine, ["", "ltx", "wan", "minimax"], ["engine: series default", "LTX-2.3", "Wan 2.2", "MiniMax (cloud)"])}</td>
+            ${sel("engine", i, sh.engine, ["", "minimax_local", "ltx", "wan", "minimax"], ["engine: series default", "MiniMax H3 (local)", "LTX-2.3", "Wan 2.2", "MiniMax (cloud)"])}</td>
           <td><div class="row" style="gap:2px"><button class="link" data-up="${i}" title="move up">↑</button><button class="link" data-down="${i}" title="move down">↓</button>
             <button class="link" data-dup="${i}" title="split: duplicate below">split</button><button class="link" data-merge="${i}" title="merge with next">merge</button>
             <button class="link danger" data-del="${i}">delete</button></div></td></tr>`;

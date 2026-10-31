@@ -587,7 +587,12 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
                 done += 1
                 job.progress = [done, len(todo) * n_takes]
                 continue
-            if engine == "wan":
+            if engine == "minimax_local":
+                seconds = max(4.0, seconds)
+                frames = workflows.minimax_h3_frames(seconds)
+                wf = workflows.minimax_h3_i2v(s, prompts.motion_prompt(sh, b, engine), first_name,
+                                             frames, seed, end_name, prefix)
+            elif engine == "wan":
                 frames = workflows.wan_frames(seconds, int(s["wan"]["fps"]))
                 wf = workflows.wan_i2v(s, prompts.motion_prompt(sh, b, "wan"), first_name, frames, seed,
                                        prompts.video_loras(sh, b), prefix)
@@ -610,7 +615,7 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
             flags = media.qc_video(path, seconds, info["duration"])
             spf = res["seconds"] / max(1, frames)
             job.say(f"  done in {res['seconds']:.0f}s ({spf:.2f} s/frame){' - flags: ' + ', '.join(flags) if flags else ''}")
-            item = {"file": store.rel(path), "engine": engine, "seed": seed, "frames": frames,
+            item = {"file": store.rel(path), "engine": engine, "model": "MiniMax-H3" if engine == "minimax_local" else engine, "seed": seed, "frames": frames,
                     "seconds": round(info["duration"], 2), "render_s": round(res["seconds"]),
                     "flags": flags, "first_frame": store.rel(first),
                     "sig": store.bible_signature(b, sh), "created": store.now()}

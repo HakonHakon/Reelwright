@@ -117,6 +117,13 @@ def _required_model_options(s):
         require("CLIPLoader", "clip_name", s["wan"]["text_encoder"])
         require("VAELoader", "vae_name", s["wan"]["vae"])
         require("LoraLoaderModelOnly", "lora_name", s["wan"]["high_lightning"], s["wan"]["low_lightning"])
+    if "minimax_local" in engines:
+        h = s["minimax_local"]
+        require("UNETLoader", "unet_name", h["unet"])
+        require("CLIPLoader", "clip_name", h["clip"])
+        require("VAELoader", "vae_name", h["video_vae"], h["audio_vae"])
+        if h.get("lora"):
+            require("LoraLoaderModelOnly", "lora_name", h["lora"])
     return needed
 
 

@@ -235,3 +235,44 @@ def wan_frames(seconds: float, fps: int) -> int:
     """Wan needs 4n+1 frames."""
     n = max(1, round(seconds * fps / 4))
     return 4 * n + 1
+
+
+def minimax_h3_frames(seconds: float) -> int:
+    """H3 uses a 17n+5 frame grid at 24 fps."""
+    n = max(5, round(seconds * 24))
+    return n + (5 - n % 17) % 17
+
+
+def minimax_h3_i2v(s: dict, prompt: str, first_frame: str, frames: int, seed: int,
+                   end_frame: str | None = None, prefix: str = "studio/take") -> dict:
+    """Local H3 FL2VA with native audio; follows Comfy's official I2V template."""
+    h = s["minimax_local"]
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": h["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": h["clip"], "type": "minimax", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": h["video_vae"]}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": h["audio_vae"]}},
+        "5": {"class_type": "LoadImage", "inputs": {"image": first_frame}},
+        "6": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {
+            "clip": ["2", 0], "vae": ["3", 0], "prompt": prompt,
+            "width": int(h["width"]), "height": int(h["height"]), "length": int(frames), "first_frame": ["5", 0]}},
+        "7": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
+        "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+        "9": {"class_type": "BasicScheduler", "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": int(h["steps"]), "denoise": 1.0}},
+        "10": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["6", 0]}},
+        "11": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["7", 0], "guider": ["10", 0], "sampler": ["8", 0], "sigmas": ["9", 0], "latent_image": ["6", 1]}},
+        "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+        "13": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}},
+        "14": {"class_type": "CreateVideo", "inputs": {"images": ["12", 0], "fps": 24.0, "audio": ["13", 0]}},
+        "15": {"class_type": "SaveVideo", "inputs": {"video": ["14", 0], "filename_prefix": prefix, "format": "auto", "codec": "auto"}},
+    }
+    if h.get("lora"):
+        wf["16"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["1", 0], "lora_name": h["lora"], "strength_model": 1.0}}
+        wf["9"]["inputs"]["model"] = ["16", 0]
+        wf["10"]["inputs"]["model"] = ["16", 0]
+    if end_frame:
+        wf["17"] = {"class_type": "LoadImage", "inputs": {"image": end_frame}}
+        wf["6"]["inputs"]["last_frame"] = ["17", 0]
+    return wf

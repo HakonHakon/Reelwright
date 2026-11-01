@@ -100,7 +100,7 @@ svg.i { width: 17px; height: 17px; flex: none; stroke: currentColor; fill: none;
 .take-library-panel > summary { padding: 14px 16px; border: 1px solid var(--rule); background: var(--paper); font-weight: 600; border-radius: 6px; }
 .take-library-panel[open] > summary { margin-bottom: 14px; }
 .timeline-focus { overflow: hidden; }
-.take-editor.focused { position: fixed; z-index: 90; inset: 10px; margin: 0; overflow: auto; box-shadow: var(--shadow); }
+.take-editor.focused { position: fixed; z-index: 45; inset: 10px; margin: 0; overflow: auto; box-shadow: var(--shadow); }
 .take-editor.focused .edit-monitor video { height: max(150px, calc(100dvh - 430px)); max-height: 440px; }
 .take-editor.focused .edit-inspector { max-height: max(220px, calc(100dvh - 360px)); }
 .take-editor.inspector-hidden .edit-inspector { display: none; }

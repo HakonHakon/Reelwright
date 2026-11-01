@@ -138,6 +138,10 @@ def test_timeline_edit_music_generate_and_export(edit_server,engine,mobile,tmp_p
         # Expanded mobile editor contains its own scroll area; page does not overflow.
         page.locator('[data-edit="focus"]').click()
         assert page.locator('.take-editor.focused').is_visible()
+        # Dialogs must stay usable above the expanded editor.
+        page.locator('[data-edit="sync"]').click()
+        page.locator('#edit-sync-all').click()
+        page.locator('#edit-sync-apply').click()
         assert page.evaluate('document.documentElement.scrollWidth<=window.innerWidth+1')
         page.screenshot(path=str(tmp_path/f'{engine}-{mobile}-timeline.png'))
         page.keyboard.press('Escape')

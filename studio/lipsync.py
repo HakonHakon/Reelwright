@@ -45,6 +45,25 @@ def plan_episode(episode, shot_ids, cfg):
     return timeline
 
 
+def correct_clip(job, cfg, client, source, voice, destination, frames, width, height, fps, prefix):
+    """Apply the installed ComfyUI mouth correction to a precisely trimmed clip."""
+    import tempfile
+    job.check()
+    with tempfile.TemporaryDirectory(prefix='reelwright_clip_sync_') as work:
+        video_name = client.upload(source, prefix + '.mp4')
+        audio_name = client.upload(voice, prefix + '.wav')
+        result = client.run(workflows.lipsync_video(video_name, audio_name), cancel=lambda: job.cancel_flag)
+        if not result['videos']:
+            raise RuntimeError('Lip-sync produced no video')
+        rendered = str(Path(work) / 'model.mp4')
+        client.download(result['videos'][0], rendered)
+        job.check()
+        media._run([cfg['ffmpeg'], '-y', '-v', 'error', '-i', rendered, '-an', '-vf',
+                    f'scale={width}:{height},fps={fps},tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                    '-frames:v', str(frames), '-c:v', 'libx264', '-crf', '16', destination])
+    return destination
+
+
 def render(job, sid, eid, timeline, audio_file, audio_offset=0, isolate_vocals=True):
     from . import jobs
     cfg = settings.load()

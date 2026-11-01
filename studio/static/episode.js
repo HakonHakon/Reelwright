@@ -29,7 +29,7 @@ async function viewEpisode(view, sid, eid, tab) {
   const fn = { story: tabStory, shots: tabShots, frames: tabFrames, animatic: tabAnimatic, takes: tabTakes, cut: tabCut }[tab] || tabStory;
   await fn(el, ctx);
   if (tab === "frames" || tab === "takes") {
-    bulkSelect(el, "[data-rm]", async targets => {
+    bulkSelect(tab === 'takes' ? $('#take-library', el) : el, "[data-rm]", async targets => {
       const items = {};
       for (const t of targets) (items[t.dataset.shot] ||= []).push(+t.dataset.rm);
       await POST(`${ctx.base}/delete_assets`, {kind: tab === "frames" ? "frame" : "take", items});
@@ -420,6 +420,8 @@ async function tabTakes(el, ctx) {
   const models = await GET("/api/models");
   el.innerHTML = `
     ${!ctx.e.gates.frames ? `<div class="notice">First frames aren't approved yet. Shots without a selected frame are skipped.</div>` : ""}
+    <div id="take-timeline"></div>
+    <details class="take-library-panel"><summary>Take library &amp; batch generation</summary>
     <div class="card row">
       <label class="row" style="margin:0">takes per shot <input id="ntakes" type="number" min="1" max="8" value="${ctx.e._settings.takes_per_shot}" style="width:60px"></label>
       <label>Video model <select id="take-model"><option value="">Per-shot / project default</option>${models.map(m => `<option value="${esc(m.id)}" data-engine="${m.engine}">${esc(m.name)}</option>`).join("")}</select></label>
@@ -428,12 +430,15 @@ async function tabTakes(el, ctx) {
       <span class="muted small grow">Measured speed: ${Object.entries(spf).map(([k, v]) => `${k} ${v} s/frame`).join(", ") || "not measured yet"} · est. ${fmtSec(ctx.e._estimate_s)} for all</span>
       ${gateBtn(ctx, "takes", "takes")}
     </div>
-    ${shots.map((sh) => takeCard(ctx, sh)).join("")}`;
+    <h2>Take library</h2><p class="muted small">Generate candidates here, then add them to the timeline or replace its selected clip. Library picks and source files stay available.</p>
+    <div id="take-library">${shots.map((sh) => takeCard(ctx, sh)).join("")}</div></details>`;
   const n = () => parseInt($("#ntakes").value) || 1;
   const modelChoice = () => {
     const option = $("#take-model").selectedOptions[0];
     return { engine: option.dataset.engine || "", model: option.value };
   };
+  const editor = await mountTakeTimeline($("#take-timeline"), ctx, shotId =>
+    startJob(`${ctx.base}/takes`, {shot_ids: [shotId], takes: n(), force: true, ...modelChoice()}));
   $("#render-missing").onclick = () => startJob(`${ctx.base}/takes`, { takes: n(), ...modelChoice() });
   $("#render-checked").onclick = () => {
     const ids = $$("input[data-chk]:checked").map((x) => x.dataset.chk);
@@ -442,6 +447,9 @@ async function tabTakes(el, ctx) {
   };
   el.onclick = async (ev) => {
     const t = ev.target, ds = t.dataset;
+    if (ds.timelineAdd != null && ds.shot) return editor.addTake(ds.shot, +ds.timelineAdd);
+    if (ds.timelineReplace != null && ds.shot) return editor.addTake(ds.shot, +ds.timelineReplace, true);
+    if (editor.dirty && ds.shot) await editor.flush();
     if (ds.zoom) zoom(ds.zoom);
     if (ds.gate) setGate(ctx, ds.gate, ds.val === "1");
     if (ds.pick != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/take`, { select: +ds.pick }); reload(); }
@@ -469,9 +477,11 @@ function takeCard(ctx, sh) {
       <button data-lock="${sh.takes.locked ? 0 : 1}" data-shot="${sh.id}">${sh.takes.locked ? "Unlock" : "Lock"}</button></div>
     <details><summary>motion prompt</summary><pre class="prompt">${esc(sh._motion_prompt)}</pre></details>
     <div class="cands"><div class="cands-in">${items.map((t, k) => `<div class="cand ${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? "sel" : ""}">
-      <div class="frame"><video playsinline preload="metadata" controls preload="metadata" src="${media(t.file)}"></video></div>
+      <div class="frame"><video playsinline preload="none" controls ${t.first_frame || f?.file ? `poster="${media(t.first_frame || f.file)}"` : ''} src="${media(t.file)}"></video></div>
       <div class="meta"><span class="code">${esc(sh.id)}/T${k + 1}</span>${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? `<span class="pick">picked</span>` : ""}<span>${esc(t.model || t.engine)}${t.face_correction ? " · " + esc(t.face_correction) + " corrected" : ""}, ${t.seconds}s, ${t.render_s}s render</span> ${(t.flags || []).map((x) => `<span class="chip warn">${esc(x)}</span>`).join(" ")}</div>
       <div class="acts">${sh.takes.selected === k ? "" : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
+        <button data-timeline-add="${k}" data-shot="${sh.id}">Add to timeline</button>
+        <button data-timeline-replace="${k}" data-shot="${sh.id}">Replace selected clip</button>
         <button data-face="${k}" data-shot="${sh.id}">Correct faces</button>
         <button class="danger" data-rm="${k}" data-shot="${sh.id}">✕</button></div></div>`).join("") || `<p class="muted" style="padding:20px">No takes yet.</p>`}</div></div>
     ${items.length ? `<div class="row small" style="margin-top:8px">Trim selected take: in <input id="ti-${sh.id}" type="number" step="0.05" min="0" value="${sh.takes.trim_in || 0}" style="width:70px">s
@@ -485,7 +495,8 @@ async function tabCut(el, ctx) {
   const missing = e.shots.filter((s) => !(s.takes.items || []).length).map((s) => s.id);
   el.innerHTML = `
     ${missing.length ? `<div class="notice">No takes yet for: ${esc(missing.join(", "))}. They'll be left out.</div>` : ""}
-    <div class="card form-grid">
+    ${e.timeline ? `<div class="notice">This film uses the saved Takes timeline. <a href="#/s/${ctx.sid}/e/${ctx.eid}/takes">Edit clips, music and lip-sync in Takes</a>.</div>` : ''}
+    <div class="card form-grid ${e.timeline ? 'hidden' : ''}">
       <div><label>Music or voice recording</label><input type="file" id="mfile" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac">
         <div id="music-current" class="small muted">${m.file ? "current: " + esc(m.file.split("/").pop()) : "none"}</div></div>
       <div><label>Music volume (0-1)</label><input id="mvol" type="number" step="0.05" min="0" max="1" value="${m.volume ?? 0.25}">
@@ -494,7 +505,7 @@ async function tabCut(el, ctx) {
         <button id="lip-setup" ${m.file ? "" : "disabled"}>Lip-sync to uploaded audio</button><span class="grow"></span>
         <button class="primary" id="cut">Render final cut</button></div>
     </div>
-    <p class="muted small">Each selected take is trimmed, scaled to ${e._settings.video.width}x${e._settings.video.height} @ ${e._settings.video.fps} fps and loudness-normalised, then joined. Wan takes (silent) get a silent track.</p>
+    ${e.timeline ? `<button class="primary" id="render-edit">Render saved timeline</button><p class="muted small">Uses the clip order, trims, mute settings, music placement and lip-sync choices saved in Takes.</p>` : `<p class="muted small">Each selected take is trimmed, scaled to ${e._settings.video.width}x${e._settings.video.height} @ ${e._settings.video.fps} fps and loudness-normalised, then joined. Wan takes (silent) get a silent track.</p>`}
     ${o.final ? `<h2>Final film ${o.runtime ? "· " + fmtSec(o.runtime) : ""}</h2>
       <video playsinline preload="metadata" controls src="${media(o.final)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
       <div class="row" style="margin-top:8px"><a href="${media(o.final)}" download>final.mp4</a>${o.srt ? `<a href="${media(o.srt)}" download>subtitles (.srt)</a>` : ""}
@@ -531,6 +542,7 @@ async function tabCut(el, ctx) {
     await POST(`${ctx.base}/lipsync/select`, {index: +button.dataset.useLipsync}); reload();
   });
   $("#cut").onclick = () => startJob(`${ctx.base}/cut`);
+  if ($('#render-edit')) $('#render-edit').onclick = () => startJob(`${ctx.base}/cut`);
   App.refreshers.push(reload);
 }
 

@@ -137,11 +137,24 @@ Choose a video model for each render, or use the shot/project default:
 
 Render several takes, pick the best, trim it, and use **Last frame -> next shot** to continue a scene. Takes get quality flags for cuts or drift inside the clip.
 
+The **Takes editor** is the editing workspace inside Studio:
+
+- Preview and scrub the video, drag clip grips to reorder, and drag edges or enter source in/out times to trim on project frame boundaries.
+- **Split at playhead**, duplicate, move or delete individual clips. Deletion closes the gap; the source takes remain in the library. Undo/redo restores edits during the current session.
+- Mute individual clips or all takes, and adjust clip volume. **Add music / voice** adds a waveform track with its own start, source trim, length, volume, mute and loop controls.
+- After an audio upload, Studio asks whether to choose lip-sync clips. Choose clips for either character; optional Demucs vocal isolation guides local LatentSync using each clip's exact place in the song.
+- Generate more takes for the selected shot with the model selector, then open **Take library & batch generation** to add a candidate or replace the selected timeline clip.
+- Edits autosave. **Render timeline** queues the saved edit in Studio, checks its frame count, and publishes a version with Watch / Download MP4 links. Completed lip-sync clips are cached for subsequent exports; an interrupted render can be submitted again.
+
+**Expand editor** gives more room; on phones, **Settings** opens the clip/music inspector. The current editor has one ripple video track and one music track. Audio ends with the video; loop or trim it to fit. Editing never regenerates approved footage unless you explicitly enable lip-sync or request another take. Existing selected lip-sync finals with saved cut metadata open as editable segments of that final, preserving their approved picture.
+
 **Correct faces** adds another take for comparison. Qwen Image Edit corrects every original frame from the character reference; MiniMax H3 offers a reference-conditioned video edit. KEEP and CodeFormer restore damaged faces when their separate runtimes are installed. Generative correction can change expressions or details, so review it before selecting it.
 
 ### 7. Cut
 
-Optionally add a music bed that ducks under dialogue, then render `final.mp4` with `final.srt` subtitles and `final.edl` for DaVinci Resolve.
+Once you save a Takes timeline, **Cut → Render saved timeline** uses that same edit. It retains previous exports, provides the current MP4 and EDL, and uses the timeline's trims, clip audio and music mix. Subtitles from an earlier cut are cleared because their timing may no longer match. Timeline versions are also downloadable directly in Takes. Legacy projects without a saved timeline retain the original cut and subtitle workflow below.
+
+For the legacy cut, optionally add a music bed that ducks under dialogue, then render `final.mp4` with `final.srt` subtitles and `final.edl` for DaVinci Resolve.
 
 For a music video or a new voice recording, upload the audio and choose **Save music settings**. Studio asks whether to set up lip-sync:
 
@@ -176,13 +189,13 @@ Use **Select all** and **Delete selected** on deletable collections, including p
 Install `pytest` in the studio environment and ensure ffmpeg and ffprobe are on `PATH`. Run the API, media and model-routing checks with:
 
 ```sh
-python -m pytest tests/test_studio_features.py tests/test_lipsync.py tests/test_comfy_outputs.py -q
+python -m pytest tests/test_studio_features.py tests/test_lipsync.py tests/test_comfy_outputs.py tests/test_timeline.py -q
 ```
 
 Mobile browser checks additionally need Playwright with Chromium and WebKit installed:
 
 ```sh
-python -m pytest tests/test_studio_mobile.py -q
+python -m pytest tests/test_studio_mobile.py tests/test_timeline_browser.py -q
 ```
 
 These tests use temporary projects and mocked GPU calls. The full pipeline tests in `tests/test_studio_e2e.py` also require the configured LTX template (`video_director_agent/i2v_template.json` by default). The screenshots above come from a throwaway demo project with generated placeholder images.

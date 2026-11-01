@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+from functools import lru_cache
 
 from PIL import Image, ImageOps
 
@@ -157,6 +158,22 @@ def qc_video(path: str, expected_seconds: float, actual_seconds: float) -> list[
 
 
 # ── Cut ─────────────────────────────────────────────────────────────────
+
+def audio_peaks(ffmpeg, path):
+    stat = os.stat(path)
+    return _audio_peaks(ffmpeg, path, stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=32)
+def _audio_peaks(ffmpeg, path, modified, size):
+    import numpy as np
+    result = subprocess.run([ffmpeg, '-v', 'error', '-i', path, '-vn', '-ac', '1', '-ar', '2000',
+                             '-f', 's16le', '-'], capture_output=True)
+    if result.returncode:
+        raise MediaError('Could not read the audio waveform')
+    samples = np.abs(np.frombuffer(result.stdout, dtype='<i2').astype(np.float32))
+    peaks = np.array([part.max() if part.size else 0 for part in np.array_split(samples, 512)])
+    return np.round(peaks / max(1, float(peaks.max())), 4).tolist()
 
 def normalize_clip(ffmpeg: str, ffprobe: str, src: str, dst: str, trim_in: float, trim_out: float,
                    width: int, height: int, fps: int, lufs: float) -> float:

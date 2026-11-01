@@ -330,6 +330,12 @@ document.addEventListener("keydown", (e) => {
 // ── router ───────────────────────────────────────────────────────────────
 const SKELETON = `<div class="skel h1"></div><div class="skel row-card"></div><div class="skel row-card"></div>`;
 async function route() {
+  if (App.timelineEditor) {
+    const editor = App.timelineEditor;
+    try { if (editor.dirty) await editor.flush(); }
+    catch (error) { toast('Timeline could not save. Your edit is still open: ' + error.message, true); return; }
+    editor.destroy(); App.timelineEditor = null;
+  }
   closeModal();
   App.refreshers = []; App.selecting = false; App.dirty = false; App.dirtyWarned = false;
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);

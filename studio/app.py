@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
-from . import jobs, llm, media, planner, prompts, store, providers
+from . import jobs, llm, media, planner, prompts, store, providers, timeline
 from . import settings as settings_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -543,6 +543,61 @@ def _correction_character(sid, sh):
 
 
 # takes
+@app.get('/api/s/{sid}/e/{eid}/timeline')
+def get_timeline(sid: str, eid: str, selected_takes: bool = False):
+    episode = _ep(sid, eid)
+    if selected_takes:
+        episode = {**episode, 'timeline': timeline.default_edit(episode, _s(), selected_takes=True)}
+    return timeline.view(episode, _s())
+
+
+@app.get('/api/s/{sid}/e/{eid}/timeline/source')
+def timeline_source(sid: str, eid: str, file: str, audio: bool = False):
+    try:
+        return timeline.source_info(_ep(sid, eid), file, _s(), audio=audio)
+    except (ValueError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get('/api/s/{sid}/e/{eid}/timeline/waveform')
+def timeline_waveform(sid: str, eid: str, file: str):
+    try:
+        info = timeline.source_info(_ep(sid, eid), file, _s(), audio=True)
+        return {'duration': info['duration'], 'peaks': media.audio_peaks(_s()['ffmpeg'], store.abs_media(file))}
+    except (ValueError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put('/api/s/{sid}/e/{eid}/timeline')
+def save_timeline(sid: str, eid: str, body: dict = Body(...)):
+    _ep(sid, eid)
+    try:
+        episode = timeline.save(sid, eid, body, _s())
+        return timeline.view(episode, _s())
+    except timeline.EditConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, TypeError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _timeline_export(sid, eid):
+    episode = _ep(sid, eid)
+    cfg = settings_mod.for_episode(_s(), episode)
+    try:
+        edit = timeline.validate(episode, episode.get('timeline') or timeline.default_edit(episode, cfg), cfg)
+        if not edit['clips']:
+            raise ValueError('Add clips to the timeline before rendering')
+    except (ValueError, TypeError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _submit('timeline', f'Timeline export {eid}', timeline.render, sid=sid, eid=eid,
+                   edit=edit, video=dict(cfg['video']))
+
+
+@app.post('/api/s/{sid}/e/{eid}/timeline/export')
+def export_timeline(sid: str, eid: str):
+    return _timeline_export(sid, eid)
+
+
 @app.post("/api/s/{sid}/e/{eid}/takes")
 def ep_takes(sid: str, eid: str, body: dict = Body(default={})):
     _ep(sid, eid)
@@ -616,6 +671,8 @@ def ep_animatic(sid: str, eid: str):
 
 @app.post("/api/s/{sid}/e/{eid}/cut")
 def ep_cut(sid: str, eid: str):
+    if _ep(sid, eid).get('timeline'):
+        return _timeline_export(sid, eid)
     return _submit("cut", f"Final cut {eid}", jobs.job_cut, sid=sid, eid=eid)
 
 
@@ -638,6 +695,10 @@ async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: fl
     def apply(e):
         m = e.setdefault("music", {})
         if rel:
+            assets = e.setdefault('audio_assets', [])
+            for path in (m.get('file'), rel):
+                if path and path not in assets:
+                    assets.append(path)
             m["file"] = rel
         m["volume"] = float(volume)
         m["duck"] = duck.lower() in ("1", "true", "yes", "on")
@@ -648,6 +709,8 @@ async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: fl
 def ep_lipsync(sid: str, eid: str, body: dict = Body(default={})):
     from . import lipsync
     episode = _ep(sid, eid)
+    if episode.get('timeline'):
+        raise HTTPException(400, 'Choose lip-sync clips and render the saved timeline in Takes')
     audio_file = (episode.get('music') or {}).get('file')
     if not audio_file or not os.path.isfile(store.abs_media(audio_file)):
         raise HTTPException(400, 'Upload music or a voice recording in Cut first')

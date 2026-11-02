@@ -976,6 +976,59 @@ def test_overlay_lane_add_select_drag_inspector_preview_delete_and_persistence(e
         browser.close()
 
 
+def test_reframe_inspector_monitor_preview_matches_the_export_maths_and_persists(edit_server):
+    import subprocess
+    base, sid, eid, shots, music, submitted = edit_server
+    # a 16:9 take in a 9:16 project
+    wide = store.abs_media(shots[0]['takes']['items'][0]['file'])
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=red:s=192x108:r=30:d=1', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1',
+                    '-c:v', 'libx264', '-c:a', 'aac', wide], check=True)
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(viewport={'width': 1440, 'height': 1100}, service_workers='block').new_page()
+        errors, ed = _open_editor(page, base, sid, eid)
+        reframe = lambda: page.evaluate('App.timelineEditor.edit.clips[0].reframe')
+        assert reframe() == {'fit': 'contain', 'zoom': 1, 'x': .5, 'y': .5}
+        page.locator('.edit-clip').first.click()
+        assert page.locator('.edit-reframe-masks').get_attribute('hidden') is not None and page.locator('[data-edit-video]').evaluate('v => v.style.transform') == ''
+
+        page.locator('.edit-reframe > summary').click()
+        fit = page.locator('[data-rf-field="fit"]'); fit.select_option('cover')
+        assert reframe()['fit'] == 'cover' and page.locator('.edit-reframe-masks').get_attribute('hidden') is None
+        zoom = page.locator('[data-rf-field="zoom"]'); zoom.fill('9'); zoom.press('Tab'); assert reframe()['zoom'] == 4, 'clamped to 4'
+        zoom.fill('1'); zoom.press('Tab')
+        x = page.locator('[data-rf-field="x"]'); x.fill('0.5'); x.dispatch_event('change')
+
+        # The source's red/blue edge (source x = 96 of 192) must land in the middle of the frame, and the picture fills it.
+        geo = """() => {
+          const t = App.timelineEditor, v = t.video, info = t.sources[t.edit.clips[0].source], r = v.getBoundingClientRect();
+          const c = Math.min(v.offsetWidth / info.width, v.offsetHeight / info.height), s = r.width / v.offsetWidth;
+          const left = r.left + r.width / 2 - info.width * c * s / 2, top = r.top + r.height / 2 - info.height * c * s / 2;
+          const dims = t.ctx.e._settings.video, mon = document.querySelector('.edit-monitor').getBoundingClientRect(), masks = [...document.querySelectorAll('.edit-reframe-masks i')].map(i => i.getBoundingClientRect());
+          const fl = masks[2].right, fr = masks[3].left, ft = masks[0].bottom, fb = masks[1].top;
+          return {edge: left + 96 * c * s, centre: (fl + fr) / 2, picL: left, picR: left + info.width * c * s, picT: top, picB: top + info.height * c * s, fl, fr, ft, fb, aspect: (fr - fl) / (fb - ft), want: dims.width / dims.height};
+        }"""
+        g = page.evaluate(geo)
+        assert abs(g['aspect'] - g['want']) < .01, 'the visible window has the project shape'
+        assert abs(g['edge'] - g['centre']) < 2, g
+        assert g['picT'] <= g['ft'] + 1 and g['picB'] >= g['fb'] - 1 and g['picL'] <= g['fl'] + 1 and g['picR'] >= g['fr'] - 1, 'no bars: the picture covers the frame'
+
+        # Moving the focus right shifts the picture left so more of the right side stays in view.
+        x.fill('0.9'); x.dispatch_event('change')
+        assert abs(reframe()['x'] - .9) < 1e-9
+        assert page.evaluate(geo)['edge'] < g['edge'] - 5
+        page.locator('[data-edit="reframe-reset"]').click()
+        assert reframe() == {'fit': 'contain', 'zoom': 1, 'x': .5, 'y': .5} and page.locator('.edit-reframe-masks').get_attribute('hidden') is not None
+
+        page.locator('.edit-reframe > summary').click()
+        page.locator('[data-rf-field="fit"]').select_option('cover')
+        page.locator('[data-edit="save"]').click()
+        page.wait_for_function('!App.timelineEditor.dirty && !App.timelineEditor.saving')
+        assert store.get_episode(sid, eid)['timeline']['clips'][0]['reframe']['fit'] == 'cover'
+        assert not errors, errors
+        browser.close()
+
+
 def test_titles_dialog_lane_live_preview_delete_and_persistence(edit_server):
     base, sid, eid, shots, music, submitted = edit_server
     with playwright.sync_playwright() as p:

@@ -3,6 +3,14 @@
 // A clip's `transition` is a crossfade with the clip before it: they overlap, so the timeline is shorter than the
 // sum of the clip lengths. Mirror of timeline.clip_starts in the backend: never add up c.frames by hand.
 const clipStarts = clips => { const starts = []; let end = 0; clips.forEach((c, i) => { const begin = end - (i ? c.transition || 0 : 0); starts.push(begin); end = begin + c.frames; }); return {starts, total: end}; };
+// Mirror of timeline.reframe_geometry in the backend: where a source picture lands in the project frame.
+const DEFAULT_REFRAME = {fit: 'contain', zoom: 1, x: .5, y: .5};
+const reframeGeometry = (sw, sh, W, H, rf) => {
+  const k = (rf.fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh)) * rf.zoom;
+  const vx = Math.min(sw, W / k), vy = Math.min(sh, H / k);
+  const x0 = Math.min(Math.max(rf.x * sw - vx / 2, 0), sw - vx), y0 = Math.min(Math.max(rf.y * sh - vy / 2, 0), sh - vy);
+  return {k, x0, y0, vx, vy, ow: vx * k, oh: vy * k};
+};
 const editClone = value => JSON.parse(JSON.stringify(value));
 const LANE_HEIGHT = 40, MAX_LANES = 8, OVERLAY_ROW = 34, MAX_OVERLAYS = 8;
 const MARKER_COLORS = ["red", "orange", "yellow", "green", "blue", "purple"];
@@ -22,7 +30,7 @@ class TakeTimelineEditor {
       <div class="edit-heading"><div><h2>Takes editor</h2><span class="edit-status muted small" data-edit-status data-state="saved" role="status" aria-live="polite">Timeline ready · source takes retained</span></div>
         <div class="row"><button data-edit="focus" title="Full-screen editor (Esc to exit)">Expand editor</button><button data-edit="inspector" title="Show or hide the clip and music settings">Inspector</button><button data-edit="undo" aria-label="Undo timeline edit" title="Undo (Ctrl+Z)">Undo</button><button data-edit="redo" aria-label="Redo timeline edit" title="Redo (Ctrl+Shift+Z)">Redo</button>
         <button data-edit="save" title="Edits also autosave">Save now</button><button data-edit="export" class="primary">Render timeline</button></div></div>
-      <div class="edit-stage"><div class="edit-monitor"><video data-edit-video playsinline preload="metadata"></video><div class="edit-title-preview" aria-hidden="true"></div><div class="edit-overlay-preview" aria-hidden="true"></div><span data-edit-empty>Add a take from the library below</span>
+      <div class="edit-stage"><div class="edit-monitor"><video data-edit-video playsinline preload="metadata"></video><div class="edit-title-preview" aria-hidden="true"></div><div class="edit-overlay-preview" aria-hidden="true"></div><div class="edit-reframe-masks" hidden aria-hidden="true"><i></i><i></i><i></i><i></i></div><span data-edit-empty>Add a take from the library below</span>
         <div class="edit-transport"><button data-edit="play" aria-label="Play timeline" title="Play / pause (Space)">▶</button><button data-edit="start" aria-label="Go to timeline start" title="Go to start (Home)">↤</button>
         <button data-edit="prev-cut" aria-label="Previous cut" title="Previous cut (↑)">⏮</button><button data-edit="step-back" aria-label="Back one frame" title="Back one frame (←)">◂</button><button data-edit="step-fwd" aria-label="Forward one frame" title="Forward one frame (→)">▸</button><button data-edit="next-cut" aria-label="Next cut" title="Next cut (↓)">⏭</button>
         <output class="edit-tc" data-edit-tc aria-label="Timecode">00:00:00:00</output><output data-edit-time>00:00.000</output><span class="grow"></span></div>
@@ -74,7 +82,7 @@ class TakeTimelineEditor {
       this.refocus();  // an edit can redraw the focused clip away; keep the shortcuts working
     };
     $('.edit-scroll', root).addEventListener('scroll', () => { if (this.thumbRaf) return; this.thumbRaf = requestAnimationFrame(() => { this.thumbRaf = 0; if (!this.destroyed && this.thumbsStale()) this.tracks(); }); }, {passive: true});
-    this.monitorObserver = new ResizeObserver(() => { this.titlePreview(); this.overlayPreview(); }); this.monitorObserver.observe($('.edit-monitor', root));
+    this.monitorObserver = new ResizeObserver(() => { this.titlePreview(); this.overlayPreview(); this.reframePreview(this.activeClip); }); this.monitorObserver.observe($('.edit-monitor', root));
     this.overlayEls = new Map(); this.overlaySel = null; this.laneEls = new Map(); this.laneWaves = {}; this.laneWavePending = new Set();
     this.draw(); this.seek(0); this.loadWaveform(); this.ensureBeats();
     const versions = this.ctx.e.outputs?.timeline_versions || [], previews = this.ctx.e.outputs?.timeline_previews || [];
@@ -370,11 +378,29 @@ class TakeTimelineEditor {
       <label>Clip volume<input data-edit-volume type="range" min="0" max="1" step=".05" value="${c.volume}" aria-label="Clip volume"></label>
       ${this.fadeFields([c])}
       ${this.crossfadeField(c)}
+      ${this.reframeFields(c)}
       <label class="row"><input data-edit-lipsync type="checkbox" ${c.lipsync ? 'checked' : ''} ${this.eligible(c) ? '' : 'disabled'}>Lip-sync this clip to music</label>
       <label>Generate with<select data-edit-model aria-label="Timeline generation model">${$('#take-model')?.innerHTML || ''}</select></label>
       <button data-edit="generate" ${sh ? '' : 'disabled'}>Generate take for this shot</button>` : '<p class="muted small">Select a clip or add a take below.</p>'}
       <h3>Music / voice</h3>${this.musicInspector()}${this.laneInspector()}`;
     const model = $('[data-edit-model]', this.root); if (model) model.value = $('#take-model').value;
+  }
+  reframeFields(c) {
+    const rf = {...DEFAULT_REFRAME, ...(c.reframe || {})}, info = this.sources[c.source];
+    const dims = this.ctx.e._settings?.video, same = info?.width && dims && Math.abs(info.width / info.height - dims.width / dims.height) < .01;
+    return `<details class="edit-reframe" ${rf.fit !== 'contain' || rf.zoom !== 1 ? 'open' : ''}><summary>Reframe${rf.fit !== 'contain' || rf.zoom !== 1 ? ' · on' : ''}</summary>
+      <label>Fit<select data-rf-field="fit" aria-label="Reframe fit"><option value="contain" ${rf.fit === 'contain' ? 'selected' : ''}>Whole picture (bars if needed)</option><option value="cover" ${rf.fit === 'cover' ? 'selected' : ''}>Fill the frame (crops)</option></select></label>
+      <label>Zoom (×)<input data-rf-field="zoom" type="number" min="1" max="4" step=".05" value="${rf.zoom}" aria-label="Reframe zoom"></label>
+      <label>Focus left ↔ right<input data-rf-field="x" type="range" min="0" max="1" step=".01" value="${rf.x}" aria-label="Reframe focus horizontal"></label>
+      <label>Focus top ↔ bottom<input data-rf-field="y" type="range" min="0" max="1" step=".01" value="${rf.y}" aria-label="Reframe focus vertical"></label>
+      <p class="muted small">${same ? 'This picture already has the frame shape; zoom crops into it.' : 'Fill the frame crops a wide or tall picture to the project shape around the focus point.'} Lip-sync sees the reframed picture.</p>
+      <button data-edit="reframe-reset">Reset reframe</button></details>`;
+  }
+  reframeChange(t, c) {
+    const rf = {...DEFAULT_REFRAME, ...(c.reframe || {})}, f = t.dataset.rfField;
+    if (f === 'fit') rf.fit = t.value === 'cover' ? 'cover' : 'contain';
+    else { const v = Number(t.value); if (!Number.isFinite(v)) return this.inspector(); rf[f] = f === 'zoom' ? Math.max(1, Math.min(4, v)) : Math.max(0, Math.min(1, v)); }
+    return this.changeEdit(() => { c.reframe = rf; });
   }
   crossfadeField(c) {
     const i = this.edit.clips.indexOf(c), prev = this.edit.clips[i - 1];
@@ -486,6 +512,7 @@ class TakeTimelineEditor {
     let start = 0, clip;
     const where = clipStarts(this.edit.clips).starts;  // in a crossfade the monitor shows the incoming clip (the export blends)
     for (let i = this.edit.clips.length - 1; i >= 0; i--) { if (this.frame >= where[i] && this.frame < where[i] + this.edit.clips[i].frames) { clip = this.edit.clips[i]; start = where[i]; break; } }
+    this.activeClip = clip || null; this.reframePreview(this.activeClip);
     if (!clip) { this.video.pause(); this.video.removeAttribute('src'); return; }
     const src = media(clip.source);
     if (this.video.dataset.source !== src) { this.video.dataset.source = src; this.video.src = src; }
@@ -541,7 +568,7 @@ class TakeTimelineEditor {
     const maximum = Math.round(info.video_duration * this.fps);
     this.changeEdit(() => {
       if (replace && this.clip) Object.assign(this.clip, {shot_id: shotId, source: take.file, source_in: 0, frames: Math.min(this.clip.frames, this.fitFrames(this.clip, maximum)), lipsync: false});
-      else { const clip = {id: editId(), shot_id: shotId, source: take.file, source_in: 0, frames: maximum, muted: false, volume: 1, lipsync: false, speed: 1, transition: 0}; this.edit.clips.push(clip); this.selected = clip.id; this.frame = this.start(clip.id); }
+      else { const clip = {id: editId(), shot_id: shotId, source: take.file, source_in: 0, frames: maximum, muted: false, volume: 1, lipsync: false, speed: 1, transition: 0, reframe: {...DEFAULT_REFRAME}}; this.edit.clips.push(clip); this.selected = clip.id; this.frame = this.start(clip.id); }
     });
   }
   /** Counts quick consecutive taps on the same item (a redraw between clicks stops browsers sending dblclick). */
@@ -788,6 +815,22 @@ class TakeTimelineEditor {
   drawTitles() {
     const px = f => f / this.fps * this.zoom;
     $('.edit-title-track', this.root).innerHTML = this.titles.length ? this.titles.map(t => `<button type="button" class="edit-title ${t.id === this.titleSel ? 'sel' : ''}" data-title="${esc(t.id)}" style="left:${px(t.start_frame)}px;width:${Math.max(6, px(t.frames))}px" title="${esc(t.text)} · ${this.tc(t.start_frame)}" aria-label="Title ${esc(t.text)} at ${this.tc(t.start_frame)}"><span>${esc(t.text.replace(/\n/g, ' '))}</span></button>`).join('') : '<span class="edit-track-empty">Add on-screen text with “Title”</span>';
+  }
+  reframePreview(clip) {  // show the clip the way the export frames it: scale/shift the video, hide what falls outside the frame
+    const masks = $('.edit-reframe-masks', this.root); if (!masks) return;
+    const rf = clip?.reframe, info = clip && this.sources[clip.source], v = this.video;
+    if (!rf || (rf.fit === 'contain' && rf.zoom === 1) || !info?.width || !v.offsetWidth) { v.style.transform = ''; masks.hidden = true; return; }
+    const dims = this.ctx.e._settings?.video || {width: 9, height: 16}, W = dims.width, H = dims.height;
+    const vw = v.offsetWidth, vh = v.offsetHeight, vl = v.offsetLeft, vt = v.offsetTop;
+    const f = Math.min(vw / W, vh / H), w = W * f, h = H * f, fl = vl + (vw - w) / 2, ft = vt + (vh - h) / 2;
+    const g = reframeGeometry(info.width, info.height, W, H, rf), c = Math.min(vw / info.width, vh / info.height);
+    const tx = fl + f * ((W - g.ow) / 2 - g.x0 * g.k) - (vl + vw / 2) + info.width / 2 * f * g.k;
+    const ty = ft + f * ((H - g.oh) / 2 - g.y0 * g.k) - (vt + vh / 2) + info.height / 2 * f * g.k;
+    v.style.transform = `translate(${tx}px, ${ty}px) scale(${f * g.k / c})`;
+    const [top, bottom, left, right] = $$('i', masks), box = (el, x, y, ww, hh) => Object.assign(el.style, {left: x + 'px', top: y + 'px', width: Math.max(0, ww) + 'px', height: Math.max(0, hh) + 'px'});
+    const mh = this.root.querySelector('.edit-monitor').offsetHeight, mw = this.root.querySelector('.edit-monitor').offsetWidth;
+    box(top, 0, 0, mw, ft); box(bottom, 0, ft + h, mw, mh - ft - h); box(left, 0, ft, fl, h); box(right, fl + w, ft, mw - fl - w, h);
+    masks.hidden = false;
   }
   titlePreview() {
     const layer = $('.edit-title-preview', this.root); if (!layer) return;
@@ -1040,6 +1083,7 @@ class TakeTimelineEditor {
         else { this.edit.audio = this.edit.audio.filter(x => x !== lane); this.edit.audio.forEach((x, i) => { x.lane = i; }); }
       });
     }
+    if (action === 'reframe-reset' && c) return this.changeEdit(() => { c.reframe = {...DEFAULT_REFRAME}; });
     if (action === 'overlay-remove' && this.overlaySel) return this.removeOverlay(this.overlaySel);
     if (action === 'duplicate' && c) return this.duplicate();
     if ((action === 'earlier' || action === 'later') && c) return this.moveClip(action === 'earlier' ? -1 : 1);
@@ -1070,6 +1114,7 @@ class TakeTimelineEditor {
   }
   async change(event) {
     const t = event.target, c = this.clip, m = this.edit.music;
+    if (t.matches('[data-rf-field]') && c) return this.reframeChange(t, c);
     if (t.matches('[data-ov-field]')) return this.overlayChange(t);
     if (t.matches('[data-lane-field]')) return this.laneChange(t);
     if (t.matches('[data-edit-lane]')) return this.uploadLane(t);

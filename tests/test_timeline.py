@@ -1142,3 +1142,110 @@ def test_overlay_starts_on_exactly_its_frame_for_any_start(film, start):
     video, _ = _render_edit(sid, eid, edit)
     shown = [bool(_pixel(video, f, 24, 48)[2] > 150) for f in range(30)]
     assert shown == [start <= f < start + 6 for f in range(30)], (start, shown)
+
+
+# ── reframe ──────────────────────────────────────────────────────────────
+
+def _split_source(film, width, height, vertical=False, count=30):
+    """Replace the first take: left/right (or top/bottom) halves red/blue."""
+    client, sid, eid, shots, music = film
+    source = store.abs_media(shots[0]['takes']['items'][0]['file'])
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    if vertical:
+        frame[:height // 2, :, 0] = 255; frame[height // 2:, :, 2] = 255
+    else:
+        frame[:, :width // 2, 0] = 255; frame[:, width // 2:, 2] = 255
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{width}x{height}', '-r', '30',
+                    '-i', 'pipe:0', '-c:v', 'libx264', '-crf', '0', source], input=np.tile(frame, (count, 1, 1)).tobytes(), check=True)
+
+
+def _render_reframe(film, reframe, window=None):
+    client, sid, eid, shots, music = film
+    edit = timeline.default_edit(store.get_episode(sid, eid), settings.load())
+    clip = edit['clips'][0]; clip.update(frames=10, muted=True, reframe=reframe)
+    edit['clips'] = [clip]; edit['music'] = None
+    return _render_edit(sid, eid, edit, window=window)[0]
+
+
+def test_reframe_defaults_and_validation(film):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    edit = client.get(url).json()['edit']
+    assert [c['reframe'] for c in edit['clips']] == [{'fit': 'contain', 'zoom': 1, 'x': .5, 'y': .5}] * 2
+    assert client.put(url, json=edit).status_code == 200
+    old = copy.deepcopy(store.get_episode(sid, eid)['timeline'])
+    for c in old['clips']:
+        del c['reframe']
+    store.update_episode(sid, eid, lambda e: e.update(timeline=old))
+    base = client.get(url).json()['edit']
+    assert base['clips'][0]['reframe']['fit'] == 'contain'
+
+    def put(reframe):
+        edit = copy.deepcopy(base); edit['clips'][0]['reframe'] = reframe
+        return client.put(url, json=edit).status_code
+    for bad in ['cover', {'fit': 'stretch'}, {'zoom': 0.5}, {'zoom': 5}, {'x': -.1}, {'y': 1.1}, {'zoom': 'big'}, {'x': True}]:
+        assert put(bad) == 400, bad
+    assert 'revision' in client.get(url).json()['edit']
+    base = client.get(url).json()['edit']
+    assert put({'fit': 'cover', 'zoom': 2.5, 'x': .2, 'y': .9}) == 200
+    saved = client.get(url).json()['edit']['clips'][0]['reframe']
+    assert saved == {'fit': 'cover', 'zoom': 2.5, 'x': .2, 'y': .9}
+
+
+def test_reframe_geometry():
+    g = timeline.reframe_geometry(192, 108, 64, 96, {'fit': 'cover', 'zoom': 1, 'x': .5, 'y': .5})
+    assert abs(g['k'] - 96 / 108) < 1e-9 and abs(g['vx'] - 72) < 1e-9 and g['vy'] == 108 and abs(g['x0'] - 60) < 1e-9 and abs(g['ow'] - 64) < 1e-9
+    edge = timeline.reframe_geometry(192, 108, 64, 96, {'fit': 'cover', 'zoom': 1, 'x': 0, 'y': .5})
+    assert edge['x0'] == 0, 'the crop window never leaves the picture'
+    far = timeline.reframe_geometry(192, 108, 64, 96, {'fit': 'cover', 'zoom': 1, 'x': 1, 'y': .5})
+    assert abs(far['x0'] - 120) < 1e-9
+    contain = timeline.reframe_geometry(192, 108, 64, 96, {'fit': 'contain', 'zoom': 1, 'x': .5, 'y': .5})
+    assert contain['vx'] == 192 and contain['vy'] == 108 and abs(contain['ow'] - 64) < 1e-9 and abs(contain['oh'] - 36) < 1e-9
+    assert timeline.reframe_filter(192, 108, 64, 96, timeline.DEFAULT_REFRAME).startswith('scale=64:96:force_original_aspect_ratio=decrease'), 'the default is the old filter'
+
+
+def test_default_reframe_still_letterboxes_a_wide_picture(film):
+    _split_source(film, 192, 108)
+    video = _render_reframe(film, dict(timeline.DEFAULT_REFRAME))
+    assert len(video) == 10
+    assert video[0, 5, 32].max() < 40 and video[0, 90, 32].max() < 40, 'black bars above and below'
+    assert video[0, 48, 10, 0] > 200 and video[0, 48, 55, 2] > 200, 'the whole picture is visible: red left, blue right'
+
+
+@pytest.mark.parametrize('x,left,right', [(.25, 'red', 'red'), (.75, 'blue', 'blue'), (.5, 'red', 'blue')])
+def test_cover_fills_the_frame_and_the_focus_picks_what_stays(film, x, left, right):
+    _split_source(film, 192, 108)
+    video = _render_reframe(film, {'fit': 'cover', 'zoom': 1, 'x': x, 'y': .5})
+    colour = lambda px: 'red' if px[0] > 200 and px[2] < 60 else 'blue' if px[2] > 200 and px[0] < 60 else 'other'
+    assert colour(video[0, 5, 8]) == left and colour(video[0, 90, 8]) == left, 'no bars: the picture reaches the top and bottom'
+    assert colour(video[0, 5, 56]) == right and colour(video[0, 90, 56]) == right
+    if left != right:
+        edge = int(np.argmax(video[0, 48, :, 2] > 128))
+        assert abs(edge - 32) <= 2, f'the red/blue edge is at the middle of the frame, not {edge}'
+
+
+def test_zoom_enlarges_the_picture_around_the_focus(film):
+    _split_source(film, 192, 108)
+    wide = _render_reframe(film, {'fit': 'contain', 'zoom': 1, 'x': .5, 'y': .5})
+    near = _render_reframe(film, {'fit': 'contain', 'zoom': 2, 'x': .5, 'y': .5})
+    bars = lambda v: int(np.argmax(v[0, :, 32].max(axis=1) > 60))   # first picture row
+    assert bars(near) < bars(wide) - 8, 'zoomed picture is taller, so the black bars shrink'
+    zoomed_left = _render_reframe(film, {'fit': 'contain', 'zoom': 2, 'x': .1, 'y': .5})
+    assert zoomed_left[0, 48, 56, 0] > 200 and zoomed_left[0, 48, 56, 2] < 60, 'focusing on the left shows only red'
+
+
+def test_vertical_focus_on_a_tall_picture(film):
+    _split_source(film, 96, 192, vertical=True)
+    top = _render_reframe(film, {'fit': 'cover', 'zoom': 1, 'x': .5, 'y': .25})
+    bottom = _render_reframe(film, {'fit': 'cover', 'zoom': 1, 'x': .5, 'y': .75})
+    assert top[0, 50, 32, 0] > 200 and bottom[0, 50, 32, 2] > 200
+
+
+def test_range_previews_and_speed_keep_the_reframe(film):
+    _split_source(film, 192, 108, count=60)
+    client, sid, eid, shots, music = film
+    edit = timeline.default_edit(store.get_episode(sid, eid), settings.load())
+    clip = edit['clips'][0]; clip.update(frames=20, muted=True, speed=2, reframe={'fit': 'cover', 'zoom': 1, 'x': .75, 'y': .5})
+    edit['clips'] = [clip]; edit['music'] = None
+    video, _ = _render_edit(sid, eid, copy.deepcopy(edit), window=(5, 15))
+    assert len(video) == 10 and video[0, 5, 8, 2] > 200 and video[0, 90, 8, 2] > 200, 'blue everywhere: cover at the right focus'

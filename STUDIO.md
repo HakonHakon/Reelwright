@@ -160,6 +160,16 @@ source in, start, length, centre x/y and width (as a percentage of the frame), o
 transparency), and whether its own sound is mixed in (muted by default). **Delete** removes the selected overlay.
 Overlapping overlays stack on extra rows; up to 8. The monitor draws them live with the same maths as the export.
 
+### Reframe
+
+In the clip inspector, **Reframe** controls how a take sits in the project frame. **Fit** is *Whole picture* (the
+default: the picture is shown complete, with bars if its shape differs) or *Fill the frame* (crops a 16:9 take to
+9:16 or the other way round). **Zoom** (1 to 4×) enlarges further, and the **Focus** sliders choose which part of the
+picture stays in view when it is cropped. **Reset reframe** returns to the default. The monitor shows the framed
+picture with everything outside the frame hidden, using the same maths as the export. The crop is cut from the
+original take (not from an already shrunk picture), and lip-sync works on the reframed picture, so a close crop
+also gives the face more pixels. Changing the reframe of a lip-synced clip renders it again.
+
 ### Titles
 
 **Title** adds on-screen text at the playhead (3 seconds by default) and opens its editor; **Titles (n)**

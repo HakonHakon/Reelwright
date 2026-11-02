@@ -96,7 +96,7 @@ def default_edit(episode, cfg, selected_takes=False):
         for i, c in enumerate(selected_version['timeline']):
             clips.append({'id': f'clip_{i}', 'shot_id': c['shot_id'], 'source': selected_version['file'],
                           'source_in': c['start'], 'frames': round(c['duration'] * fps),
-                          'muted': True, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1, 'transition': 0})
+                          'muted': True, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1, 'transition': 0, 'reframe': dict(DEFAULT_REFRAME)})
     else:
         for sh in sorted(episode['shots'], key=lambda x: x['order']):
             items = sh['takes'].get('items', [])
@@ -113,7 +113,7 @@ def default_edit(episode, cfg, selected_takes=False):
             duration -= tin + float(sh['takes'].get('trim_out') or 0)
             clips.append({'id': 'clip_' + sh['id'], 'shot_id': sh['id'], 'source': take['file'],
                           'source_in': tin, 'frames': max(1, round(duration * fps)),
-                          'muted': False, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1, 'transition': 0})
+                          'muted': False, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1, 'transition': 0, 'reframe': dict(DEFAULT_REFRAME)})
     music = None
     m = episode.get('music') or {}
     if m.get('file'):
@@ -133,6 +133,7 @@ def view(episode, cfg):
     edit = retime(edit, settings.for_episode(cfg, episode)['video']['fps'])
     for clip in edit['clips']:  # timelines saved before fades existed
         clip.setdefault('fade_in', 0); clip.setdefault('fade_out', 0); clip.setdefault('speed', 1); clip.setdefault('transition', 0)
+        clip.setdefault('reframe', dict(DEFAULT_REFRAME))
     edit.setdefault('markers', [])  # timelines saved before markers and ranges existed
     edit.setdefault('range', None)
     edit.setdefault('titles', [])
@@ -192,6 +193,45 @@ def retime(edit, fps):
 
 
 MIN_SPEED, MAX_SPEED = 0.25, 4
+MAX_ZOOM = 4
+DEFAULT_REFRAME = {'fit': 'contain', 'zoom': 1, 'x': .5, 'y': .5}
+
+
+def parse_reframe(value):
+    """How a clip's picture sits in the project frame: `fit` 'contain' (whole picture, bars) or 'cover' (fills the
+    frame, cropping), a further `zoom` of 1..4, and the picture point (x, y in 0..1) kept in view when it is cropped."""
+    if value is None:
+        return dict(DEFAULT_REFRAME)
+    if not isinstance(value, dict) or value.get('fit', 'contain') not in ('contain', 'cover'):
+        raise ValueError('Reframe needs a fit of contain or cover')
+    return {'fit': value.get('fit', 'contain'), 'zoom': number(value.get('zoom', 1), 'Zoom', 1, MAX_ZOOM),
+            'x': number(value.get('x', .5), 'Reframe x', 0, 1), 'y': number(value.get('y', .5), 'Reframe y', 0, 1)}
+
+
+def reframe_geometry(sw, sh, width, height, reframe):
+    """Where the source picture lands in a width x height frame (all in source pixels unless noted).
+
+    Returns the crop window (x0, y0, vx, vy), the scale k (frame px per source px) and the size the cropped part
+    is drawn at (ow, oh), which is smaller than the frame on an axis that is not cropped (then it is centred).
+    The editor monitor has the same maths (reframeGeometry in timeline.js)."""
+    fit_k = max(width / sw, height / sh) if reframe['fit'] == 'cover' else min(width / sw, height / sh)
+    k = fit_k * reframe['zoom']
+    vx, vy = min(sw, width / k), min(sh, height / k)
+    x0 = min(max(reframe['x'] * sw - vx / 2, 0), sw - vx)
+    y0 = min(max(reframe['y'] * sh - vy / 2, 0), sh - vy)
+    return {'k': k, 'x0': x0, 'y0': y0, 'vx': vx, 'vy': vy, 'ow': vx * k, 'oh': vy * k}
+
+
+def reframe_filter(sw, sh, width, height, reframe):
+    """The ffmpeg filters that put the source picture into the frame (replaces plain scale + pad)."""
+    if reframe == DEFAULT_REFRAME:
+        return (f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+                f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2')
+    g = reframe_geometry(sw, sh, width, height, reframe)
+    even = lambda v: max(2, round(v / 2) * 2)
+    ow, oh = min(width, even(g['ow'])), min(height, even(g['oh']))
+    return (f"crop={max(2, round(g['vx']))}:{max(2, round(g['vy']))}:{round(g['x0'])}:{round(g['y0'])},"
+            f'scale={ow}:{oh},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2')
 
 
 def clip_starts(clips):
@@ -405,7 +445,7 @@ def validate(episode, body, cfg):
                       'frames': frames, 'muted': flag(c.get('muted', False), 'Clip mute'),
                       'volume': number(c.get('volume', 1), 'Clip volume', 0, 2), 'lipsync': sync,
                       'fade_in': fade_in, 'fade_out': fade_out, 'speed': speed,
-                      'transition': number(c.get('transition', 0), 'Crossfade')})
+                      'transition': number(c.get('transition', 0), 'Crossfade'), 'reframe': parse_reframe(c.get('reframe'))})
     for i, c in enumerate(clips):
         t = c['transition']
         if type(t) is not int:
@@ -582,8 +622,7 @@ def render(job, sid, eid, edit, video, window=None):
         # start_time=0 keeps the first frame when a trim lands between the source's own frames
         # (e.g. a 24 fps take on a 30 fps timeline); otherwise the clip comes out one frame short.
         command += ['-map', '0:v:0', '-map', '0:a:0' if info['has_audio'] else '1:a:0',
-                    '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
-                    f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2' + (f',setpts=PTS/{speed:.8f}' if speed != 1 else '') + f',fps={fps}:start_time=0,tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                    '-vf', reframe_filter(info['width'], info['height'], width, height, c.get('reframe') or DEFAULT_REFRAME) + (f',setpts=PTS/{speed:.8f}' if speed != 1 else '') + f',fps={fps}:start_time=0,tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
                     '-af', (atempo(speed) + ',' if speed != 1 else '') + f'aresample=48000,apad,atrim=end_sample={round(duration*48000)}',
                     '-frames:v', str(c['frames']), '-t', str(duration), '-c:v', 'libx264', '-crf', '16',
                     '-c:a', 'aac', '-b:a', '256k', str(base)]
@@ -595,7 +634,7 @@ def render(job, sid, eid, edit, video, window=None):
                       '-t', str(duration), '-ar', '16000', '-ac', '1', str(voice)])
             fingerprint = [source, Path(source).stat().st_mtime_ns, Path(source).stat().st_size,
                            c['source_in'], c['frames'], video, hashlib.sha256(voice.read_bytes()).hexdigest(),
-                           'LatentSync1.6-{steps}-{guidance}-{seed}'.format(**settings.lipsync_params(cfg))]
+                           'LatentSync1.6-{steps}-{guidance}-{seed}'.format(**settings.lipsync_params(cfg)), c.get('reframe')]
             key = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
             picture = cache / (key + '.mp4')
             if not picture.is_file():

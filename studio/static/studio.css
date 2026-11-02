@@ -46,7 +46,7 @@ svg.i { width: 17px; height: 17px; flex: none; stroke: currentColor; fill: none;
 .edit-heading { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--rule); }
 .edit-heading h2 { margin: 0; }
 .edit-stage { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-width: 0; }
-.edit-monitor { min-width: 0; position: relative; background: #090c10; color: #e7e9ee; display: flex; flex-direction: column; justify-content: center; }
+.edit-monitor { min-width: 0; position: relative; overflow: hidden; background: #090c10; color: #e7e9ee; display: flex; flex-direction: column; justify-content: center; }
 .edit-monitor video { width: 100%; height: min(44vh, 440px); object-fit: contain; background: #090c10; }
 .edit-monitor [data-edit-empty] { position: absolute; inset: 30% 12px auto; text-align: center; color: #9faab9; pointer-events: none; }
 .edit-transport { display: flex; gap: 12px; align-items: center; padding: 10px 16px 0; }
@@ -790,3 +790,9 @@ input[aria-invalid="true"] { border-color: var(--bad); outline: 2px solid color-
 .edit-overlay-clip .edit-fade.out { right: 0; clip-path: polygon(0 0, 100% 0, 100% 100%); }
 .edit-overlay-preview { position: absolute; pointer-events: none; overflow: hidden; z-index: 1; }
 .edit-overlay-preview video { position: absolute; height: auto !important; max-height: none; transform: translate(-50%, -50%); object-fit: contain; background: transparent; }
+
+.edit-reframe-masks[hidden] { display: none; }
+.edit-reframe-masks i { position: absolute; background: #090c10; z-index: 1; pointer-events: none; }
+.edit-monitor video[data-edit-video] { transform-origin: 50% 50%; }
+.edit-reframe { margin: 8px 0; }
+.edit-reframe summary { cursor: pointer; font: 600 12px var(--f-code); }

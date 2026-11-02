@@ -31,6 +31,7 @@ def assets(episode):
     files.update(v['file'] for v in outputs.get('timeline_versions', []))
     files.update(outputs[k] for k in ('final', 'before_lipsync') if outputs.get(k))
     files.update(c['source'] for c in episode.get('timeline', {}).get('clips', []))
+    files.update(o['source'] for o in episode.get('timeline', {}).get('overlays') or [])
     return files
 
 
@@ -124,7 +125,7 @@ def default_edit(episode, cfg, selected_takes=False):
         except (ValueError, media.MediaError):
             pass
     return {'schema_version': 1, 'revision': episode.get('timeline', {}).get('revision', 0),
-            'fps': fps, 'clips': clips, 'music': music, 'markers': [], 'range': None, 'titles': [], 'audio': []}
+            'fps': fps, 'clips': clips, 'music': music, 'markers': [], 'range': None, 'titles': [], 'audio': [], 'overlays': []}
 
 
 def view(episode, cfg):
@@ -136,8 +137,9 @@ def view(episode, cfg):
     edit.setdefault('range', None)
     edit.setdefault('titles', [])
     edit.setdefault('audio', [])  # timelines saved before audio lanes existed
+    edit.setdefault('overlays', [])  # ... and before the overlay lane
     sources = {}
-    for c in edit['clips']:
+    for c in edit['clips'] + edit['overlays']:
         if c['source'] in sources:
             continue
         try:
@@ -165,6 +167,12 @@ def retime(edit, fps):
         if edit.get('music'):
             edit['music']['start_frame'] = round(number(edit['music']['start_frame'], 'Music position') * fps / old)
             edit['music']['frames'] = max(1, round(number(edit['music']['frames'], 'Music length', 1) * fps / old))
+        for o in edit.get('overlays') or []:
+            o['start_frame'] = round(number(o['start_frame'], 'Overlay position') * fps / old)
+            o['frames'] = max(1, round(number(o['frames'], 'Overlay length', 1) * fps / old))
+            fade_in = min(o['frames'], round(number(o.get('fade_in', 0), 'Overlay fade in') * fps / old))
+            o['fade_in'] = fade_in
+            o['fade_out'] = min(o['frames'] - fade_in, round(number(o.get('fade_out', 0), 'Overlay fade out') * fps / old))
         for track in edit.get('audio') or []:
             track['start_frame'] = round(number(track['start_frame'], 'Audio position') * fps / old)
             track['frames'] = max(1, round(number(track['frames'], 'Audio length', 1) * fps / old))
@@ -276,6 +284,49 @@ def parse_titles(value):
 
 
 MAX_AUDIO = 8
+MAX_OVERLAYS = 8
+
+
+def parse_overlays(episode, value, fps, cfg, taken):
+    """Picture-in-picture / B-roll clips drawn over the main track. They sit at a free start frame (nothing ripples)
+    and never change the timeline length: whatever sticks out past the end is cut off."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_OVERLAYS:
+        raise ValueError(f'Use at most {MAX_OVERLAYS} overlay clips')
+    out, probes = [], {}
+    for o in value:
+        if not isinstance(o, dict) or not isinstance(o.get('id'), str) or not o['id'] or o['id'] in taken:
+            raise ValueError('Each overlay clip needs a unique id')
+        taken.add(o['id'])
+        file = o.get('source')
+        if file not in probes:
+            probes[file] = source_info(episode, file, cfg)
+        start = round(number(o.get('source_in', 0), 'Overlay source start') * fps)
+        position, frames = number(o.get('start_frame', 0), 'Overlay position', 0, MAX_FRAME), number(o.get('frames'), 'Overlay length', 1, MAX_FRAME)
+        if type(position) is not int or type(frames) is not int or start + frames > round(probes[file]['video_duration'] * fps):
+            raise ValueError('Overlay trim extends beyond its source video')
+        fade_in, fade_out = number(o.get('fade_in', 0), 'Overlay fade in'), number(o.get('fade_out', 0), 'Overlay fade out')
+        if type(fade_in) is not int or type(fade_out) is not int or fade_in + fade_out > frames:
+            raise ValueError('Overlay fades must be whole frames and fit inside the clip')
+        out.append({'id': o['id'], 'source': file, 'source_in': start / fps, 'start_frame': position, 'frames': frames,
+                    'x': number(o.get('x', .75), 'Overlay x', 0, 1), 'y': number(o.get('y', .25), 'Overlay y', 0, 1),
+                    'scale': number(o.get('scale', .4), 'Overlay size', .05, 1), 'opacity': number(o.get('opacity', 1), 'Overlay opacity', 0, 1),
+                    'volume': number(o.get('volume', 1), 'Overlay volume', 0, 2), 'muted': flag(o.get('muted', True), 'Overlay mute'),
+                    'fade_in': fade_in, 'fade_out': fade_out})
+    return out
+
+
+def slice_overlays(overlays, first, last, fps):
+    """Overlay clips as they appear inside a range preview, moved so the range starts at frame 0."""
+    out = []
+    for o in overlays:
+        start, end = o['start_frame'], o['start_frame'] + o['frames']
+        lo, hi = max(start, first), min(end, last)
+        if lo < hi:
+            out.append({**o, 'source_in': o['source_in'] + (lo - start) / fps, 'start_frame': lo - first, 'frames': hi - lo,
+                        'fade_in': o.get('fade_in', 0) if lo == start else 0, 'fade_out': o.get('fade_out', 0) if hi == end else 0})
+    return out
 
 
 def parse_audio(episode, value, fps, cfg):
@@ -384,7 +435,8 @@ def validate(episode, body, cfg):
     return {'schema_version': 1, 'revision': episode.get('timeline', {}).get('revision', 0),
             'fps': fps, 'clips': clips, 'music': music,
             'markers': parse_markers(body.get('markers')), 'range': parse_range(body.get('range')),
-            'titles': parse_titles(body.get('titles')), 'audio': parse_audio(episode, body.get('audio'), fps, cfg)}
+            'titles': parse_titles(body.get('titles')), 'audio': parse_audio(episode, body.get('audio'), fps, cfg),
+            'overlays': parse_overlays(episode, body.get('overlays'), fps, cfg, set(seen))}
 
 
 def save(sid, eid, body, cfg):
@@ -499,6 +551,20 @@ def render(job, sid, eid, edit, video, window=None):
             client.download(result['audios'][0], str(guide))
     music = prepare_music(job, cfg, edit.get('music'), full, fps, out)
     lanes = [prepare_music(job, cfg, t, full, fps, out, name=f'lane{k}') for k, t in enumerate(edit.get('audio') or []) if not t['muted']]
+    all_overlays = edit.get('overlays') or []
+    for k, o in enumerate(all_overlays):  # the sound of an overlay joins the audio lanes (prepared on the whole timeline, then seeked)
+        if not o['muted'] and media.probe(cfg['ffprobe'], store.abs_media(o['source']))['has_audio']:
+            lanes.append(prepare_music(job, cfg, {**o, 'file': o['source'], 'loop': False}, full, fps, out, name=f'ovsound{k}'))
+    overlays = slice_overlays(all_overlays, first, last, fps) if window else all_overlays
+    overlay_files = []
+    for k, o in enumerate(overlays):  # each overlay clip becomes an exact-length file of the size it will be drawn at
+        job.check()
+        target = out / f'ov{k}.mp4'
+        wide = max(2, round(o['scale'] * width / 2) * 2)
+        run(job, [cfg['ffmpeg'], '-y', '-v', 'error', '-ss', str(o['source_in']), '-i', store.abs_media(o['source']), '-an',
+                  '-vf', f'scale={wide}:-2,fps={fps}:start_time=0,tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                  '-frames:v', str(o['frames']), '-c:v', 'libx264', '-crf', '16', str(target)])
+        overlay_files.append(target)
     cache = Path(store.ep_dir(sid, eid)) / 'out' / 'timeline_cache'
     cache.mkdir(exist_ok=True)
     clips, events = [], []
@@ -561,6 +627,8 @@ def render(job, sid, eid, edit, video, window=None):
         command += (['-ss', f'{first / fps:.6f}', '-t', f'{total / fps:.6f}'] if window else []) + ['-i', str(music)]
     for lane in lanes:
         command += (['-ss', f'{first / fps:.6f}', '-t', f'{total / fps:.6f}'] if window else []) + ['-i', str(lane)]
+    for target in overlay_files:
+        command += ['-i', str(target)]
     for png, _, _ in shown:
         command += ['-i', str(png)]
     graph, inputs = [], ''
@@ -573,7 +641,7 @@ def render(job, sid, eid, edit, video, window=None):
         graph += [f'[{i}:v]trim=end_frame={c["frames"]},setpts=N/({fps}*TB){fade_v}{same_base}[v{i}]',
                   f'[{i}:a]aresample=48000,atrim=end_sample={round(c["frames"]/fps*48000)},asetpts=N/SR/TB{fade_a}[a{i}]']
         inputs += f'[v{i}][a{i}]'
-    first_input = len(clips) + (1 if music else 0) + len(lanes)
+    first_input = len(clips) + (1 if music else 0) + len(lanes) + len(overlay_files)
     if not crossfades:
         graph += [f'{inputs}concat=n={len(clips)}:v=1:a=1[v][a]']
     else:  # chain the clips; a crossfade overlaps the incoming clip with the running result
@@ -587,7 +655,18 @@ def render(job, sid, eid, edit, video, window=None):
             else:
                 graph += [f'[{video}][{sound}][v{k}][a{k}]concat=n=2:v=1:a=1[{out_v}][{out_a}]']
             video, sound, length = out_v, out_a, length + clips_in[k]['frames'] - t
-    graph += [f'[v]setpts=N/({fps}*TB)[pic0]']
+    # overlay and picture are paired by time stamp: give both an exact frame-number clock (time base 1/fps) so a start
+    # time that is rounded to microseconds can never put an overlay frame on the wrong side of the main frame it belongs to
+    frame_clock = f',settb=expr=1/{fps}' if overlays else ''
+    graph += [f'[v]setpts=N/({fps}*TB){frame_clock}[main0]']
+    ov_base = len(clips) + (1 if music else 0) + len(lanes)
+    for k, o in enumerate(overlays):
+        fi, fo = o.get('fade_in', 0), o.get('fade_out', 0)
+        shape = (f',fade=t=in:s=0:n={fi}:alpha=1' if fi else '') + (f',fade=t=out:s={o["frames"] - fo}:n={fo}:alpha=1' if fo else '')
+        shape += f',colorchannelmixer=aa={o["opacity"]}' if o['opacity'] != 1 else ''
+        graph += [f'[{ov_base + k}:v]format=yuva420p{shape},setpts=PTS-STARTPTS+{o["start_frame"]}/({fps}*TB),settb=expr=1/{fps}[ov{k}]',
+                  f"[main{k}][ov{k}]overlay=x='main_w*{o['x']}-overlay_w/2':y='main_h*{o['y']}-overlay_h/2':eof_action=repeat:enable='between(n,{o['start_frame']},{o['start_frame'] + o['frames'] - 1})'[main{k + 1}]"]
+    graph += [f'[main{len(overlays)}]null[pic0]']
     for j, (_, a, b) in enumerate(shown):
         graph.append(f"[pic{j}][{first_input + j}:v]overlay=0:0:enable='between(n,{a},{b - 1})'[pic{j + 1}]")
     graph.append(f'[pic{len(shown)}]null[picture]')

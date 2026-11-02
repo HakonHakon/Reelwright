@@ -546,6 +546,7 @@ async function tabTakes(el, ctx) {
     const t = ev.target, ds = t.dataset;
     if (ds.timelineAdd != null && ds.shot) return editor.addTake(ds.shot, +ds.timelineAdd);
     if (ds.timelineReplace != null && ds.shot) return editor.addTake(ds.shot, +ds.timelineReplace, true);
+    if (ds.timelineOverlay != null && ds.shot) return editor.addOverlay(ds.shot, +ds.timelineOverlay);
     if (editor.dirty && ds.shot) await editor.flush();
     if (ds.zoom) zoom(ds.zoom);
     if (ds.gate) setGate(ctx, ds.gate, ds.val === "1");
@@ -581,6 +582,7 @@ function takeCard(ctx, sh) {
       <div class="acts">${sh.takes.selected === k ? "" : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
         <button data-timeline-add="${k}" data-shot="${sh.id}">Add to timeline</button>
         <button data-timeline-replace="${k}" data-shot="${sh.id}">Replace selected clip</button>
+        <button data-timeline-overlay="${k}" data-shot="${sh.id}" title="Picture-in-picture / B-roll on top of the main track">Add as overlay</button>
         <button data-face="${k}" data-shot="${sh.id}">Correct faces</button>
         <button class="danger" data-rm="${k}" data-shot="${sh.id}">✕</button></div></div>`).join("") || `<p class="muted" style="padding:20px">No takes yet.</p>`}</div></div>
     ${items.length ? `<div class="row small" style="margin-top:8px">Trim selected take: in <input id="ti-${sh.id}" type="number" step="0.05" min="0" value="${sh.takes.trim_in || 0}" style="width:70px">s

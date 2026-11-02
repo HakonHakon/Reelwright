@@ -912,6 +912,70 @@ def test_cut_to_beat_aligns_the_middle_of_a_crossfade_and_keeps_the_total(edit_s
         browser.close()
 
 
+def test_overlay_lane_add_select_drag_inspector_preview_delete_and_persistence(edit_server):
+    base, sid, eid, shots, music, submitted = edit_server
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(viewport={'width': 1440, 'height': 1100}, service_workers='block').new_page()
+        errors, ed = _open_editor(page, base, sid, eid)
+        overlays = lambda: page.evaluate('App.timelineEditor.edit.overlays.map(o => ({s: o.start_frame, n: o.frames, x: o.x, y: o.y, scale: o.scale, opacity: o.opacity, muted: o.muted, fi: o.fade_in, fo: o.fade_out}))')
+        page.locator('[data-edit-zoom]').fill('100'); page.evaluate('App.timelineEditor.snap = false')
+        assert page.locator('.edit-overlay-clip').count() == 0 and page.locator('.lbl-overlay').count() == 0
+
+        # "Add as overlay" on a take card puts a clip on a new OVERLAY lane at the playhead, selected.
+        page.locator('[data-edit-scrub]').fill('6')
+        page.locator('.take-library-panel > summary').click()
+        page.locator('[data-timeline-overlay]').last.click()
+        page.locator('.edit-overlay-clip').first.wait_for()
+        assert overlays() == [{'s': 6, 'n': 30, 'x': .75, 'y': .25, 'scale': .4, 'opacity': 1, 'muted': True, 'fi': 0, 'fo': 0}]
+        assert page.locator('.lbl-overlay').count() == 1
+        assert abs(page.locator('.lbl-overlay').bounding_box()['height'] - page.locator('.edit-overlay-track').bounding_box()['height']) < 2
+        assert 'Overlay clip' in page.locator('[data-edit-inspector]').inner_text()
+        assert page.evaluate('App.timelineEditor.total') == 60, 'overlays never change the timeline length'
+
+        # Dragging moves it in time (100 px = 1 s = 30 frames) as one undo step.
+        page.locator('.edit-overlay-clip').first.scroll_into_view_if_needed()
+        box = page.locator('.edit-overlay-clip').first.bounding_box()
+        page.mouse.move(box['x'] + 20, box['y'] + 10); page.mouse.down(); page.mouse.move(box['x'] + 70, box['y'] + 10, steps=4); page.mouse.move(box['x'] + 120, box['y'] + 10, steps=4); page.mouse.up()
+        assert overlays()[0]['s'] == 36, overlays()
+        page.locator('.take-editor').focus(); page.keyboard.press('Control+z'); assert overlays()[0]['s'] == 6
+        page.keyboard.press('Control+Shift+z'); assert overlays()[0]['s'] == 36
+
+        # Inspector: place, size, opacity, fades (clamped), mute, trim.
+        def field(name): return page.locator(f'[data-ov-field="{name}"]')
+        for name, value in [('x', '30'), ('y', '80'), ('scale', '55')]:
+            field(name).fill(value); field(name).press('Tab')
+        assert (overlays()[0]['x'], overlays()[0]['y'], overlays()[0]['scale']) == (.3, .8, .55)
+        field('x').fill('250'); field('x').press('Tab'); assert overlays()[0]['x'] == 1, 'kept inside the frame'
+        field('opacity').fill('0.5')
+        field('fade_in').fill('0.5'); field('fade_in').press('Tab')
+        field('length').fill('0.4'); field('length').press('Tab')
+        assert overlays()[0]['n'] == 12 and overlays()[0]['fi'] == 12 and page.locator('.edit-overlay-clip .edit-fade.in').count() == 1, overlays()
+        field('length').fill('99'); field('length').press('Tab'); assert overlays()[0]['n'] == 12, 'longer than the source video is refused'
+        field('muted').uncheck(); assert overlays()[0]['muted'] is False
+
+        # The monitor shows it while the playhead is inside, in the right place, and not outside.
+        page.locator('[data-edit-scrub]').fill('40')
+        page.wait_for_function("document.querySelectorAll('.edit-overlay-preview video').length === 1")
+        style = page.locator('.edit-overlay-preview video').evaluate('v => [v.style.left, v.style.top, v.style.width]')
+        assert style == ['100%', '80%', '55%'], style
+        page.locator('[data-edit-scrub]').fill('2')
+        page.wait_for_function("document.querySelectorAll('.edit-overlay-preview video').length === 0")
+
+        # Autosave persists it; Delete removes the selected overlay and the lane label with it; undo brings it back.
+        page.locator('[data-edit="save"]').click()
+        page.wait_for_function('!App.timelineEditor.dirty && !App.timelineEditor.saving')
+        saved = store.get_episode(sid, eid)['timeline']['overlays']
+        assert len(saved) == 1 and saved[0]['start_frame'] == 36 and saved[0]['frames'] == 12 and saved[0]['scale'] == .55 and saved[0]['muted'] is False
+        page.locator('.edit-overlay-clip').first.click()
+        page.locator('.take-editor').focus(); page.keyboard.press('Delete')
+        assert overlays() == [] and page.locator('.lbl-overlay').count() == 0 and page.locator('.edit-overlay-clip').count() == 0
+        assert page.evaluate('App.timelineEditor.edit.clips.length') == 2, 'the main clips are untouched'
+        page.keyboard.press('Control+z'); assert len(overlays()) == 1 and page.locator('.lbl-overlay').count() == 1
+        assert not errors, errors
+        browser.close()
+
+
 def test_titles_dialog_lane_live_preview_delete_and_persistence(edit_server):
     base, sid, eid, shots, music, submitted = edit_server
     with playwright.sync_playwright() as p:

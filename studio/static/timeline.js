@@ -4,7 +4,7 @@
 // sum of the clip lengths. Mirror of timeline.clip_starts in the backend: never add up c.frames by hand.
 const clipStarts = clips => { const starts = []; let end = 0; clips.forEach((c, i) => { const begin = end - (i ? c.transition || 0 : 0); starts.push(begin); end = begin + c.frames; }); return {starts, total: end}; };
 const editClone = value => JSON.parse(JSON.stringify(value));
-const LANE_HEIGHT = 40, MAX_LANES = 8;
+const LANE_HEIGHT = 40, MAX_LANES = 8, OVERLAY_ROW = 34, MAX_OVERLAYS = 8;
 const MARKER_COLORS = ["red", "orange", "yellow", "green", "blue", "purple"];
 const markerId = () => `mk_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 const editId = () => `clip_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
@@ -22,7 +22,7 @@ class TakeTimelineEditor {
       <div class="edit-heading"><div><h2>Takes editor</h2><span class="edit-status muted small" data-edit-status data-state="saved" role="status" aria-live="polite">Timeline ready · source takes retained</span></div>
         <div class="row"><button data-edit="focus" title="Full-screen editor (Esc to exit)">Expand editor</button><button data-edit="inspector" title="Show or hide the clip and music settings">Inspector</button><button data-edit="undo" aria-label="Undo timeline edit" title="Undo (Ctrl+Z)">Undo</button><button data-edit="redo" aria-label="Redo timeline edit" title="Redo (Ctrl+Shift+Z)">Redo</button>
         <button data-edit="save" title="Edits also autosave">Save now</button><button data-edit="export" class="primary">Render timeline</button></div></div>
-      <div class="edit-stage"><div class="edit-monitor"><video data-edit-video playsinline preload="metadata"></video><div class="edit-title-preview" aria-hidden="true"></div><span data-edit-empty>Add a take from the library below</span>
+      <div class="edit-stage"><div class="edit-monitor"><video data-edit-video playsinline preload="metadata"></video><div class="edit-title-preview" aria-hidden="true"></div><div class="edit-overlay-preview" aria-hidden="true"></div><span data-edit-empty>Add a take from the library below</span>
         <div class="edit-transport"><button data-edit="play" aria-label="Play timeline" title="Play / pause (Space)">▶</button><button data-edit="start" aria-label="Go to timeline start" title="Go to start (Home)">↤</button>
         <button data-edit="prev-cut" aria-label="Previous cut" title="Previous cut (↑)">⏮</button><button data-edit="step-back" aria-label="Back one frame" title="Back one frame (←)">◂</button><button data-edit="step-fwd" aria-label="Forward one frame" title="Forward one frame (→)">▸</button><button data-edit="next-cut" aria-label="Next cut" title="Next cut (↓)">⏭</button>
         <output class="edit-tc" data-edit-tc aria-label="Timecode">00:00:00:00</output><output data-edit-time>00:00.000</output><span class="grow"></span></div>
@@ -43,8 +43,8 @@ class TakeTimelineEditor {
         <div class="tb-group" role="group" aria-label="Markers"><button data-edit="marker-add" title="Add a marker at the playhead, or remove the one under it (Shift+M)">⚑ Marker <span class="kbd">⇧M</span></button><button data-edit="markers" title="Name, colour, jump to and list markers">Markers (0)</button><button data-edit="title-add" title="Add on-screen text at the playhead">T Title</button><button data-edit="titles" title="Edit all titles">Titles (0)</button></div>
         <span class="grow"></span>
         <div class="tb-group" role="group" aria-label="Render range"><button data-edit="range-in" title="Start the range at the playhead (I)">In <span class="kbd">I</span></button><button data-edit="range-out" title="End the range at the playhead (O)">Out <span class="kbd">O</span></button><button data-edit="range-clear" title="Clear the range (Alt+X)" disabled>Clear</button><button data-edit="export-range" title="Render only this range as a quick preview. Lip-sync is skipped, and your current final film is not replaced." disabled>Render range</button><span class="range-info" data-edit-range-info></span></div></div>
-      <div class="edit-tracks"><div class="edit-labels"><div>TIME</div><div><span>VIDEO</span><button class="trk-btn" data-edit="track-video-mute" aria-pressed="false" aria-label="Mute all clip audio" title="Mute / unmute all clip audio">M</button></div><div><span>MUSIC</span><button class="trk-btn" data-edit="track-music-mute" aria-pressed="false" aria-label="Mute music" title="Mute / unmute music">M</button></div><div class="lbl-titles"><span>TITLES</span></div></div>
-        <div class="edit-scroll"><div class="edit-canvas"><div class="edit-ruler"></div><div class="edit-video-track"></div><div class="edit-music-track"></div><div class="edit-audio-track"></div><div class="edit-title-track"></div><div class="edit-beatgrid" aria-hidden="true"></div><div class="edit-rangeview" hidden><i class="dim a" aria-hidden="true"></i><i class="dim b" aria-hidden="true"></i><i class="bar" aria-hidden="true"></i><b class="handle in" data-range-handle="in" role="slider" aria-label="Range start" title="Drag the range start"></b><b class="handle out" data-range-handle="out" role="slider" aria-label="Range end" title="Drag the range end"></b></div><div class="edit-markers"></div>
+      <div class="edit-tracks"><div class="edit-labels"><div>TIME</div><div class="lbl-video"><span>VIDEO</span><button class="trk-btn" data-edit="track-video-mute" aria-pressed="false" aria-label="Mute all clip audio" title="Mute / unmute all clip audio">M</button></div><div class="lbl-music"><span>MUSIC</span><button class="trk-btn" data-edit="track-music-mute" aria-pressed="false" aria-label="Mute music" title="Mute / unmute music">M</button></div><div class="lbl-titles"><span>TITLES</span></div></div>
+        <div class="edit-scroll"><div class="edit-canvas"><div class="edit-ruler"></div><div class="edit-video-track"></div><div class="edit-overlay-track"></div><div class="edit-music-track"></div><div class="edit-audio-track"></div><div class="edit-title-track"></div><div class="edit-beatgrid" aria-hidden="true"></div><div class="edit-rangeview" hidden><i class="dim a" aria-hidden="true"></i><i class="dim b" aria-hidden="true"></i><i class="bar" aria-hidden="true"></i><b class="handle in" data-range-handle="in" role="slider" aria-label="Range start" title="Drag the range start"></b><b class="handle out" data-range-handle="out" role="slider" aria-label="Range end" title="Drag the range end"></b></div><div class="edit-markers"></div>
           <div class="edit-snap-line" hidden aria-hidden="true"></div><div class="edit-playhead" aria-hidden="true"></div></div></div></div>
       <div class="edit-footer row"><label class="btn file-pick">Add music / voice<input data-edit-audio type="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac" aria-label="Add timeline music"></label>
         <label class="btn file-pick" title="Voice-over or sound effects on their own lane (up to 8)">Add audio lane<input data-edit-lane type="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac" aria-label="Add audio lane"></label>
@@ -74,8 +74,8 @@ class TakeTimelineEditor {
       this.refocus();  // an edit can redraw the focused clip away; keep the shortcuts working
     };
     $('.edit-scroll', root).addEventListener('scroll', () => { if (this.thumbRaf) return; this.thumbRaf = requestAnimationFrame(() => { this.thumbRaf = 0; if (!this.destroyed && this.thumbsStale()) this.tracks(); }); }, {passive: true});
-    this.monitorObserver = new ResizeObserver(() => this.titlePreview()); this.monitorObserver.observe($('.edit-monitor', root));
-    this.laneEls = new Map(); this.laneWaves = {}; this.laneWavePending = new Set();
+    this.monitorObserver = new ResizeObserver(() => { this.titlePreview(); this.overlayPreview(); }); this.monitorObserver.observe($('.edit-monitor', root));
+    this.overlayEls = new Map(); this.overlaySel = null; this.laneEls = new Map(); this.laneWaves = {}; this.laneWavePending = new Set();
     this.draw(); this.seek(0); this.loadWaveform(); this.ensureBeats();
     const versions = this.ctx.e.outputs?.timeline_versions || [], previews = this.ctx.e.outputs?.timeline_previews || [];
     const span = v => v.window ? `${(v.window[0] / (v.video?.fps || this.fps)).toFixed(2)}–${(v.window[1] / (v.video?.fps || this.fps)).toFixed(2)} s` : '';
@@ -135,7 +135,7 @@ class TakeTimelineEditor {
     });
   }
   clampFades() {
-    this.clampTransitions();
+    this.clampTransitions(); (this.edit.overlays || []).forEach(o => this.clampOverlay(o));
     for (const c of this.edit.clips) {
       c.fade_in = Math.max(0, Math.min(c.frames, Math.round(c.fade_in || 0)));
       c.fade_out = Math.max(0, Math.min(c.frames - c.fade_in, Math.round(c.fade_out || 0)));
@@ -225,7 +225,7 @@ class TakeTimelineEditor {
     this.drawBeats(); this.drawMarks(); this.drawTitles();
     const waveform = music && this.waveform?.file === music.file ? this.waveSvg(music, this.waveform) : '';
     $('.edit-music-track', this.root).innerHTML = music ? `<button class="edit-music-clip ${music.muted ? 'muted' : ''}" data-music-move style="left:${music.start_frame / this.fps * this.zoom}px;width:${Math.max(8, music.frames / this.fps * this.zoom)}px" aria-label="Music timeline clip">${waveform}<span>${esc(music.file.split('/').pop())}${music.muted ? ' · muted' : ''}</span></button>` : '<span class="edit-track-empty">Add a song or voice recording</span>';
-    this.laneTracks();
+    this.laneTracks(); this.overlayTracks();
   }
   waveSvg(t, {peaks, duration}) {
     const points = [], remaining = Math.max(.001, duration - t.source_in);
@@ -235,6 +235,88 @@ class TakeTimelineEditor {
       points.push([x, (peaks[Math.floor((t.source_in + time) / duration * peaks.length)] || 0) * 18]);
     }
     return `<svg viewBox="0 0 400 40" preserveAspectRatio="none" aria-hidden="true"><polygon points="${points.map(([x, h]) => `${x},${20-h}`).join(' ')} ${points.reverse().map(([x, h]) => `${x},${20+h}`).join(' ')}"/></svg>`;
+  }
+  overlayRows() {  // overlapping overlay clips go on separate rows
+    const rows = [], ends = [];
+    for (const o of this.edit.overlays || []) {
+      let r = ends.findIndex(end => end <= o.start_frame); if (r < 0) { r = ends.length; ends.push(0); }
+      ends[r] = o.start_frame + o.frames; rows.push(r);
+    }
+    return {rows, count: ends.length};
+  }
+  overlayTracks() {
+    const list = this.edit.overlays || [], labels = $('.edit-labels', this.root), {rows, count} = this.overlayRows();
+    $$('.lbl-overlay', labels).forEach(el => el.remove());
+    const track = $('.edit-overlay-track', this.root);
+    track.style.height = count * OVERLAY_ROW + 'px'; track.hidden = !list.length;
+    if (list.length) $('.lbl-music', labels).insertAdjacentHTML('beforebegin', `<div class="lbl-overlay" style="height:${count * OVERLAY_ROW}px"><span>OVERLAY</span></div>`);
+    track.innerHTML = list.map((o, i) => {
+      const name = o.source.split('/').pop(), px = Math.max(8, o.frames / this.fps * this.zoom), fadeW = f => Math.min(o.frames, f) / this.fps * this.zoom;
+      return `<button type="button" class="edit-overlay-clip ${o.id === this.overlaySel ? 'selected' : ''} ${o.muted ? 'muted' : ''}" data-overlay-move="${esc(o.id)}" style="left:${o.start_frame / this.fps * this.zoom}px;width:${px}px;top:${rows[i] * OVERLAY_ROW + 3}px" title="${esc(name)} · ${this.seconds(o.frames)}s" aria-label="Overlay clip ${esc(name)}" aria-pressed="${o.id === this.overlaySel}"><span>${esc(name)}</span>${o.fade_in ? `<i class="edit-fade in" style="width:${fadeW(o.fade_in)}px" aria-hidden="true"></i>` : ''}${o.fade_out ? `<i class="edit-fade out" style="width:${fadeW(o.fade_out)}px" aria-hidden="true"></i>` : ''}</button>`;
+    }).join('');
+  }
+  get overlay() { return (this.edit.overlays || []).find(o => o.id === this.overlaySel) || null; }
+  async addOverlay(shotId, index) {
+    const sh = this.ctx.e.shots.find(sh => sh.id === shotId), take = sh?.takes.items[index]; if (!take) return;
+    if ((this.edit.overlays || []).length >= MAX_OVERLAYS) return toast(`At most ${MAX_OVERLAYS} overlay clips.`, true);
+    const info = await GET(this.api + '/source?file=' + encodeURIComponent(take.file)); this.sources[take.file] = info;
+    if (this.destroyed) return;
+    const overlay = {id: editId(), source: take.file, source_in: 0, start_frame: this.frame, frames: Math.max(1, Math.min(Math.round(info.video_duration * this.fps), Math.round(3 * this.fps))), x: .75, y: .25, scale: .4, opacity: 1, volume: 1, muted: true, fade_in: 0, fade_out: 0};
+    this.changeEdit(() => { this.edit.overlays = [...(this.edit.overlays || []), overlay]; this.overlaySel = overlay.id; });
+  }
+  removeOverlay(id) { this.changeEdit(() => { this.edit.overlays = (this.edit.overlays || []).filter(o => o.id !== id); if (this.overlaySel === id) this.overlaySel = null; }); }
+  overlayInspector() {
+    const o = this.overlay; if (!o) return '';
+    const sec = f => (f / this.fps).toFixed(2), field = (name, label, attrs, value) => `<label>${label}<input data-ov-field="${name}" ${attrs} value="${value}" aria-label="Overlay ${label}"></label>`;
+    return `<h3>Overlay clip</h3><p class="muted small">${esc(o.source.split('/').pop())}. Drag it on the OVERLAY lane to move it; the picture-in-picture position is relative to the frame.</p>
+      <div class="edit-field-pair">${field('in', 'Source in (s)', 'type="number" min="0" step=".1"', o.source_in)}${field('start', 'Timeline start (s)', 'type="number" min="0" step=".1"', this.seconds(o.start_frame))}</div>
+      ${field('length', 'Length (s)', `type="number" min="${1 / this.fps}" step=".1"`, this.seconds(o.frames))}
+      <div class="edit-field-pair">${field('x', 'Centre x (%)', 'type="number" min="0" max="100" step="1"', Math.round(o.x * 100))}${field('y', 'Centre y (%)', 'type="number" min="0" max="100" step="1"', Math.round(o.y * 100))}</div>
+      <div class="edit-field-pair">${field('scale', 'Width (% of frame)', 'type="number" min="5" max="100" step="1"', Math.round(o.scale * 100))}${field('opacity', 'Opacity', 'type="range" min="0" max="1" step=".05"', o.opacity)}</div>
+      <div class="edit-field-pair">${field('fade_in', 'Fade in (s)', 'type="number" min="0" step=".1"', sec(o.fade_in || 0))}${field('fade_out', 'Fade out (s)', 'type="number" min="0" step=".1"', sec(o.fade_out || 0))}</div>
+      <label class="row"><input data-ov-field="muted" type="checkbox" ${o.muted ? 'checked' : ''}>Mute its sound</label>
+      ${field('volume', 'Volume', 'type="range" min="0" max="1" step=".05"', o.volume)}
+      <button class="danger" data-edit="overlay-remove">Remove overlay</button>`;
+  }
+  overlayChange(t) {
+    const o = this.overlay; if (!o) return;
+    const f = t.dataset.ovField, num = name => Number($(`[data-ov-field="${name}"]`, this.root).value), info = this.sources[o.source];
+    if (['in', 'start', 'length'].includes(f)) {
+      const begin = num('in'), start = Math.round(num('start') * this.fps), frames = Math.round(num('length') * this.fps);
+      if (![begin, start, frames].every(Number.isFinite) || begin < 0 || start < 0 || frames < 1 || Math.round(begin * this.fps) + frames > Math.round((info?.video_duration || 0) * this.fps)) { this.inspector(); return toast('Choose a trim within the source video.', true); }
+      return this.changeEdit(() => { Object.assign(o, {source_in: Math.round(begin * this.fps) / this.fps, start_frame: start, frames}); this.clampOverlay(o); });
+    }
+    if (f === 'x' || f === 'y') { const v = num(f) / 100; return Number.isFinite(v) ? this.changeEdit(() => { o[f] = Math.max(0, Math.min(1, v)); }) : this.inspector(); }
+    if (f === 'scale') { const v = num('scale') / 100; return Number.isFinite(v) ? this.changeEdit(() => { o.scale = Math.max(.05, Math.min(1, v)); }) : this.inspector(); }
+    if (f === 'opacity' || f === 'volume') return this.changeEdit(() => { o[f] = +t.value; });
+    if (f === 'muted') return this.changeEdit(() => { o.muted = t.checked; });
+    if (f === 'fade_in' || f === 'fade_out') {
+      const frames = Math.max(0, Math.round(Number(t.value) * this.fps)); if (!Number.isFinite(frames)) return this.inspector();
+      return this.changeEdit(() => { o[f] = Math.min(frames, o.frames); const other = f === 'fade_in' ? 'fade_out' : 'fade_in'; o[other] = Math.min(o[other] || 0, o.frames - o[f]); });
+    }
+  }
+  clampOverlay(o) { o.fade_in = Math.max(0, Math.min(o.frames, Math.round(o.fade_in || 0))); o.fade_out = Math.max(0, Math.min(o.frames - o.fade_in, Math.round(o.fade_out || 0))); }
+  overlayPreview() {  // the overlay clips over the monitor, drawn with the same maths as the export
+    const layer = $('.edit-overlay-preview', this.root); if (!layer) return;
+    const list = this.edit.overlays || [], active = list.filter(o => this.frame >= o.start_frame && this.frame < o.start_frame + o.frames);
+    const ids = new Set(active.map(o => o.id));
+    for (const [id, el] of this.overlayEls) if (!ids.has(id)) { el.pause(); el.remove(); this.overlayEls.delete(id); }
+    if (!active.length) return;
+    const v = this.video.getBoundingClientRect(), host = layer.parentElement.getBoundingClientRect(), dims = this.ctx.e._settings?.video || {width: 9, height: 16};
+    const scale = Math.min(v.width / dims.width, v.height / dims.height), w = dims.width * scale, h = dims.height * scale;
+    Object.assign(layer.style, {left: v.left - host.left + (v.width - w) / 2 + 'px', top: v.top - host.top + (v.height - h) / 2 + 'px', width: w + 'px', height: h + 'px'});
+    for (const o of active) {
+      let el = this.overlayEls.get(o.id);
+      if (!el) { el = document.createElement('video'); el.playsInline = true; el.preload = 'auto'; el.onloadedmetadata = () => this.overlayPreview(); this.overlayEls.set(o.id, el); layer.appendChild(el); }
+      const src = media(o.source); if (el.dataset.source !== src) { el.dataset.source = src; el.src = src; }
+      const edge = Math.min(this.frame - o.start_frame, o.start_frame + o.frames - 1 - this.frame);
+      const fade = Math.min(1, o.fade_in ? (this.frame - o.start_frame + 1) / o.fade_in : 1, o.fade_out ? (o.start_frame + o.frames - this.frame) / o.fade_out : 1);
+      Object.assign(el.style, {left: o.x * 100 + '%', top: o.y * 100 + '%', width: o.scale * 100 + '%', opacity: String(o.opacity * Math.max(0, fade))});
+      el.muted = o.muted; el.volume = Math.min(1, o.volume);
+      const target = o.source_in + (this.frame - o.start_frame) / this.fps;
+      if (el.readyState >= 1 && (!this.playing || Math.abs(el.currentTime - target) > .2)) el.currentTime = target;
+      if (this.playing && el.paused) el.play().catch(() => {}); else if (!this.playing && !el.paused) el.pause();
+    }
   }
   laneTracks() {
     const lanes = this.edit.audio || [], labels = $('.edit-labels', this.root);
@@ -260,6 +342,7 @@ class TakeTimelineEditor {
     }
   }
   inspector() {
+    if (this.overlay) { $('[data-edit-inspector]', this.root).innerHTML = this.overlayInspector() + '<p class="muted small">Click a clip on the VIDEO lane to edit that clip again.</p>'; return; }
     const c = this.clip, m = this.edit.music, picked = this.selectedClips();
     if (picked.length > 1) {
       const all = key => picked.every(x => x[key]), some = key => picked.some(x => x[key]);
@@ -399,7 +482,7 @@ class TakeTimelineEditor {
   }
   syncMedia(force = false) {
     if (this.destroyed) return;
-    this.syncLanes(force);
+    this.syncLanes(force); this.overlayPreview();
     let start = 0, clip;
     const where = clipStarts(this.edit.clips).starts;  // in a crossfade the monitor shows the incoming clip (the export blends)
     for (let i = this.edit.clips.length - 1; i >= 0; i--) { if (this.frame >= where[i] && this.frame < where[i] + this.edit.clips[i].frames) { clip = this.edit.clips[i]; start = where[i]; break; } }
@@ -444,7 +527,7 @@ class TakeTimelineEditor {
   }
   pause() {
     this.playing = false; App.interactionBusy = false; cancelAnimationFrame(this.animation);
-    this.video.pause(); this.audio.pause(); this.laneEls?.forEach(el => el.pause());
+    this.video.pause(); this.audio.pause(); this.laneEls?.forEach(el => el.pause()); this.overlayEls?.forEach(el => el.pause());
     const button = $('[data-edit="play"]', this.root); if (button) button.textContent = '▶';
   }
   remove() {
@@ -857,7 +940,7 @@ class TakeTimelineEditor {
       return;
     }
     if (event.code === 'Space') { if (button) return; return go(() => this.togglePlay()); }
-    if (k === 'Delete' || k === 'Backspace') return go(() => this.markerSel ? this.removeMarker(this.markerSel) : this.titleSel ? this.removeTitle(this.titleSel) : this.remove());
+    if (k === 'Delete' || k === 'Backspace') return go(() => this.markerSel ? this.removeMarker(this.markerSel) : this.overlaySel ? this.removeOverlay(this.overlaySel) : this.titleSel ? this.removeTitle(this.titleSel) : this.remove());
     if (k === 'ArrowLeft') return go(() => this.step(event.shiftKey ? -Math.round(this.fps) : -1));
     if (k === 'ArrowRight') return go(() => this.step(event.shiftKey ? Math.round(this.fps) : 1));
     if (k === 'ArrowUp') return go(() => this.jumpCut(-1));
@@ -886,12 +969,13 @@ class TakeTimelineEditor {
   }
   snapTargets(d) {
     const out = new Set([0, this.frame]), before = d.before, music = before.music;
-    const global = ['music', 'lane', 'marker', 'range-in', 'range-out'].includes(d.mode);
+    const global = ['music', 'lane', 'overlay', 'marker', 'range-in', 'range-out'].includes(d.mode);
     const {starts, total} = clipStarts(before.clips), at = before.clips.findIndex(c => c.id === d.id), own = at < 0 ? null : starts[at];
     before.clips.forEach((c, i) => { if (global || (own != null && starts[i] + c.frames <= own)) { out.add(starts[i]); out.add(starts[i] + c.frames); } });
-    if (d.mode !== 'music' && d.mode !== 'lane') for (const b of this.beatFrames()) out.add(b.frame);
+    if (d.mode !== 'music' && d.mode !== 'lane' && d.mode !== 'overlay') for (const b of this.beatFrames()) out.add(b.frame);
     if (global) out.add(total);
     if (d.mode !== 'music' && music) { out.add(music.start_frame); out.add(music.start_frame + music.frames); }
+    for (const o of before.overlays || []) if (!(d.mode === 'overlay' && o.id === d.overlayId)) { out.add(o.start_frame); out.add(o.start_frame + o.frames); }
     for (const t of before.audio || []) if (!(d.mode === 'lane' && t.id === d.laneId)) { out.add(t.start_frame); out.add(t.start_frame + t.frames); }
     for (const m of before.markers || []) if (!(d.mode === 'marker' && m.id === d.id)) out.add(m.frame);
     return [...out];
@@ -956,6 +1040,7 @@ class TakeTimelineEditor {
         else { this.edit.audio = this.edit.audio.filter(x => x !== lane); this.edit.audio.forEach((x, i) => { x.lane = i; }); }
       });
     }
+    if (action === 'overlay-remove' && this.overlaySel) return this.removeOverlay(this.overlaySel);
     if (action === 'duplicate' && c) return this.duplicate();
     if ((action === 'earlier' || action === 'later') && c) return this.moveClip(action === 'earlier' ? -1 : 1);
     if (action === 'mute-all') return this.changeEdit(() => { const muted = !this.edit.clips.every(c => c.muted); this.edit.clips.forEach(c => { c.muted = muted; }); });
@@ -971,7 +1056,10 @@ class TakeTimelineEditor {
       else this.changeEdit(() => { const revision = this.edit.revision; this.edit = data.edit; this.edit.revision = revision; Object.assign(this.sources, data.sources); this.selected = this.edit.clips[0]?.id; this.frame = 0; });
       return;
     }
+    const ovEl = event.target.closest('[data-overlay-move]');
+    if (ovEl) { this.pause(); this.overlaySel = ovEl.dataset.overlayMove; this.markerSel = null; this.titleSel = null; this.draw(); return; }
     const button = event.target.closest('[data-clip]');
+    if (button && this.overlaySel) this.overlaySel = null;
     const again = button && !event.shiftKey && !event.ctrlKey && !event.metaKey && this.tap('clip:' + button.dataset.clip) === 2;
     if (button) { this.pick(button.dataset.clip, event); this.draw(); }
     if (event.target.closest('.edit-canvas') && !event.target.closest('[data-edge], [data-grip]')) {
@@ -982,6 +1070,7 @@ class TakeTimelineEditor {
   }
   async change(event) {
     const t = event.target, c = this.clip, m = this.edit.music;
+    if (t.matches('[data-ov-field]')) return this.overlayChange(t);
     if (t.matches('[data-lane-field]')) return this.laneChange(t);
     if (t.matches('[data-edit-lane]')) return this.uploadLane(t);
     if (t.matches('[data-edit-model]')) { $('#take-model').value = t.value; return; }
@@ -1080,17 +1169,17 @@ class TakeTimelineEditor {
       event.preventDefault(); this.pause(); App.interactionBusy = true; this.scrubbing = {pointer: event.pointerId};
       $('.edit-canvas', this.root).setPointerCapture(event.pointerId); this.scrubTo(event); $('.take-editor', this.root).focus({preventScroll: true}); return;
     }
-    const edge = event.target.closest('[data-edge]'), grip = event.target.closest('[data-grip]'), music = event.target.closest('[data-music-move]'), lane = event.target.closest('[data-lane-move]');
-    const body = this.tool === 'slip' && !edge && !grip && !music && !lane ? event.target.closest('[data-clip]') : null;
-    if (!edge && !grip && !music && !lane && !body) return;
+    const edge = event.target.closest('[data-edge]'), grip = event.target.closest('[data-grip]'), music = event.target.closest('[data-music-move]'), lane = event.target.closest('[data-lane-move]'), ovMove = event.target.closest('[data-overlay-move]');
+    const body = this.tool === 'slip' && !edge && !grip && !music && !lane && !ovMove ? event.target.closest('[data-clip]') : null;
+    if (!edge && !grip && !music && !lane && !ovMove && !body) return;
     event.preventDefault(); this.pause(); App.interactionBusy = true;
     const button = event.target.closest('[data-clip]'); if (button) this.selected = button.dataset.clip;
-    let mode = lane ? 'lane' : music ? 'music' : body ? 'slip' : edge?.dataset.edge || 'move', id = this.selected, rightId = null;
+    let mode = ovMove ? 'overlay' : lane ? 'lane' : music ? 'music' : body ? 'slip' : edge?.dataset.edge || 'move', id = this.selected, rightId = null;
     if (this.tool === 'roll' && edge && button) {
       const i = this.edit.clips.findIndex(c => c.id === button.dataset.clip), left = edge.dataset.edge === 'right' ? i : i - 1;
       if (i >= 0 && left >= 0 && left + 1 < this.edit.clips.length) { mode = 'roll'; id = this.edit.clips[left].id; rightId = this.edit.clips[left + 1].id; }
     }
-    this.drag = {pointer: event.pointerId, x: event.clientX, before: editClone(this.edit), mode, id, rightId, laneId: lane?.dataset.laneMove};
+    this.drag = {pointer: event.pointerId, x: event.clientX, before: editClone(this.edit), mode, id, rightId, laneId: lane?.dataset.laneMove, overlayId: ovMove?.dataset.overlayMove};
     $('.edit-canvas', this.root).setPointerCapture(event.pointerId);
   }
   dragMove(event) {
@@ -1109,6 +1198,16 @@ class TakeTimelineEditor {
         else if (b != null) { begin = b - frames; this.snapAt = b; }
       }
       this.edit.music.start_frame = Math.max(0, begin);
+    }
+    else if (d.mode === 'overlay') {
+      const o = d.before.overlays.find(x => x.id === d.overlayId), now = this.edit.overlays.find(x => x.id === d.overlayId);
+      let begin = Math.max(0, o.start_frame + delta);
+      if (snapping) {
+        const a = this.nearest(begin, targets), b = this.nearest(begin + o.frames, targets);
+        if (a != null && (b == null || Math.abs(a - begin) <= Math.abs(b - begin - o.frames))) { begin = a; this.snapAt = a; }
+        else if (b != null) { begin = b - o.frames; this.snapAt = b; }
+      }
+      now.start_frame = Math.max(0, begin);
     }
     else if (d.mode === 'lane') {
       const t = d.before.audio.find(x => x.id === d.laneId), now = this.edit.audio.find(x => x.id === d.laneId);
@@ -1172,7 +1271,7 @@ class TakeTimelineEditor {
     this.pause(); this.destroyed = true; clearTimeout(this.saveTimer); cancelAnimationFrame(this.thumbRaf); this.monitorObserver?.disconnect();
     document.body.classList.remove('timeline-focus');
     this.video.removeAttribute('src'); this.audio.removeAttribute('src'); this.video.load(); this.audio.load();
-    this.laneEls.forEach(el => { el.pause(); el.removeAttribute('src'); }); this.laneEls.clear();
+    this.laneEls.forEach(el => { el.pause(); el.removeAttribute('src'); }); this.laneEls.clear(); this.overlayEls.forEach(el => { el.pause(); el.removeAttribute('src'); }); this.overlayEls.clear();
   }
 }
 

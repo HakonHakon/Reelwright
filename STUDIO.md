@@ -150,6 +150,16 @@ the incoming clip. The monitor shows a straight cut at the start of the overlap;
 Cut to beat treats the middle of a crossfade as the cut, and a range that starts or ends inside a crossfade gets the
 part of it that is inside the range.
 
+### Overlay lane (picture-in-picture / B-roll)
+
+Open the take library and press **Add as overlay** on a take: it appears on an **OVERLAY** lane under VIDEO, starting
+at the playhead (3 s at most), and is selected. Overlay clips sit at a free position (nothing ripples), never change
+the length of the timeline (what sticks out past the end is cut off) and are drawn above the main picture and below
+titles. Drag one to move it in time (it snaps to clip edges, lanes and markers; **Alt** bypasses). The inspector sets
+source in, start, length, centre x/y and width (as a percentage of the frame), opacity, fades (the overlay fades its
+transparency), and whether its own sound is mixed in (muted by default). **Delete** removes the selected overlay.
+Overlapping overlays stack on extra rows; up to 8. The monitor draws them live with the same maths as the export.
+
 ### Titles
 
 **Title** adds on-screen text at the playhead (3 seconds by default) and opens its editor; **Titles (n)**

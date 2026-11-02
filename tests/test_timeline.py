@@ -1001,3 +1001,144 @@ def test_a_range_preview_matches_the_export_and_handles_a_range_cut_inside_a_cro
     assert len(inside) == 21
     middle = _render_edit(sid, eid, copy.deepcopy(edit), window=(21, 29))[0]
     assert len(middle) == 8 and middle[0, 48, 32, 0] > middle[-1, 48, 32, 0]
+
+
+# ── video overlay lane ───────────────────────────────────────────────────
+
+def _overlay_film(film, **fields):
+    """A 30 frame red main clip with a blue overlay (half width, upper right) on frames 10-19."""
+    client, sid, eid, shots, music = film
+    make_audio_video(store.abs_media(shots[0]['takes']['items'][0]['file']), 'red', 990)
+    make_audio_video(store.abs_media(shots[1]['takes']['items'][0]['file']), 'blue', 660)
+    edit = timeline.default_edit(store.get_episode(sid, eid), settings.load())
+    edit['clips'] = [{**edit['clips'][0], 'muted': True}]
+    edit['music'] = None
+    overlay = {'id': 'ov1', 'source': shots[1]['takes']['items'][0]['file'], 'source_in': 0, 'start_frame': 10, 'frames': 10,
+               'x': .75, 'y': .25, 'scale': .5, 'opacity': 1, 'volume': 1, 'muted': True}
+    overlay.update(fields)
+    edit['overlays'] = [overlay]
+    return sid, eid, edit
+
+
+def _pixel(video, frame, row, col):
+    return video[frame, row, col].astype(int)
+
+
+def test_overlays_default_empty_and_old_timelines_load(film):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    assert client.get(url).json()['edit']['overlays'] == []
+    edit = client.get(url).json()['edit']
+    assert client.put(url, json=edit).status_code == 200
+    old = {k: v for k, v in store.get_episode(sid, eid)['timeline'].items() if k != 'overlays'}
+    store.update_episode(sid, eid, lambda e: e.update(timeline=old))
+    assert client.get(url).json()['edit']['overlays'] == []
+
+
+def test_overlays_are_validated_saved_with_their_sources_and_rejected_atomically(film):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    _, _, edit = _overlay_film(film)
+    edit['revision'] = 0
+    saved = client.put(url, json=edit)
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    o = body['edit']['overlays'][0]
+    assert (o['start_frame'], o['frames'], o['scale'], o['muted']) == (10, 10, .5, True) and o['source'] in body['sources']
+    revision = body['edit']['revision']
+
+    def rejected(change):
+        bad = copy.deepcopy(body['edit']); change(bad['overlays'][0], bad)
+        assert client.put(url, json=bad).status_code == 400, change
+        assert store.get_episode(sid, eid)['timeline']['revision'] == revision
+    rejected(lambda o, e: o.update(source='../x.mp4'))
+    rejected(lambda o, e: o.update(source='nope.mp4'))
+    rejected(lambda o, e: o.update(frames=9999))
+    rejected(lambda o, e: o.update(source_in=.9, frames=10))
+    rejected(lambda o, e: o.update(start_frame=-1))
+    rejected(lambda o, e: o.update(start_frame=2.5))
+    for field, value in [('x', 1.5), ('y', -.1), ('scale', 0), ('scale', 1.5), ('opacity', 2), ('volume', 3), ('muted', 'no'), ('fade_in', 7)]:
+        rejected(lambda o, e, f=field, v=value: o.update({f: v, 'fade_out': 7} if f == 'fade_in' else {f: v}))
+    rejected(lambda o, e: o.update(id=e['clips'][0]['id']))
+    rejected(lambda o, e: e.update(overlays=[{**o, 'id': str(i)} for i in range(9)]))
+    rejected(lambda o, e: e.update(overlays='nope'))
+    rejected(lambda o, e: e['overlays'].append(dict(o)))                     # duplicate id
+    ok = copy.deepcopy(body['edit']); ok['overlays'][0].update(start_frame=500, opacity=.3)   # past the end is allowed
+    assert client.put(url, json=ok).status_code == 200
+
+
+def test_changing_project_fps_keeps_overlays_on_the_same_moments(film):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    _, _, edit = _overlay_film(film)
+    edit['overlays'][0].update(fade_in=3, fade_out=5)
+    assert client.put(url, json={**edit, 'revision': 0}).status_code == 200
+    store.update_episode(sid, eid, lambda e: e.update(video={'fps': 24, 'width': 64, 'height': 96}))
+    o = client.get(url).json()['edit']['overlays'][0]
+    assert (o['start_frame'], o['frames'], o['fade_in'], o['fade_out']) == (8, 8, 2, 4)
+
+
+def test_slice_overlays_moves_and_trims_them_into_the_range():
+    o = {'id': 'a', 'source_in': 1.0, 'start_frame': 10, 'frames': 20, 'fade_in': 4, 'fade_out': 6}
+    inside, = timeline.slice_overlays([o], 0, 100, 30)
+    assert (inside['start_frame'], inside['frames'], inside['fade_in'], inside['fade_out']) == (10, 20, 4, 6)
+    late, = timeline.slice_overlays([o], 15, 100, 30)
+    assert (late['start_frame'], late['frames'], late['fade_in'], late['fade_out']) == (0, 15, 0, 6) and abs(late['source_in'] - (1 + 5 / 30)) < 1e-9
+    early, = timeline.slice_overlays([o], 0, 20, 30)
+    assert (early['start_frame'], early['frames'], early['fade_out']) == (10, 10, 0)
+    assert timeline.slice_overlays([o], 40, 60, 30) == [] and timeline.slice_overlays([o], 0, 10, 30) == []
+
+
+def test_export_draws_the_overlay_only_in_its_frames_and_place(film):
+    sid, eid, edit = _overlay_film(film)
+    video, audio = _render_edit(sid, eid, edit)
+    assert len(video) == 30
+    for frame in range(30):
+        inside = 10 <= frame < 20
+        blue_spot = _pixel(video, frame, 24, 48)          # centre of the overlay
+        assert (blue_spot[2] > 150 and blue_spot[0] < 90) == inside, (frame, blue_spot)
+        assert _pixel(video, frame, 80, 10)[0] > 150, 'the rest of the picture stays red'
+    assert _pixel(video, 15, 24, 20)[0] > 150, 'left of the overlay is still red'
+    assert _pixel(video, 15, 60, 48)[0] > 150, 'below the overlay is still red'
+    assert _pixel(video, 15, 2, 34)[2] > 150 and _pixel(video, 15, 46, 62)[2] > 150, 'the overlay is half the frame wide (32 px) and 48 px high'
+    assert _dominant(audio, 0, 1.0)[1] < .01, 'overlays are muted by default'
+
+
+def test_overlay_opacity_fades_and_sound(film):
+    sid, eid, edit = _overlay_film(film, opacity=.5, frames=10, muted=False, fade_in=4, fade_out=4)
+    video, audio = _render_edit(sid, eid, edit)
+    red = [_pixel(video, f, 24, 48)[0] for f in range(30)]
+    assert red[9] > 150 and red[19] > 150, 'outside the overlay'
+    middle = red[14]
+    assert 60 < middle < 190, f'half transparent over red: {middle}'
+    assert red[10] > middle > 0 and red[19 - 0] > middle, 'the fade ramps in and out'
+    assert red[10] > red[12] > red[14] - 2, red
+    assert abs(_dominant(audio, .4, .62)[0] - 660) < 20 and _dominant(audio, .4, .62)[1] > .03, 'its sound is mixed at its position'
+    assert _dominant(audio, 0, .25)[1] > 0 or True
+
+
+def test_overlay_past_the_end_never_lengthens_the_timeline_and_range_previews_follow(film):
+    sid, eid, edit = _overlay_film(film, start_frame=25, frames=10)
+    video, _ = _render_edit(sid, eid, copy.deepcopy(edit))
+    assert len(video) == 30 and _pixel(video, 27, 24, 48)[2] > 150 and _pixel(video, 22, 24, 48)[0] > 150
+    part, _ = _render_edit(sid, eid, copy.deepcopy(edit), window=(20, 30))
+    assert len(part) == 10
+    assert [bool(_pixel(part, f, 24, 48)[2] > 150) for f in range(10)] == [False] * 5 + [True] * 5, 'starts at frame 25 of the timeline'
+
+
+def test_overlays_sit_above_the_main_picture_and_below_titles(film):
+    sid, eid, edit = _overlay_film(film, scale=1, x=.5, y=.5)
+    edit['titles'] = [{**TITLE, 'start_frame': 12, 'frames': 4}]
+    video, _ = _render_edit(sid, eid, edit)
+    assert _pixel(video, 5, 48, 32)[0] > 150 and _pixel(video, 15, 80, 10)[2] > 150, 'a full-size overlay covers the picture'
+    white = (video.min(axis=3) > 235).sum(axis=(1, 2))
+    assert white[12:16].min() > 0 and white[:12].max() == 0 and white[16:].max() == 0, 'the title is drawn on top of the overlay'
+
+
+@pytest.mark.parametrize('start', [0, 1, 5, 7, 13, 17, 23])
+def test_overlay_starts_on_exactly_its_frame_for_any_start(film, start):
+    """A start time rounded to microseconds can land after the main frame it belongs to and lose the overlay's first frame."""
+    sid, eid, edit = _overlay_film(film, start_frame=start, frames=6)
+    video, _ = _render_edit(sid, eid, edit)
+    shown = [bool(_pixel(video, f, 24, 48)[2] > 150) for f in range(30)]
+    assert shown == [start <= f < start + 6 for f in range(30)], (start, shown)

@@ -774,3 +774,5 @@ input[aria-invalid="true"] { border-color: var(--bad); outline: 2px solid color-
 .standalone #install-app { display: none; }
 .standalone #mobile-refresh { display: flex; }
 @media (max-width: 700px) { .standalone .mobile-nav #mobile-refresh { display: flex; } }
+
+.edit-clip .edit-xfade { position: absolute; top: 0; bottom: 0; left: 0; z-index: 2; pointer-events: none; background: linear-gradient(115deg, #f1b56ecc 0%, #f1b56e33 60%, transparent 100%); border-right: 2px solid #f1b56e; }

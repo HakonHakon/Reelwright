@@ -839,6 +839,79 @@ def test_audio_lanes_add_drag_mute_inspector_remove_and_persist(edit_server):
         browser.close()
 
 
+def test_crossfade_inspector_overlap_clamping_split_lipsync_and_persistence(edit_server):
+    base, sid, eid, shots, music, submitted = edit_server
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(viewport={'width': 1440, 'height': 1100}, service_workers='block').new_page()
+        errors, ed = _open_editor(page, base, sid, eid)
+        clips = lambda: page.evaluate('App.timelineEditor.edit.clips.map(c => [c.frames, c.transition, App.timelineEditor.start(c.id)])')
+        total = lambda: page.evaluate('App.timelineEditor.total')
+        page.locator('[data-edit-zoom]').fill('100')
+        assert clips() == [[30, 0, 0], [30, 0, 30]] and total() == 60
+
+        # The first clip cannot be crossfaded.
+        page.locator('.edit-clip').first.click()
+        assert page.locator('[data-edit-xfade]').is_disabled()
+
+        # A crossfade overlaps the clips: the second one starts earlier and the timeline gets shorter.
+        page.locator('.edit-clip').nth(1).click()
+        field = page.locator('[data-edit-xfade]')
+        field.fill('0.3'); field.press('Tab')
+        assert clips() == [[30, 0, 0], [30, 9, 21]] and total() == 51
+        left = page.evaluate("[...document.querySelectorAll('.edit-clip')].map(e => e.getBoundingClientRect().left - document.querySelector('.edit-video-track').getBoundingClientRect().left)")
+        assert abs(left[1] - 21 / 30 * 100) < 1.5, left
+        assert abs(page.locator('.edit-clip').nth(1).locator('.edit-xfade').evaluate('e => e.getBoundingClientRect().width') - 30) < 1.5
+        assert page.locator('[data-edit-scrub]').get_attribute('max') == '50'
+
+        # More than half of the shorter clip is limited to half.
+        field.fill('5'); field.press('Tab')
+        assert clips()[1][1] == 15 and total() == 45
+        field.fill('0.2'); field.press('Tab')
+        assert clips()[1][1] == 6 and total() == 54
+
+        # Splitting the incoming clip leaves the crossfade on the first piece only.
+        _split_at(page, 40)
+        assert [c[1] for c in clips()] == [0, 6, 0] and total() == 54
+        # Cut-to-clip jumps land in the middle of the crossfade.
+        assert page.evaluate('App.timelineEditor.cuts()')[:3] == [0, 27, 40]
+
+        # Lip-sync cannot coexist with a crossfade next to it; turning it on drops the crossfade.
+        page.locator('.edit-clip').nth(1).click()
+        box = page.locator('[data-edit-lipsync]')
+        assert box.is_enabled()
+        box.check()
+        assert clips()[1][1] == 0 and total() == 60
+
+        page.keyboard.press('Control+z')
+        page.locator('.take-editor').focus(); page.keyboard.press('Control+z')
+        page.locator('[data-edit="save"]').click()
+        page.wait_for_function('!App.timelineEditor.dirty && !App.timelineEditor.saving')
+        saved = [(c['frames'], c['transition']) for c in store.get_episode(sid, eid)['timeline']['clips']]
+        assert saved[0] == (30, 0) and saved[1][1] == 6, saved
+        assert not errors, errors
+        browser.close()
+
+
+def test_cut_to_beat_aligns_the_middle_of_a_crossfade_and_keeps_the_total(edit_server):
+    base, sid, eid, shots, music, submitted = edit_server
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(viewport={'width': 1440, 'height': 1100}, service_workers='block').new_page()
+        errors, ed = _open_editor(page, base, sid, eid)
+        page.evaluate("() => { const t = App.timelineEditor; const [a, b] = t.edit.clips; a.frames = 24; Object.assign(b, {source_in: 10 / 30, frames: 20, transition: 8}); t.beatFrames = () => [{frame: 23, bar: true}]; }")
+        plan = page.evaluate("""() => { const t = App.timelineEditor, r = t.planBeatCuts({align: true, tolerance: 0, every: 0, scope: 'all'});
+            const {starts, total} = clipStarts(r.edit.clips); return {aligned: r.aligned, stuck: r.stuck, starts, total, frames: r.edit.clips.map(c => c.frames), middle: starts[1] + Math.floor(r.edit.clips[1].transition / 2)}; }""")
+        assert plan['aligned'] == 1 and plan['stuck'] == 0, plan
+        assert plan['middle'] == 23 and plan['total'] == 36 and plan['frames'] == [27, 17], plan
+        # A beat that would make the crossfade longer than half of a clip is refused instead of moving things.
+        page.evaluate("() => { const t = App.timelineEditor; t.beatFrames = () => [{frame: 25, bar: true}]; }")
+        plan = page.evaluate("() => { const r = App.timelineEditor.planBeatCuts({align: true, tolerance: 0, every: 0, scope: 'all'}); return {aligned: r.aligned, stuck: r.stuck}; }")
+        assert plan == {'aligned': 0, 'stuck': 1}, plan
+        assert not errors, errors
+        browser.close()
+
+
 def test_titles_dialog_lane_live_preview_delete_and_persistence(edit_server):
     base, sid, eid, shots, music, submitted = edit_server
     with playwright.sync_playwright() as p:

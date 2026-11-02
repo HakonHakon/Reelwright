@@ -863,3 +863,141 @@ def test_a_range_preview_seeks_into_the_lanes(film, tmp_path):
     assert abs(_dominant(audio, .02, .14)[0] - 880) < 30 and _dominant(audio, .02, .14)[1] > .03, 'frames 15-20 still hear the first lane'
     assert _dominant(audio, .2, .45)[1] < .01, 'silence until the second lane'
     assert abs(_dominant(audio, .55, .95)[0] - 1320) < 15 and _dominant(audio, .55, .95)[1] > .05, 'the second lane starts 15 frames in'
+
+
+# ── crossfades ───────────────────────────────────────────────────────────
+
+def _crossfade_film(film, transition=10, lengths=(30, 30)):
+    client, sid, eid, shots, music = film
+    for sh, color, hz in zip(shots, ['red', 'blue'], [990, 660]):
+        make_audio_video(store.abs_media(sh['takes']['items'][0]['file']), color, hz)
+    edit = timeline.default_edit(store.get_episode(sid, eid), settings.load())
+    for clip, frames in zip(edit['clips'], lengths):
+        clip.update(frames=frames, muted=False)
+    edit['clips'][1]['transition'] = transition
+    edit['music'] = None
+    return sid, eid, edit
+
+
+def _render_edit(sid, eid, edit, window=None):
+    edit = timeline.validate(store.get_episode(sid, eid), edit, settings.load())
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, edit, settings.load()['video'], window=window)
+    ep = store.get_episode(sid, eid)
+    return _frames_and_audio(store.abs_media(ep['outputs']['timeline_previews'][-1]['file'] if window else ep['outputs']['final']))
+
+
+def test_clip_starts_overlap_by_each_transition():
+    clips = [{'frames': 30}, {'frames': 30, 'transition': 10}, {'frames': 20}, {'frames': 20, 'transition': 4}]
+    assert timeline.clip_starts(clips) == ([0, 20, 50, 66], 86)
+    assert timeline.clip_starts([]) == ([], 0)
+    assert timeline.clip_starts([{'frames': 7, 'transition': 5}]) == ([0], 7), 'the first clip has nothing to overlap'
+
+
+def test_crossfade_defaults_to_zero_and_old_timelines_load(film):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    edit = client.get(url).json()['edit']
+    assert [c['transition'] for c in edit['clips']] == [0, 0]
+    assert client.put(url, json=edit).status_code == 200
+    old = copy.deepcopy(store.get_episode(sid, eid)['timeline'])
+    for c in old['clips']:
+        del c['transition']
+    store.update_episode(sid, eid, lambda e: e.update(timeline=old))
+    assert [c['transition'] for c in client.get(url).json()['edit']['clips']] == [0, 0]
+
+
+def test_crossfade_rules_are_enforced_atomically(film):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    base = client.get(url).json()['edit']
+
+    def put(**fields):
+        edit = copy.deepcopy(base); edit['clips'][1].update(fields)
+        return client.put(url, json=edit).status_code
+    assert put(transition=15) == 200, 'exactly half of a 30 frame clip is allowed'
+    base = client.get(url).json()['edit']
+    assert put(transition=16) == 400, 'more than half of the shorter clip'
+    assert put(transition=-1) == 400 and put(transition=2.5) == 400 and put(transition='x') == 400 and put(transition=True) == 400
+    first = copy.deepcopy(base); first['clips'][0]['transition'] = 4
+    assert client.put(url, json=first).status_code == 400, 'the first clip has no clip before it'
+    assert put(transition=5, lipsync=True) == 400, 'no crossfade into a lip-sync clip'
+    left = copy.deepcopy(base); left['clips'][0]['lipsync'] = True; left['clips'][1]['transition'] = 5
+    assert client.put(url, json=left).status_code == 400, 'nor out of one'
+    assert put(transition=0) == 200
+
+
+def test_changing_project_fps_scales_crossfades(film):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    edit = client.get(url).json()['edit']; edit['clips'][1]['transition'] = 10
+    assert client.put(url, json=edit).status_code == 200
+    store.update_episode(sid, eid, lambda e: e.update(video={'fps': 24, 'width': 64, 'height': 96}))
+    changed = client.get(url).json()['edit']
+    assert [c['frames'] for c in changed['clips']] == [24, 24] and changed['clips'][1]['transition'] == 8
+    assert client.put(url, json=changed).status_code == 200
+
+
+def test_slice_keeps_the_part_of_a_crossfade_inside_the_range():
+    clips = [{'id': 'a', 'frames': 30, 'source_in': 0.0, 'speed': 1}, {'id': 'b', 'frames': 30, 'source_in': 0.0, 'speed': 1, 'transition': 10}]
+    both = timeline.slice_clips(clips, 10, 40, 30)           # overlap is frames 20..30, wholly inside
+    assert [(c['frames'], c['transition']) for c in both] == [(20, 0), (20, 10)]
+    assert timeline.clip_starts(both) == ([0, 10], 30)
+    inside = timeline.slice_clips(clips, 24, 45, 30)         # starts in the middle of the overlap
+    assert [(c['frames'], c['transition']) for c in inside] == [(6, 0), (21, 6)] and abs(inside[1]['source_in'] - 4 / 30) < 1e-9
+    assert timeline.clip_starts(inside)[1] == 21
+    only_b = timeline.slice_clips(clips, 31, 45, 30)
+    assert [(c['id'], c['transition']) for c in only_b] == [('b', 0)]
+    cut_off = timeline.slice_clips(clips, 0, 25, 30)         # ends in the middle of the overlap
+    assert [(c['frames'], c['transition']) for c in cut_off] == [(25, 0), (5, 5)] and timeline.clip_starts(cut_off)[1] == 25
+
+
+def test_export_blends_the_overlap_and_shortens_the_timeline(film):
+    sid, eid, edit = _crossfade_film(film)
+    video, audio = _render_edit(sid, eid, edit)
+    assert len(video) == 50, 'two 30 frame clips overlapping by 10'
+    red = video[:, 48, 32, 0].astype(int)
+    assert red[:19].min() > 200 and red[31:].max() < 60, 'pure red, then pure blue'
+    overlap = red[20:30]
+    assert np.all(np.diff(overlap) < 0) and overlap[0] > 150 and overlap[-1] < 90, overlap
+    assert abs(len(audio) / 8000 - 50 / 30) < .06
+    assert abs(_dominant(audio, .05, .5)[0] - 990) < 12 and abs(_dominant(audio, 1.25, 1.6)[0] - 660) < 12
+    assert _dominant(audio, .05, .5)[1] > .05 and _dominant(audio, 1.25, 1.6)[1] > .05
+
+
+def test_markers_lanes_and_titles_keep_their_timeline_positions_with_a_crossfade(film, tmp_path):
+    client, sid, eid, shots, music = film
+    low = _upload_lane_audio(client, sid, eid, _tone(tmp_path, 'low.wav', 880))
+    sid, eid, edit = _crossfade_film(film)
+    for clip in edit['clips']:
+        clip['muted'] = True
+    edit['audio'] = [{'id': 'a', 'file': low['file'], 'lane': 0, 'source_in': 0, 'start_frame': 36, 'frames': 12, 'volume': 1}]
+    edit['titles'] = [{**TITLE, 'start_frame': 40, 'frames': 6}]
+    video, audio = _render_edit(sid, eid, edit)
+    assert len(video) == 50
+    assert abs(_dominant(audio, 1.22, 1.58)[0] - 880) < 20 and _dominant(audio, 1.22, 1.58)[1] > .05
+    assert _dominant(audio, .1, 1.0)[1] < .01, 'silent before the lane starts at frame 36'
+    white = (video[:, :, :, :].min(axis=3) > 235).sum(axis=(1, 2))
+    assert white[:40].max() == 0 and white[40:46].min() > 0 and white[46:].max() == 0, 'the title shows exactly in frames 40-45'
+
+
+def test_chain_of_crossfades_and_hard_cuts_has_the_expected_length(film):
+    client, sid, eid, shots, music = film
+    sid, eid, edit = _crossfade_film(film, transition=6, lengths=(30, 30))
+    third = {**edit['clips'][0], 'id': 'third', 'transition': 0, 'frames': 20}
+    fourth = {**edit['clips'][1], 'id': 'fourth', 'transition': 8, 'frames': 20}
+    edit['clips'] += [third, fourth]
+    assert timeline.clip_starts(edit['clips']) == ([0, 24, 54, 66], 86)
+    video, audio = _render_edit(sid, eid, edit)
+    assert len(video) == 86 and abs(len(audio) / 8000 - 86 / 30) < .08
+
+
+def test_a_range_preview_matches_the_export_and_handles_a_range_cut_inside_a_crossfade(film):
+    sid, eid, edit = _crossfade_film(film)
+    full, _ = _render_edit(sid, eid, copy.deepcopy(edit))
+    part, _ = _render_edit(sid, eid, copy.deepcopy(edit), window=(10, 40))
+    assert len(part) == 30
+    assert np.max(np.abs(part[:, 48, 32, 0].astype(int) - full[10:40, 48, 32, 0].astype(int))) <= 12, 'same blend as the export'
+    inside, _ = _render_edit(sid, eid, copy.deepcopy(edit), window=(24, 45))
+    assert len(inside) == 21
+    middle = _render_edit(sid, eid, copy.deepcopy(edit), window=(21, 29))[0]
+    assert len(middle) == 8 and middle[0, 48, 32, 0] > middle[-1, 48, 32, 0]

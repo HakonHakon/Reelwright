@@ -630,7 +630,7 @@ def _timeline_export(sid, eid, window=None):
         if not edit['clips']:
             raise ValueError('Add clips to the timeline before rendering')
         if window:
-            total = sum(c['frames'] for c in edit['clips'])
+            total = timeline.clip_starts(edit['clips'])[1]
             if window[0] >= total:
                 raise ValueError('The range starts after the end of the timeline')
             window = (window[0], min(window[1], total))

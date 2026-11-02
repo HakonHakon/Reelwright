@@ -140,6 +140,16 @@ source in, timeline start, length, fade in/out, volume, mute, loop, and removes 
 clip sounds and the music in the export and in range previews, and are previewed in the monitor. Music stays the
 guide for lip-sync; lanes never affect it.
 
+### Crossfades
+
+Select a clip and set **Crossfade from previous clip (s)** in the inspector. The two clips overlap and blend
+(picture and sound), so the timeline gets shorter by that amount; markers, titles, music and audio lanes keep
+their timeline positions. The first clip has none, it can be at most half of the shorter of the two clips, and
+lip-sync clips cannot be crossfaded (turning lip-sync on drops the crossfade). A shaded wedge marks the overlap on
+the incoming clip. The monitor shows a straight cut at the start of the overlap; the export and range previews blend.
+Cut to beat treats the middle of a crossfade as the cut, and a range that starts or ends inside a crossfade gets the
+part of it that is inside the range.
+
 ### Titles
 
 **Title** adds on-screen text at the playhead (3 seconds by default) and opens its editor; **Titles (n)**

@@ -1,5 +1,8 @@
 // Takes editor: the saved edit is independent of its source takes.
 "use strict";
+// A clip's `transition` is a crossfade with the clip before it: they overlap, so the timeline is shorter than the
+// sum of the clip lengths. Mirror of timeline.clip_starts in the backend: never add up c.frames by hand.
+const clipStarts = clips => { const starts = []; let end = 0; clips.forEach((c, i) => { const begin = end - (i ? c.transition || 0 : 0); starts.push(begin); end = begin + c.frames; }); return {starts, total: end}; };
 const editClone = value => JSON.parse(JSON.stringify(value));
 const LANE_HEIGHT = 40, MAX_LANES = 8;
 const MARKER_COLORS = ["red", "orange", "yellow", "green", "blue", "purple"];
@@ -80,7 +83,7 @@ class TakeTimelineEditor {
     $('.edit-results', root).innerHTML = (versions.length ? `<details><summary>Rendered timelines (${versions.length})</summary>${rows(versions)}</details>` : '') + (previews.length ? `<details><summary>Range previews (${previews.length})</summary>${rows(previews)}</details>` : '');
   }
   get fps() { return this.edit.fps; }
-  get total() { return this.edit.clips.reduce((n, c) => n + c.frames, 0); }
+  get total() { return clipStarts(this.edit.clips).total; }
   get selected() { return this._primary; }
   set selected(id) { this._primary = id; this.anchor = id; this.markerSel = null; this.titleSel = null; this.selection = new Set(id ? [id] : []); }
   get titles() { return this.edit.titles || []; }
@@ -107,7 +110,7 @@ class TakeTimelineEditor {
     this.markerSel = null; this.titleSel = null;
   }
   selectAll() { this.selection = new Set(this.edit.clips.map(c => c.id)); this._primary = this.selection.has(this._primary) ? this._primary : this.edit.clips[0]?.id; this.anchor = this._primary; this.draw(); }
-  start(id) { let f = 0; for (const c of this.edit.clips) { if (c.id === id) return f; f += c.frames; } return 0; }
+  start(id) { const i = this.edit.clips.findIndex(c => c.id === id); return i < 0 ? 0 : clipStarts(this.edit.clips).starts[i]; }
   seconds(frame) { return (frame / this.fps).toFixed(3); }
   label(c) { return c.shot_id || 'Video clip'; }
   sourceFrames(c) { return Math.round((this.sources[c.source]?.video_duration || c.source_in + c.frames / this.fps) * this.fps); }
@@ -125,7 +128,14 @@ class TakeTimelineEditor {
     this.history.push(before); if (this.history.length > 50) this.history.shift(); this.future = [];
     this.changed();
   }
+  clampTransitions() {  // no crossfade on the first clip, next to lip-sync, or longer than half of the shorter neighbour
+    this.edit.clips.forEach((c, i) => {
+      const prev = this.edit.clips[i - 1];
+      c.transition = !prev || c.lipsync || prev.lipsync ? 0 : Math.max(0, Math.min(Math.round(c.transition || 0), Math.floor(Math.min(c.frames, prev.frames) / 2)));
+    });
+  }
   clampFades() {
+    this.clampTransitions();
     for (const c of this.edit.clips) {
       c.fade_in = Math.max(0, Math.min(c.frames, Math.round(c.fade_in || 0)));
       c.fade_out = Math.max(0, Math.min(c.frames - c.fade_in, Math.round(c.fade_out || 0)));
@@ -200,17 +210,17 @@ class TakeTimelineEditor {
     ruler.style.backgroundImage = `repeating-linear-gradient(90deg, #47566b 0 1px, transparent 1px ${minorStep * this.zoom}px)`;
     const scroller = $('.edit-scroll', this.root); this.canvasWidth = width;
     this.thumbWindow = {from: scroller.scrollLeft - 500, to: scroller.scrollLeft + scroller.clientWidth + 500};
-    let position = 0;
-    $('.edit-video-track', this.root).innerHTML = this.edit.clips.map(c => {
-      const left = position / this.fps * this.zoom; position += c.frames;
+    const placed = clipStarts(this.edit.clips).starts;
+    $('.edit-video-track', this.root).innerHTML = this.edit.clips.map((c, index) => {
+      const left = placed[index] / this.fps * this.zoom;
       const sh = this.ctx.e.shots.find(sh => sh.id === c.shot_id);
       const poster = sh && selFrame(sh)?.file;
       const px = Math.max(3, c.frames / this.fps * this.zoom), size = px < 46 ? 'tiny' : px < 96 ? 'narrow' : '';
       const shortName = px < 96 ? this.label(c).replace(/^(S\d+)_SH(\d+)$/, '$1·$2') : this.label(c);
-      return `<button type="button" class="edit-clip ${size} ${this.selection.has(c.id) ? 'selected' : ''} ${c.id === this.selected ? 'primary' : ''} ${c.muted ? 'muted' : ''}" aria-pressed="${this.selection.has(c.id)}" data-clip="${esc(c.id)}" style="left:${left}px;width:${px}px" title="${esc(this.label(c))} · ${this.seconds(c.frames)}s${c.muted ? ' · muted' : ''}${c.lipsync ? ' · lip-sync' : ''}" aria-label="Timeline clip ${esc(this.label(c))}">
+      return `<button type="button" class="edit-clip ${size} ${this.selection.has(c.id) ? 'selected' : ''} ${c.id === this.selected ? 'primary' : ''} ${c.muted ? 'muted' : ''}" aria-pressed="${this.selection.has(c.id)}" data-clip="${esc(c.id)}" style="left:${left}px;width:${px}px" title="${esc(this.label(c))} · ${this.seconds(c.frames)}s${c.muted ? ' · muted' : ''}${c.lipsync ? ' · lip-sync' : ''}${c.transition ? ` · crossfade ${this.seconds(c.transition)}s` : ''}" aria-label="Timeline clip ${esc(this.label(c))}">
         ${poster ? `<img src="${media(poster)}" alt="" draggable="false">` : ''}${this.thumbs(c, left, px)}<span class="edit-clip-name">${esc(shortName)}</span>
         <span class="edit-clip-meta">${this.seconds(c.frames)}s${this.speed(c) !== 1 ? ` · ${+this.speed(c).toFixed(2)}×` : ''}</span><span class="edit-badges" aria-hidden="true">${c.muted ? '<i>M</i>' : ''}${c.lipsync ? '<i class="ls">LS</i>' : ''}</span>
-        ${c.fade_in ? `<i class="edit-fade in" style="width:${Math.min(px, c.fade_in / this.fps * this.zoom)}px" aria-hidden="true"></i>` : ''}${c.fade_out ? `<i class="edit-fade out" style="width:${Math.min(px, c.fade_out / this.fps * this.zoom)}px" aria-hidden="true"></i>` : ''}<span class="edit-grip" data-grip="move" aria-label="Drag to reorder">⠿</span><span class="edit-edge left" data-edge="left"></span><span class="edit-edge right" data-edge="right"></span></button>`;
+        ${c.fade_in ? `<i class="edit-fade in" style="width:${Math.min(px, c.fade_in / this.fps * this.zoom)}px" aria-hidden="true"></i>` : ''}${c.fade_out ? `<i class="edit-fade out" style="width:${Math.min(px, c.fade_out / this.fps * this.zoom)}px" aria-hidden="true"></i>` : ''}${c.transition ? `<i class="edit-xfade" style="width:${Math.min(px, c.transition / this.fps * this.zoom)}px" aria-hidden="true"></i>` : ''}<span class="edit-grip" data-grip="move" aria-label="Drag to reorder">⠿</span><span class="edit-edge left" data-edge="left"></span><span class="edit-edge right" data-edge="right"></span></button>`;
     }).join('');
     this.drawBeats(); this.drawMarks(); this.drawTitles();
     const waveform = music && this.waveform?.file === music.file ? this.waveSvg(music, this.waveform) : '';
@@ -276,11 +286,19 @@ class TakeTimelineEditor {
       <label class="row"><input data-edit-muted type="checkbox" ${c.muted ? 'checked' : ''}>Mute clip audio</label>
       <label>Clip volume<input data-edit-volume type="range" min="0" max="1" step=".05" value="${c.volume}" aria-label="Clip volume"></label>
       ${this.fadeFields([c])}
+      ${this.crossfadeField(c)}
       <label class="row"><input data-edit-lipsync type="checkbox" ${c.lipsync ? 'checked' : ''} ${this.eligible(c) ? '' : 'disabled'}>Lip-sync this clip to music</label>
       <label>Generate with<select data-edit-model aria-label="Timeline generation model">${$('#take-model')?.innerHTML || ''}</select></label>
       <button data-edit="generate" ${sh ? '' : 'disabled'}>Generate take for this shot</button>` : '<p class="muted small">Select a clip or add a take below.</p>'}
       <h3>Music / voice</h3>${this.musicInspector()}${this.laneInspector()}`;
     const model = $('[data-edit-model]', this.root); if (model) model.value = $('#take-model').value;
+  }
+  crossfadeField(c) {
+    const i = this.edit.clips.indexOf(c), prev = this.edit.clips[i - 1];
+    const reason = !prev ? 'The first clip has no clip before it' : c.lipsync || prev.lipsync ? 'Lip-sync clips cannot be crossfaded' : '';
+    const most = prev ? Math.floor(Math.min(c.frames, prev.frames) / 2) / this.fps : 0;
+    return `<label>Crossfade from previous clip (s)<input data-edit-xfade type="number" min="0" max="${most.toFixed(3)}" step=".1" value="${((c.transition || 0) / this.fps).toFixed(2)}" ${reason ? `disabled title="${reason}"` : ''} aria-label="Crossfade from the previous clip, seconds"></label>
+      <p class="muted small">${reason || 'The two clips overlap, so the timeline gets shorter. The monitor shows a cut; the export blends.'}</p>`;
   }
   fadeFields(clips) {
     const same = key => clips.every(c => c[key] === clips[0][key]) ? (clips[0][key] / this.fps).toFixed(2) : '';
@@ -383,7 +401,8 @@ class TakeTimelineEditor {
     if (this.destroyed) return;
     this.syncLanes(force);
     let start = 0, clip;
-    for (const c of this.edit.clips) { if (this.frame < start + c.frames) { clip = c; break; } start += c.frames; }
+    const where = clipStarts(this.edit.clips).starts;  // in a crossfade the monitor shows the incoming clip (the export blends)
+    for (let i = this.edit.clips.length - 1; i >= 0; i--) { if (this.frame >= where[i] && this.frame < where[i] + this.edit.clips[i].frames) { clip = this.edit.clips[i]; start = where[i]; break; } }
     if (!clip) { this.video.pause(); this.video.removeAttribute('src'); return; }
     const src = media(clip.source);
     if (this.video.dataset.source !== src) { this.video.dataset.source = src; this.video.src = src; }
@@ -439,7 +458,7 @@ class TakeTimelineEditor {
     const maximum = Math.round(info.video_duration * this.fps);
     this.changeEdit(() => {
       if (replace && this.clip) Object.assign(this.clip, {shot_id: shotId, source: take.file, source_in: 0, frames: Math.min(this.clip.frames, this.fitFrames(this.clip, maximum)), lipsync: false});
-      else { const clip = {id: editId(), shot_id: shotId, source: take.file, source_in: 0, frames: maximum, muted: false, volume: 1, lipsync: false, speed: 1}; this.edit.clips.push(clip); this.selected = clip.id; this.frame = this.start(clip.id); }
+      else { const clip = {id: editId(), shot_id: shotId, source: take.file, source_in: 0, frames: maximum, muted: false, volume: 1, lipsync: false, speed: 1, transition: 0}; this.edit.clips.push(clip); this.selected = clip.id; this.frame = this.start(clip.id); }
     });
   }
   /** Counts quick consecutive taps on the same item (a redraw between clicks stops browsers sending dblclick). */
@@ -450,7 +469,11 @@ class TakeTimelineEditor {
   }
   refocus() { if (this.destroyed || !this.root.isConnected) return; const a = document.activeElement; if (!a || a === document.body || !this.root.contains(a)) $('.take-editor', this.root)?.focus({preventScroll: true}); }
   tc(frame) { const f = Math.max(1, Math.round(this.fps)), s = Math.floor(frame / f), p = n => String(n).padStart(2, '0'); return `${p(Math.floor(s / 3600))}:${p(Math.floor(s / 60) % 60)}:${p(s % 60)}:${p(frame % f)}`; }
-  cuts() { const out = [0]; let p = 0; for (const c of this.edit.clips) { p += c.frames; out.push(p); } return out; }
+  cuts() {  // the edit points: the end of a hard cut, the middle of a crossfade
+    const {starts, total} = clipStarts(this.edit.clips), out = [0];
+    this.edit.clips.slice(1).forEach((c, i) => out.push(starts[i + 1] + Math.floor((c.transition || 0) / 2)));
+    out.push(total); return out;
+  }
   ensureVisible() {
     const scroll = $('.edit-scroll', this.root), x = this.frame / this.fps * this.zoom;
     if (x < scroll.scrollLeft + 24 || x > scroll.scrollLeft + scroll.clientWidth - 48) scroll.scrollLeft = Math.max(0, x - scroll.clientWidth * .3);
@@ -479,7 +502,7 @@ class TakeTimelineEditor {
     const c = this.clip; if (!c) return;
     const offset = this.frame - this.start(c.id);
     if (offset <= 0 || offset >= c.frames) return toast('Place the playhead inside the selected clip.', true);
-    this.changeEdit(() => { const right = {...c, id: editId(), source_in: c.source_in + offset / this.fps * this.speed(c), frames: c.frames - offset, fade_in: 0}; c.frames = offset; c.fade_out = 0; this.edit.clips.splice(this.edit.clips.indexOf(c) + 1, 0, right); this.selected = right.id; });
+    this.changeEdit(() => { const right = {...c, id: editId(), source_in: c.source_in + offset / this.fps * this.speed(c), frames: c.frames - offset, fade_in: 0, transition: 0}; c.frames = offset; c.fade_out = 0; this.edit.clips.splice(this.edit.clips.indexOf(c) + 1, 0, right); this.selected = right.id; });
   }
   trimTo(startSide) {
     const c = this.clip; if (!c) return;
@@ -490,7 +513,7 @@ class TakeTimelineEditor {
   duplicate() {
     const picked = this.selectedClips(); if (!picked.length) return;
     this.changeEdit(() => {
-      const copies = picked.map(c => ({...c, id: editId()})), at = this.edit.clips.indexOf(picked.at(-1)) + 1;
+      const copies = picked.map(c => ({...c, id: editId(), transition: 0})), at = this.edit.clips.indexOf(picked.at(-1)) + 1;
       this.edit.clips.splice(at, 0, ...copies); this.selection = new Set(copies.map(c => c.id)); this._primary = copies.at(-1).id; this.anchor = copies[0].id;
     });
   }
@@ -512,7 +535,7 @@ class TakeTimelineEditor {
   paste() {
     if (!this.clipboard.length) return toast('Copy some clips first (Ctrl+C).', true);
     this.changeEdit(() => {
-      const copies = this.clipboard.map(c => ({...editClone(c), id: editId(), lipsync: this.edit.music ? c.lipsync : false}));
+      const copies = this.clipboard.map(c => ({...editClone(c), id: editId(), transition: 0, lipsync: this.edit.music ? c.lipsync : false}));
       const last = this.selectedClips().at(-1), at = last ? this.edit.clips.indexOf(last) + 1 : this.edit.clips.length;
       this.edit.clips.splice(at, 0, ...copies); this.selection = new Set(copies.map(c => c.id)); this._primary = copies.at(-1).id; this.anchor = copies[0].id;
     });
@@ -623,31 +646,32 @@ class TakeTimelineEditor {
       for (let i = 0; i + 1 < edit.clips.length; i++) {
         const left = edit.clips[i], right = edit.clips[i + 1];
         if (!inScope.has(left.id) && !inScope.has(right.id)) continue;
-        const cut = edit.clips.slice(0, i + 1).reduce((n, c) => n + c.frames, 0), beat = nearestBeat(cut);
+        const cut = clipStarts(edit.clips).starts[i + 1] + Math.floor((right.transition || 0) / 2), beat = nearestBeat(cut);
         if (beat == null) continue;
         const shift = beat - cut;
         if (shift === 0) { result.already++; continue; }
         const low = Math.max(minFrames - left.frames, -this.fitFrames(right, Math.round(right.source_in * fps)));
         const high = Math.min(right.frames - minFrames, this.fitFrames(left, this.sourceFrames(left) - Math.round(left.source_in * fps)) - left.frames);
-        if ((tolerance && Math.abs(shift) > Math.round(tolerance * fps)) || shift < low || shift > high) { result.stuck++; continue; }
+        const t = right.transition || 0;  // the crossfade has to stay valid for both clips after the move
+        if ((tolerance && Math.abs(shift) > Math.round(tolerance * fps)) || shift < low || shift > high || t * 2 > Math.min(left.frames + shift, right.frames - shift)) { result.stuck++; continue; }
         left.frames += shift; right.source_in = (Math.round(right.source_in * fps) + Math.round(shift * this.speed(right))) / fps; right.frames -= shift; result.aligned++;
       }
     }
     if (every > 0 && frames.length) {
       const firstBar = beats.findIndex(b => b.bar), anchor = firstBar >= 0 ? firstBar % every : 0;
       const grid = frames.filter((_, i) => i >= anchor && (i - anchor) % every === 0);
-      const clips = []; let start = 0;
-      for (const c of edit.clips) {
-        const end = start + c.frames, cuts = [];
+      const clips = [], where = clipStarts(edit.clips).starts;
+      for (const [ci, c] of edit.clips.entries()) {
+        const start = where[ci], end = start + c.frames, cuts = [];
         if (inScope.has(c.id)) for (const g of grid) if (g >= start + minFrames && g <= end - minFrames && g - (cuts.at(-1) ?? start) >= minFrames) cuts.push(g);
         if (cuts.length && end - cuts.at(-1) < minFrames) cuts.pop();
         const bounds = [start, ...cuts, end];
         const fadeOut = c.fade_out || 0;
         for (let k = 0; k + 1 < bounds.length; k++) {
           const lastPart = k + 2 === bounds.length;
-          clips.push(k === 0 ? Object.assign(c, {frames: bounds[1] - bounds[0], fade_out: lastPart ? fadeOut : 0}) : {...c, id: editId(), source_in: c.source_in + (bounds[k] - start) / fps * this.speed(c), frames: bounds[k + 1] - bounds[k], fade_in: 0, fade_out: lastPart ? fadeOut : 0});
+          clips.push(k === 0 ? Object.assign(c, {frames: bounds[1] - bounds[0], fade_out: lastPart ? fadeOut : 0}) : {...c, id: editId(), transition: 0, source_in: c.source_in + (bounds[k] - start) / fps * this.speed(c), frames: bounds[k + 1] - bounds[k], fade_in: 0, fade_out: lastPart ? fadeOut : 0});
         }
-        result.added += cuts.length; start = end;
+        result.added += cuts.length;
       }
       edit.clips = clips;
     }
@@ -863,13 +887,8 @@ class TakeTimelineEditor {
   snapTargets(d) {
     const out = new Set([0, this.frame]), before = d.before, music = before.music;
     const global = ['music', 'lane', 'marker', 'range-in', 'range-out'].includes(d.mode);
-    let p = 0, own = null;
-    for (const c of before.clips) { if (c.id === d.id) own = p; p += c.frames; }
-    const total = p; p = 0;
-    for (const c of before.clips) {
-      if (global || (own != null && p + c.frames <= own)) { out.add(p); out.add(p + c.frames); }
-      p += c.frames;
-    }
+    const {starts, total} = clipStarts(before.clips), at = before.clips.findIndex(c => c.id === d.id), own = at < 0 ? null : starts[at];
+    before.clips.forEach((c, i) => { if (global || (own != null && starts[i] + c.frames <= own)) { out.add(starts[i]); out.add(starts[i] + c.frames); } });
     if (d.mode !== 'music' && d.mode !== 'lane') for (const b of this.beatFrames()) out.add(b.frame);
     if (global) out.add(total);
     if (d.mode !== 'music' && music) { out.add(music.start_frame); out.add(music.start_frame + music.frames); }
@@ -985,6 +1004,11 @@ class TakeTimelineEditor {
         x.speed = speed;
         x.frames = Math.max(1, Math.min(this.fitFrames(x, this.sourceFrames(x) - Math.round(x.source_in * this.fps)), Math.round(used / speed)));
       } });
+    }
+    if (t.matches('[data-edit-xfade]') && c) {
+      const frames = Math.round(Number(t.value) * this.fps);
+      if (!Number.isFinite(frames) || frames < 0) return this.inspector();
+      return this.changeEdit(() => { c.transition = frames; });  // clampTransitions limits it to what the neighbours allow
     }
     if (t.matches('[data-edit-muted]') && c) return this.changeEdit(() => { for (const x of this.selectedClips()) x.muted = t.checked; });
     if (t.matches('[data-edit-fade]') && c) {
@@ -1121,8 +1145,9 @@ class TakeTimelineEditor {
       c.frames += shift; right.source_in = (Math.round(right.source_in * fps) + Math.round(shift * this.speed(right))) / fps; right.frames -= shift;
     }
     else {
-      const center = this.start(c.id) + c.frames / 2 + delta; let position = 0, nearest = 0, distance = Infinity;
-      this.edit.clips.forEach((clip, i) => { const gap = Math.abs(center - position - clip.frames / 2); if (gap < distance) { distance = gap; nearest = i; } position += clip.frames; });
+      const center = this.start(c.id) + c.frames / 2 + delta; let nearest = 0, distance = Infinity;
+      const where = clipStarts(this.edit.clips).starts;
+      this.edit.clips.forEach((clip, i) => { const gap = Math.abs(center - where[i] - clip.frames / 2); if (gap < distance) { distance = gap; nearest = i; } });
       this.edit.clips.splice(this.edit.clips.indexOf(c), 1); this.edit.clips.splice(nearest, 0, c);
     }
     this.tracks(); this.position(); this.showSnap();

@@ -95,7 +95,7 @@ def default_edit(episode, cfg, selected_takes=False):
         for i, c in enumerate(selected_version['timeline']):
             clips.append({'id': f'clip_{i}', 'shot_id': c['shot_id'], 'source': selected_version['file'],
                           'source_in': c['start'], 'frames': round(c['duration'] * fps),
-                          'muted': True, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1})
+                          'muted': True, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1, 'transition': 0})
     else:
         for sh in sorted(episode['shots'], key=lambda x: x['order']):
             items = sh['takes'].get('items', [])
@@ -112,7 +112,7 @@ def default_edit(episode, cfg, selected_takes=False):
             duration -= tin + float(sh['takes'].get('trim_out') or 0)
             clips.append({'id': 'clip_' + sh['id'], 'shot_id': sh['id'], 'source': take['file'],
                           'source_in': tin, 'frames': max(1, round(duration * fps)),
-                          'muted': False, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1})
+                          'muted': False, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1, 'transition': 0})
     music = None
     m = episode.get('music') or {}
     if m.get('file'):
@@ -131,7 +131,7 @@ def view(episode, cfg):
     edit = copy.deepcopy(episode.get('timeline') or default_edit(episode, cfg))
     edit = retime(edit, settings.for_episode(cfg, episode)['video']['fps'])
     for clip in edit['clips']:  # timelines saved before fades existed
-        clip.setdefault('fade_in', 0); clip.setdefault('fade_out', 0); clip.setdefault('speed', 1)
+        clip.setdefault('fade_in', 0); clip.setdefault('fade_out', 0); clip.setdefault('speed', 1); clip.setdefault('transition', 0)
     edit.setdefault('markers', [])  # timelines saved before markers and ranges existed
     edit.setdefault('range', None)
     edit.setdefault('titles', [])
@@ -160,6 +160,7 @@ def retime(edit, fps):
             clip['frames'] = max(1, round(number(clip['frames'], 'Clip length', 1) * fps / old))
             fade_in = min(clip['frames'], round(number(clip.get('fade_in', 0), 'Fade in') * fps / old))
             clip['fade_in'] = fade_in
+            clip['transition'] = round(number(clip.get('transition', 0), 'Crossfade') * fps / old)
             clip['fade_out'] = min(clip['frames'] - fade_in, round(number(clip.get('fade_out', 0), 'Fade out') * fps / old))
         if edit.get('music'):
             edit['music']['start_frame'] = round(number(edit['music']['start_frame'], 'Music position') * fps / old)
@@ -183,6 +184,20 @@ def retime(edit, fps):
 
 
 MIN_SPEED, MAX_SPEED = 0.25, 4
+
+
+def clip_starts(clips):
+    """Timeline start frame of every clip, and the timeline length.
+
+    A clip's `transition` is a crossfade with the clip before it: the two overlap by that many frames, so the
+    timeline is shorter than the sum of the clip lengths. Everything that places something on the timeline
+    (render, lip-sync positions, range previews, the editor) must use this, never a plain sum."""
+    starts, end = [], 0
+    for i, c in enumerate(clips):
+        begin = end - (c.get('transition', 0) if i else 0)
+        starts.append(begin)
+        end = begin + c['frames']
+    return starts, end
 
 
 def atempo(speed):
@@ -338,7 +353,16 @@ def validate(episode, body, cfg):
         clips.append({'id': c['id'], 'shot_id': shot_id, 'source': file, 'source_in': start / fps,
                       'frames': frames, 'muted': flag(c.get('muted', False), 'Clip mute'),
                       'volume': number(c.get('volume', 1), 'Clip volume', 0, 2), 'lipsync': sync,
-                      'fade_in': fade_in, 'fade_out': fade_out, 'speed': speed})
+                      'fade_in': fade_in, 'fade_out': fade_out, 'speed': speed,
+                      'transition': number(c.get('transition', 0), 'Crossfade')})
+    for i, c in enumerate(clips):
+        t = c['transition']
+        if type(t) is not int:
+            raise ValueError('A crossfade must be a whole number of frames')
+        if t and (i == 0 or t * 2 > min(c['frames'], clips[i - 1]['frames'])):
+            raise ValueError('A crossfade needs a clip before it and can be at most half of the shorter of the two clips')
+        if t and (c['lipsync'] or clips[i - 1]['lipsync']):
+            raise ValueError('Lip-sync clips cannot be crossfaded; turn lip-sync off or the crossfade off')
     music = body.get('music')
     if music is not None:
         if not isinstance(music, dict):
@@ -419,16 +443,21 @@ def prepare_music(job, cfg, music, frames, fps, out, guide=False, name='music'):
 
 
 def slice_clips(clips, first, last, fps):
-    """The part of the picture between two timeline frames, as ordinary clips (lip-sync is not applied)."""
-    out, position = [], 0
-    for c in clips:
-        start, end = position, position + c['frames']
-        position = end
+    """The part of the picture between two timeline frames, as ordinary clips (lip-sync is not applied).
+
+    A crossfade inside the range stays; one that is cut by the range keeps only the part that is inside it."""
+    out, last_index, last_hi = [], None, 0
+    starts, _ = clip_starts(clips)
+    for i, c in enumerate(clips):
+        start, end = starts[i], starts[i] + c['frames']
         lo, hi = max(start, first), min(end, last)
         if lo < hi:
             # a fade belongs to its clip edge: keep it only if that edge is inside the range
+            overlap = max(0, last_hi - lo) if last_index == i - 1 and out else 0
             out.append({**c, 'source_in': c['source_in'] + (lo - start) / fps * c.get('speed', 1), 'frames': hi - lo, 'lipsync': False,
-                        'fade_in': c.get('fade_in', 0) if lo == start else 0, 'fade_out': c.get('fade_out', 0) if hi == end else 0})
+                        'fade_in': c.get('fade_in', 0) if lo == start else 0, 'fade_out': c.get('fade_out', 0) if hi == end else 0,
+                        'transition': overlap})
+            last_index, last_hi = i, hi
     return out
 
 
@@ -441,7 +470,7 @@ def render(job, sid, eid, edit, video, window=None):
     episode = store.get_episode(sid, eid)
     cfg['video'] = video
     fps, width, height = [video[k] for k in ('fps', 'width', 'height')]
-    full = sum(c['frames'] for c in edit['clips'])
+    _, full = clip_starts(edit['clips'])
     if not full:
         raise ValueError('Add clips to the timeline before rendering')
     first, last = window if window else (0, full)
@@ -472,7 +501,8 @@ def render(job, sid, eid, edit, video, window=None):
     lanes = [prepare_music(job, cfg, t, full, fps, out, name=f'lane{k}') for k, t in enumerate(edit.get('audio') or []) if not t['muted']]
     cache = Path(store.ep_dir(sid, eid)) / 'out' / 'timeline_cache'
     cache.mkdir(exist_ok=True)
-    clips, events, position = [], [], 0
+    clips, events = [], []
+    starts, _ = clip_starts(clips_in)
     for i, c in enumerate(clips_in):
         job.check()
         source = store.abs_media(c['source'])
@@ -495,7 +525,7 @@ def render(job, sid, eid, edit, video, window=None):
         picture = base
         if c['lipsync']:
             voice = out / f'{i:04d}_voice.wav'
-            run(job, [cfg['ffmpeg'], '-y', '-v', 'error', '-ss', str(position/fps), '-i', str(guide),
+            run(job, [cfg['ffmpeg'], '-y', '-v', 'error', '-ss', str(starts[i]/fps), '-i', str(guide),
                       '-t', str(duration), '-ar', '16000', '-ac', '1', str(voice)])
             fingerprint = [source, Path(source).stat().st_mtime_ns, Path(source).stat().st_size,
                            c['source_in'], c['frames'], video, hashlib.sha256(voice.read_bytes()).hexdigest(),
@@ -517,7 +547,6 @@ def render(job, sid, eid, edit, video, window=None):
                   '-c:a', 'aac', '-b:a', '256k', '-t', str(duration), str(clip)])
         clips.append(clip)
         events.append({'clip': Path(source).name, 'src_in': c['source_in'], 'duration': duration})
-        position += c['frames']
         job.progress = [i + 1, len(clips_in)]
         job.say(f'Clip {i+1}/{len(clips_in)} ready')
     command = [cfg['ffmpeg'], '-y', '-v', 'error']
@@ -535,15 +564,30 @@ def render(job, sid, eid, edit, video, window=None):
     for png, _, _ in shown:
         command += ['-i', str(png)]
     graph, inputs = [], ''
+    crossfades = any(c.get('transition') for c in clips_in)
+    same_base = ',settb=1/1000000' if crossfades else ''  # xfade needs equal time bases; concat results use microseconds
     for i, c in enumerate(clips_in):
         fi, fo = c.get('fade_in', 0), c.get('fade_out', 0)
         fade_v = (f',fade=t=in:s=0:n={fi}' if fi else '') + (f',fade=t=out:s={c["frames"] - fo}:n={fo}' if fo else '')
         fade_a = (f',afade=t=in:st=0:d={fi / fps:.6f}' if fi else '') + (f',afade=t=out:st={(c["frames"] - fo) / fps:.6f}:d={fo / fps:.6f}' if fo else '')
-        graph += [f'[{i}:v]trim=end_frame={c["frames"]},setpts=N/({fps}*TB){fade_v}[v{i}]',
+        graph += [f'[{i}:v]trim=end_frame={c["frames"]},setpts=N/({fps}*TB){fade_v}{same_base}[v{i}]',
                   f'[{i}:a]aresample=48000,atrim=end_sample={round(c["frames"]/fps*48000)},asetpts=N/SR/TB{fade_a}[a{i}]']
         inputs += f'[v{i}][a{i}]'
     first_input = len(clips) + (1 if music else 0) + len(lanes)
-    graph += [f'{inputs}concat=n={len(clips)}:v=1:a=1[v][a]', f'[v]setpts=N/({fps}*TB)[pic0]']
+    if not crossfades:
+        graph += [f'{inputs}concat=n={len(clips)}:v=1:a=1[v][a]']
+    else:  # chain the clips; a crossfade overlaps the incoming clip with the running result
+        video, sound, length = 'v0', 'a0', clips_in[0]['frames']
+        for k in range(1, len(clips_in)):
+            t, last_step = clips_in[k]['transition'], k == len(clips_in) - 1
+            out_v, out_a = ('v', 'a') if last_step else (f'cv{k}', f'ca{k}')
+            if t:
+                graph += [f'[{video}][v{k}]xfade=transition=fade:duration={t / fps:.6f}:offset={(length - t) / fps:.6f}[{out_v}]',
+                          f'[{sound}][a{k}]acrossfade=d={t / fps:.6f}:c1=tri:c2=tri[{out_a}]']
+            else:
+                graph += [f'[{video}][{sound}][v{k}][a{k}]concat=n=2:v=1:a=1[{out_v}][{out_a}]']
+            video, sound, length = out_v, out_a, length + clips_in[k]['frames'] - t
+    graph += [f'[v]setpts=N/({fps}*TB)[pic0]']
     for j, (_, a, b) in enumerate(shown):
         graph.append(f"[pic{j}][{first_input + j}:v]overlay=0:0:enable='between(n,{a},{b - 1})'[pic{j + 1}]")
     graph.append(f'[pic{len(shown)}]null[picture]')

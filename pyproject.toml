@@ -1,0 +1,38 @@
+[project]
+name = "reelwright"
+version = "0.9.0"
+description = "Local AI film studio: story, shots, frames, takes, timeline editing and lip-sync on your own GPU"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "jinja2",
+  "python-multipart",
+  "requests",
+  "websocket-client",
+  "ollama",
+  "opencv-python",
+  "Pillow",
+  "pillow-heif",
+  "numpy",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "httpx", "playwright"]
+legacy = ["sv_ttk"]  # the old Tk director agent only
+
+[project.scripts]
+reelwright-studio = "studio.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["studio"]
+
+[tool.setuptools.package-data]
+studio = ["static/**/*", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

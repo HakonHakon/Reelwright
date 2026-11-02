@@ -6,8 +6,10 @@ import os
 import shutil
 import threading
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_ROOT = os.environ.get("STUDIO_DATA", os.path.join(REPO_ROOT, "studio_data"))
+from . import paths
+
+REPO_ROOT = str(paths.REPO_ROOT)
+DATA_ROOT = str(paths.data_root())
 SETTINGS_PATH = os.path.join(DATA_ROOT, "settings.json")
 LEGACY_SETTINGS = os.path.join(REPO_ROOT, "video_director_agent", "user_settings.json")
 
@@ -165,8 +167,14 @@ def load() -> dict:
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(user, f, indent=2)
         s = _deep_merge(DEFAULTS, user)
-    s["ffmpeg"] = s["ffmpeg"] or shutil.which("ffmpeg") or "ffmpeg"
-    s["ffprobe"] = s["ffprobe"] or shutil.which("ffprobe") or "ffprobe"
+    s["ffmpeg"] = paths.find_tool("ffmpeg", s["ffmpeg"])
+    s["ffprobe"] = paths.find_tool("ffprobe", s["ffprobe"])
+    # a bundled Linux ffmpeg needs its own libraries; children (ffmpeg, workers) inherit this
+    os.environ.update(paths.tool_environment(s["ffmpeg"]))
+    # the desktop supervisor picks the ports at start-up; these are never written to settings.json
+    for key, variable in (("comfy_host", "REELWRIGHT_COMFY_HOST"), ("ollama_host", "REELWRIGHT_OLLAMA_HOST")):
+        if os.environ.get(variable):
+            s[key] = os.environ[variable]
     return s
 
 

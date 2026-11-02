@@ -187,6 +187,12 @@ class FakeOllama:
 
 @pytest.fixture(scope="module")
 def client():
+    # LTX needs the user's own exported workflow (video_director_agent/i2v_template.json, not in Git)
+    template = settings.load()["ltx"]["template"]
+    if not os.path.isabs(template):
+        template = os.path.join(settings.REPO_ROOT, template)
+    if not os.path.isfile(template):
+        pytest.skip("needs the exported LTX workflow " + template)
     FakeComfy.object_info = build_object_info()
     srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeComfy)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

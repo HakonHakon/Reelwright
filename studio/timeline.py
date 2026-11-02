@@ -11,7 +11,7 @@ import uuid
 
 import re
 
-from . import media, settings, store, titles as titles_mod, workflows
+from . import media, paths, settings, store, titles as titles_mod, workflows
 
 
 class EditConflict(ValueError):
@@ -83,7 +83,7 @@ def thumbnail(sid, eid, episode, file, seconds, height, cfg):
                 if not partial.is_file() or not partial.stat().st_size:
                     partial.unlink(missing_ok=True)
                     raise media.MediaError('There is no frame at that time')
-                partial.replace(target)
+                paths.replace(partial, target)
     return target
 
 
@@ -491,26 +491,10 @@ def save(sid, eid, body, cfg):
 
 
 def run(job, command):
-    with tempfile.TemporaryFile(mode='w+') as log:
-        process = subprocess.Popen(command, stdout=log, stderr=log)
-        try:
-            while True:
-                job.check()
-                try:
-                    code = process.wait(timeout=.25)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill(); process.wait()
-        if code:
-            log.seek(0)
-            raise media.MediaError('Timeline processing failed: ' + log.read()[-2000:])
+    from . import procs
+    code, output = procs.run_cancellable(command, job.check)
+    if code:
+        raise media.MediaError('Timeline processing failed: ' + output)
 
 
 def prepare_music(job, cfg, music, frames, fps, out, guide=False, name='music'):
@@ -641,7 +625,7 @@ def render(job, sid, eid, edit, video, window=None):
                 temporary = out / f'{i:04d}_synced.mp4'
                 lipsync.correct_clip(job, cfg, client, str(base), str(voice), str(temporary),
                                      c['frames'], width, height, fps, out.name + f'_{i}')
-                temporary.replace(picture)
+                paths.replace(temporary, picture)
             else:
                 job.say(f'Clip {i+1}: reusing the completed lip-sync')
         # Use original take audio, independently of the lip-sync model's guide audio.

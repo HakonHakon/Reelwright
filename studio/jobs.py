@@ -543,6 +543,9 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
     engines = {engine_override or sh.get("engine") or b["style"].get("default_engine") or "ltx" for sh in todo}
     for engine in engines:
         providers.validate_model(engine, model_override if engine_override else "")
+        problem = providers.engine_problem(s, engine)
+        if problem:  # say so now, before any model is unloaded
+            raise ValueError(problem)
     if engines != {"minimax"}:
         _gpu_prepare(job, s, c)
     n_takes = int(takes or s["takes_per_shot"])

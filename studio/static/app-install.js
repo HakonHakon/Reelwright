@@ -4,6 +4,10 @@ window.addEventListener("beforeinstallprompt", event => { event.preventDefault()
 window.addEventListener("appinstalled", () => { installPrompt = null; toast("Reelwright installed."); });
 $("#mobile-search").onclick = () => openPalette(true);
 $("#mobile-jobs").onclick = () => openJobs(true);
+$("#mobile-refresh").onclick = () => reloadApp(false);
+// Installed apps have no browser reload button, and "Install app" means nothing once installed.
+const isInstalled = () => matchMedia("(display-mode: standalone)").matches || matchMedia("(display-mode: fullscreen)").matches || matchMedia("(display-mode: minimal-ui)").matches || navigator.standalone === true;
+document.documentElement.classList.toggle("standalone", isInstalled());
 const onlineStatus = () => { $("#network-status").hidden = navigator.onLine; };
 window.addEventListener("online", onlineStatus); window.addEventListener("offline", onlineStatus); onlineStatus();
 $("#install-app").onclick = async () => {

@@ -34,13 +34,23 @@ const GET = (u) => api("GET", u), POST = (u, b) => api("POST", u, b ?? {}), PUT 
 const FORM = (u, fd) => api("POST", u, fd, true);
 
 // A shared selection control for every deletable collection.
+// Hidden behind a quiet "Select" toggle so checkboxes only appear when the user asks for them.
 function bulkSelect(root, selector, remove, refresh = route, label = "items") {
   const targets = $$(selector, root);
   if (!targets.length) return;
   const bar = document.createElement("div");
   bar.className = "row bulk-actions";
-  bar.innerHTML = `<label><input type="checkbox" aria-label="Select all ${esc(label)}"> Select all ${esc(label)}</label><button class="danger" disabled>Delete selected</button><span class="muted small"></span>`;
-  root.prepend(bar);
+  bar.innerHTML = `<button class="bulk-toggle" aria-pressed="false">Select ${esc(label)}…</button>
+    <span class="bulk-tools"><label><input type="checkbox" aria-label="Select all ${esc(label)}"> All</label><span class="muted small"></span><button class="danger" disabled>Delete selected</button></span>`;
+  const head = $(":scope > .page-head", root);
+  if (head) head.after(bar); else root.prepend(bar);
+  root.classList.add("bulk-off");
+  const toggle = $(".bulk-toggle", bar);
+  toggle.onclick = () => {
+    const on = root.classList.toggle("bulk-off") === false;
+    toggle.setAttribute("aria-pressed", String(on)); toggle.textContent = on ? "Done" : `Select ${label}…`;
+    if (!on) { boxes.forEach(b => { b.checked = false; }); sync(); }
+  };
   const boxes = targets.map((target, i) => {
     const box = document.createElement("input"); box.type = "checkbox";
     box.className = "bulk-check"; box.setAttribute("aria-label", `Select ${label} ${i + 1}`);
@@ -50,7 +60,7 @@ function bulkSelect(root, selector, remove, refresh = route, label = "items") {
     } else target.before(box);
     return box;
   });
-  const all = $("input", bar), button = $("button", bar), count = $("span", bar);
+  const all = $(".bulk-tools input", bar), button = $(".bulk-tools button", bar), count = $(".bulk-tools span", bar);
   const sync = () => {
     const n = boxes.filter(b => b.checked).length;
     button.disabled = !n; count.textContent = `${n} selected`;
@@ -68,7 +78,24 @@ function bulkSelect(root, selector, remove, refresh = route, label = "items") {
     catch { App.selecting = false; await refresh(); }
   };
 }
-const VIDEO_ENGINES = ["minimax_local", "ltx", "wan", "minimax"];
+// Destructive page actions live in a quiet overflow menu instead of a red button beside every title.
+function pageMenu(view, actions) {
+  const menu = document.createElement("details");
+  menu.className = "more-menu";
+  menu.innerHTML = `<summary class="icon-btn" aria-label="More actions" title="More actions">${ic("dots")}</summary><div class="more-pop" role="menu"></div>`;
+  for (const [text, fn, danger] of actions) {
+    const b = document.createElement("button");
+    b.textContent = text; b.setAttribute("role", "menuitem"); if (danger) b.className = "danger";
+    b.onclick = () => { menu.open = false; fn(); };
+    $(".more-pop", menu).append(b);
+  }
+  $(".page-head", view).append(menu);
+  return menu;
+}
+document.addEventListener("click", (e) => { $$(".more-menu[open]").forEach((m) => { if (!m.contains(e.target) || e.target.closest(".more-pop button")) m.open = false; }); });
+// Seconds for humans: 1.1666667 -> "1.2s".
+const fmtDur = (s) => `${Math.round((+s || 0) * 10) / 10}s`;
+const VIDEO_ENGINES =["minimax_local", "ltx", "wan", "minimax"];
 const engineOptions = (current) => VIDEO_ENGINES.map(x => `<option value="${x}" ${x === current ? "selected" : ""}>${esc({minimax_local:"MiniMax H3 (local)",ltx:"LTX-2.3",wan:"Wan 2.2",minimax:"MiniMax (cloud)"}[x])}</option>`).join("");
 
 // ── toasts ───────────────────────────────────────────────────────────────
@@ -146,9 +173,9 @@ function renderNav() {
   const d = a === "s" ? App.sd[sid] : null;
   const item = (href, icon, label, extra = "", sub = false) => {
     const on = location.hash.replace(/\/(story|shots|frames|animatic|takes|cut)$/, "") === href.replace(/\/(story|shots|frames|animatic|takes|cut)$/, "");
-    return `<a class="nav-item ${sub ? "sub" : ""} ${on ? "on" : ""}" href="${href}" data-i="${esc(label.trim().charAt(0).toUpperCase())}" title="${esc(label)}"><span class="lbl">${esc(label)}</span>${extra}</a>`;
+    return `<a class="nav-item ${sub || ""} ${on ? "on" : ""}" href="${href}" ${on ? 'aria-current="page"' : ""} data-i="${esc(label.trim().charAt(0).toUpperCase())}" title="${esc(label)}"><span class="lbl">${esc(label)}</span>${extra}</a>`;
   };
-  let html = item("#/", "folder", "Projects") + item("#/settings", "settings", "Settings") + item("#/models", "settings", "Models");
+  let html = item("#/", "folder", "Projects", "", "top");
   if (d) {
     const chars = Object.values(d.bible.characters), locs = Object.values(d.bible.locations);
     html += `<div class="nav-sec">${esc(d.series.name)}</div>` +
@@ -157,6 +184,7 @@ function renderNav() {
       `<div class="nav-sec">Characters</div>` + chars.slice(0, 10).map((c) => item(`#/s/${sid}/c/${c.id}`, "user", c.name, c.draft ? `<span class="count">draft</span>` : "")).join("") +
       `<div class="nav-sec">Locations</div>` + locs.slice(0, 10).map((l) => item(`#/s/${sid}/l/${l.id}`, "pin", l.name, l.draft ? `<span class="count">draft</span>` : "")).join("");
   }
+  html += `<div class="nav-sec">Studio</div>` + item("#/models", "settings", "Models", "", "top") + item("#/settings", "settings", "Settings", "", "top");
   $("#nav").innerHTML = html;
 }
 async function getSeries(sid) {
@@ -194,6 +222,24 @@ async function refreshStatus() {
       (s.missing.length ? `<div class="line"><span class="chip warn" title="${esc(s.missing.join("\n"))}">${s.missing.length} missing models</span></div>` : "");
   } catch { $("#status").innerHTML = `<div class="line"><span class="dot bad"></span><span class="lbl">Server unreachable</span></div>`; }
 }
+
+/** Reload the whole app: fetches fresh scripts and data. Asks first if there is something unsaved. */
+async function reloadApp(clearCaches = false) {
+  const button = $("#refresh-btn"); button.classList.add("spinning");
+  try {
+    let lost = App.dirty;
+    if (App.timelineEditor?.dirty) { try { await App.timelineEditor.flush(); lost = false; } catch { lost = true; } }
+    if (lost && !(await ask("You have changes that are not saved. Reload anyway?", "Reload", true))) return;
+    App.dirty = false;  // we have asked; do not let the browser ask again
+    try {
+      const registration = await navigator.serviceWorker?.getRegistration();
+      await registration?.update();
+      if (clearCaches) { for (const key of await caches.keys()) await caches.delete(key); await registration?.unregister(); }
+    } catch { /* reloading still works without the service worker */ }
+    location.reload();
+  } finally { button.classList.remove("spinning"); }
+}
+$("#refresh-btn").onclick = (event) => reloadApp(event.shiftKey || event.altKey);
 
 function openJobs(on = true) { $("#jobs").classList.toggle("on", on); $("#scrim").classList.toggle("on", on); }
 $("#jobs-btn").onclick = () => openJobs(!$("#jobs").classList.contains("on"));
@@ -253,6 +299,7 @@ async function buildPalette() {
     { g: "Actions", label: "Toggle light / dark theme", icon: "sun", run: () => $("#theme-btn").click() },
     { g: "Actions", label: "Toggle sidebar", icon: "panel", run: () => $("#collapse-btn").click() },
     { g: "Actions", label: "Open activity", icon: "activity", run: () => openJobs(true) },
+    { g: "Actions", label: "Reload the app", icon: "refresh", run: () => reloadApp(false) },
     { g: "Actions", label: "Keyboard shortcuts", icon: "info", run: showShortcuts },
   ];
   try { App.series = await GET("/api/series"); } catch { /* offline */ }
@@ -337,7 +384,7 @@ async function route() {
     editor.destroy(); App.timelineEditor = null;
   }
   closeModal();
-  App.refreshers = []; App.selecting = false; App.dirty = false; App.dirtyWarned = false;
+  App.refreshers = []; App.soft = null; App.selecting = false; App.dirty = false; App.dirtyWarned = false;
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
   const first = !App.route.length || App.route.join("/") !== parts.join("/");
   App.route = parts;
@@ -345,7 +392,9 @@ async function route() {
   const view = $("#view");
   if (first) { view.innerHTML = SKELETON; view.style.animation = "none"; void view.offsetHeight; view.style.animation = ""; }
   renderNav();
-  try {
+  // Re-rendering the page you are already on must not throw away where you were in it.
+  const keep = first ? null : { y: window.scrollY, open: $$("details", view).map((d) => d.open) };
+  const dispatch = async () => {
     if (!parts.length) return await viewHome(view);
     if (parts[0] === "models") return await viewModels(view);
     if (parts[0] === "settings") return await viewSettings(view);
@@ -359,12 +408,16 @@ async function route() {
     }
     crumbs([["Not found", null]]);
     view.innerHTML = `<div class="empty"><b>Page not found</b><a href="#/">Back to projects</a></div>`;
-  } catch (err) {
-    view.innerHTML = `<div class="notice">${ic("alert")}<span>${esc(err.message)}</span></div>`;
+  };
+  try { await dispatch(); }
+  catch (err) { view.innerHTML = `<div class="notice">${ic("alert")}<span>${esc(err.message)}</span></div>`; }
+  if (keep) {
+    $$("details", view).forEach((d, i) => { if (i < keep.open.length) d.open = keep.open[i]; });
+    window.scrollTo({ top: keep.y, behavior: "instant" });
   }
 }
 window.addEventListener("hashchange", route);
-$("#view").addEventListener("input", (e) => { if (!e.target.matches("input[type=file], .bulk-check, .bulk-actions input, input[data-chk]")) App.dirty = true; });
+$("#view").addEventListener("input", (e) => { if (!e.target.matches("input[type=file], .bulk-check, .bulk-actions input, input[data-chk], input[data-chk-all], #take-model, #ntakes, #src-override, [data-edit-model]")) App.dirty = true; });
 window.addEventListener("beforeunload", (e) => { if (App.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
 // ── shared bits ──────────────────────────────────────────────────────────
@@ -428,13 +481,11 @@ async function viewSeries(view, sid) {
     <div class="section-head"><h2>Locations</h2></div>
     <div class="prints wide">${locs.map((l) => printFig(locThumb(l), l.name, `#/s/${sid}/l/${l.id}`, `${l.draft ? "draft, " : ""}${Object.keys(l.variants || {}).join(", ") || "no variants"}`)).join("")}</div>
     ${addCard("new-loc", "Location name", "add-loc", "Add location")}`;
-  const deleteProject = document.createElement("button"); deleteProject.className = "danger";
-  deleteProject.textContent = "Delete project"; $(".page-head", view).append(deleteProject);
-  deleteProject.onclick = async () => {
+  pageMenu(view, [["Style & props", () => { location.hash = `#/s/${sid}/style`; }], ["Delete project…", async () => {
     if (await ask(`Delete ${d.series.name} and all its episodes? Files are kept in a .deleted folder.`, "Delete project", true)) {
       await api("DELETE", `/api/s/${sid}`); delete App.sd[sid]; location.hash = "#/";
     }
-  };
+  }, true]]);
   bulkSelect(view, ".eprow, .prints a", async targets => {
     for (const target of targets) {
       const parts = target.getAttribute("href").split("/");
@@ -479,21 +530,25 @@ async function viewCharacter(view, sid, cid) {
       <div><h1>${esc(c.name)}</h1><div class="row sub"><span class="chip">v${c.version}</span><span class="chip ${c.image_lora?.name ? "accent" : ""}">${c.image_lora?.name ? "LoRA set" : "no LoRA"}</span><span class="chip">${(c.refs || []).length} reference photos</span></div></div></div>
     ${c.draft ? `<div class="notice">Drafted from the story - review the description, pick a LoRA, then save.</div>` : ""}
     <div class="card form-grid">
+      <h3 class="form-sec full">Identity</h3>
       <div><label>Name</label><input id="f-name" value="${esc(c.name)}"></div>
       <div><label>Trigger token (from LoRA training, e.g. ohwx_sam)</label><input id="f-trigger" value="${esc(c.trigger)}"></div>
       <div class="full"><label>Locked appearance (50-80 words, copied verbatim into every prompt)</label><textarea id="f-app">${esc(c.appearance)}</textarea></div>
+      <h3 class="form-sec full">Wardrobe &amp; acting</h3>
       <div class="full"><label>Outfits - one per line, "name: description"</label><textarea id="f-outfits">${esc(kvToText(c.outfits))}</textarea></div>
       <div><label>Default outfit</label><input id="f-defout" value="${esc(c.default_outfit)}"></div>
       <div><label>Never change (comma separated)</label><input id="f-never" value="${esc((c.never_change || []).join(", "))}"></div>
       <div class="full"><label>Acting notes</label><textarea id="f-acting" style="min-height:44px">${esc(c.acting_notes)}</textarea></div>
+      <h3 class="form-sec full">Models</h3>
       <div><label>Image LoRA (Flux 1)</label>${loraSelect("f-ilora", c.image_lora?.name)}</div>
       <div><label>Image LoRA strength</label><input id="f-ilora-s" type="number" step="0.05" value="${c.image_lora?.strength ?? 0.9}"></div>
       <div><label>Video LoRA (Wan 2.2, optional)</label>${loraSelect("f-vlora", c.video_lora?.name)}</div>
       <div><label>Video LoRA strength</label><input id="f-vlora-s" type="number" step="0.05" value="${c.video_lora?.strength ?? 0.8}"></div>
       <div><label>First-frame source</label>${sourceSelect("f-src", c.frame_source)}</div>
+      <h3 class="form-sec full">Voice</h3>
       <div><label>Speaking rate (words per minute)</label><input id="f-wpm" type="number" value="${c.voice?.wpm ?? 140}"></div>
       <div class="full"><label>Voice description (goes into the video prompt)</label><input id="f-voice" value="${esc(c.voice?.description)}"></div>
-      <div class="full row" style="margin-top:12px"><button class="primary" id="save">Save</button><span class="grow"></span><button class="danger" id="del">Delete character</button></div>
+      <div class="full row save-bar"><button class="primary" id="save">Save character</button><span class="grow"></span><button class="danger" id="del">Delete character…</button></div>
     </div>
     <h2>Voice sample (5 s .wav for LTX voice identity)</h2>
     <div class="card row">${c.voice?.file ? `<audio controls src="${media(c.voice.file)}"></audio>` : `<span class="muted">none</span>`}
@@ -555,7 +610,7 @@ async function viewLocation(view, sid, lid) {
       <div class="full"><label>Description (layout, materials, key objects)</label><textarea id="f-desc">${esc(l.description)}</textarea></div>
       <div class="full"><label>Time-of-day variants - one per line, "name: lighting description"</label><textarea id="f-var">${esc(kvToText(l.variants))}</textarea></div>
       <div class="full"><label>Ambient sound</label><input id="f-amb" value="${esc(l.ambience)}"></div>
-      <div class="full row" style="margin-top:12px"><button class="primary" id="save">Save</button><span class="grow"></span><button class="danger" id="del">Delete location</button></div>
+      <div class="full row save-bar"><button class="primary" id="save">Save location</button><span class="grow"></span><button class="danger" id="del">Delete location…</button></div>
     </div>
     <h2>Establishing plates</h2>
     <div class="row"><select id="p-var">${variants.map((v) => `<option>${esc(v)}</option>`).join("")}</select>
@@ -601,7 +656,7 @@ async function viewStyle(view, sid) {
       <div><label>Default video engine</label><select id="f-eng">${engineOptions(st.default_engine)}</select></div>
       <div class="full"><label>Music policy (notes)</label><input id="f-music" value="${esc(st.music_policy)}"></div>
       <div class="full"><label>Props - one per line, "id: description"</label><textarea id="f-props">${esc((d.bible.props || []).map((p) => `${p.id}: ${p.description}`).join("\n"))}</textarea></div>
-      <div class="full" style="margin-top:12px"><button class="primary" id="save">Save</button></div>
+      <div class="full row save-bar"><button class="primary" id="save">Save style</button></div>
     </div>
     <p class="muted small">Shots without any LoRA character use Z-Image automatically when the default is Flux + LoRA.</p>`;
   $("#save").onclick = async () => {
@@ -612,18 +667,70 @@ async function viewStyle(view, sid) {
 }
 
 // ── settings ────────────────────────────────────────────────────────────
+// Common options as a form; everything else stays editable as JSON under "Advanced".
+const SETTING_FIELDS = [
+  ["Connections", "Where Studio finds its helpers.", [
+    ["comfy_host", "ComfyUI address", "text", "127.0.0.1:8188"],
+    ["ollama_host", "Ollama address", "text", "http://localhost:11434"],
+    ["ffmpeg", "ffmpeg path", "text", "Leave blank to auto-detect"],
+    ["ffprobe", "ffprobe path", "text", "Leave blank to auto-detect"]]],
+  ["Planning models", "Ollama models used to plan shots and check frames.", [
+    ["planner_model", "Planner model", "model"],
+    ["vision_model", "Vision model", "model"],
+    ["vision_check", "Check frames with the vision model after rendering", "bool"]]],
+  ["Rendering", "How many candidates to make, and at what size.", [
+    ["candidates_per_shot", "First-frame candidates per render", "int", "", 1, 12],
+    ["takes_per_shot", "Takes per shot", "int", "", 1, 8],
+    ["image.width", "Image width (px)", "int", "", 64, 4096],
+    ["image.height", "Image height (px)", "int", "", 64, 4096],
+    ["video.width", "Video width (px)", "int", "", 64, 4096],
+    ["video.height", "Video height (px)", "int", "", 64, 4096],
+    ["video.fps", "Video frame rate", "int", "", 1, 120],
+    ["loudness_lufs", "Target loudness (LUFS)", "num", "", -40, 0]]],
+  ["Lip-sync", "LatentSync 1.6. Higher guidance articulates the mouth more clearly; more steps are slower for little gain.", [
+    ["lipsync.steps", "Steps", "int", "", 1, 100],
+    ["lipsync.guidance", "Guidance (1 to 3)", "num", "", 1, 3]]],
+];
+const getPath = (o, p) => p.split(".").reduce((x, k) => (x == null ? undefined : x[k]), o);
+function setPath(o, p, v) {
+  const ks = p.split("."), last = ks.pop();
+  const parent = ks.reduce((x, k) => (x[k] && typeof x[k] === "object" ? x[k] : (x[k] = {})), o);
+  parent[last] = v;
+}
 async function viewSettings(view) {
   crumbs([["Settings", null]]);
   const d = await GET("/api/settings");
+  const models = (App.status && App.status.ollama_models) || [];
+  const field = ([path, label, type, hint, min, max]) => {
+    const id = "set-" + path.replace(/\./g, "-"), v = getPath(d.effective, path);
+    if (type === "bool") return `<label class="row check full"><input type="checkbox" id="${id}" ${v ? "checked" : ""}> ${esc(label)}</label>`;
+    const attrs = type === "model" ? `list="set-models" autocomplete="off"` : type === "text" ? "" : `type="number" ${type === "int" ? 'step="1"' : 'step="any"'} min="${min}" max="${max}"`;
+    return `<div><label for="${id}">${esc(label)}</label><input id="${id}" ${attrs} value="${esc(v ?? "")}" placeholder="${esc(hint || "")}"></div>`;
+  };
   view.innerHTML = `
-    <h1>Settings</h1>
-    <p class="muted">Your overrides (JSON). Anything not listed uses the default shown on the right. Model names must match ComfyUI's lists exactly.</p>
-    <div class="form-grid"><div><label>Your overrides</label><textarea id="user" style="min-height:420px;font-family:monospace">${esc(JSON.stringify(d.user, null, 2))}</textarea>
-      <div style="margin-top:8px"><button class="primary" id="save">Save</button></div></div>
-      <div><label>Effective settings</label><pre class="prompt" style="max-height:470px;overflow:auto">${esc(JSON.stringify(d.effective, null, 2))}</pre></div></div>`;
+    <div class="page-head"><div><h1>Settings</h1><p class="sub">Saved to <code>studio_data/settings.json</code>. Changes apply to the next job.</p></div></div>
+    <datalist id="set-models">${models.map((m) => `<option value="${esc(m)}">`).join("")}</datalist>
+    ${SETTING_FIELDS.map(([title, sub, fields]) => `<div class="card form-grid"><h3 class="form-sec full">${esc(title)}</h3><p class="muted small full" style="margin:-4px 0 0">${esc(sub)}</p>${fields.map(field).join("")}</div>`).join("")}
+    <details class="card adv"><summary>Advanced: all overrides as JSON</summary>
+      <p class="muted small">Model file names, workflow options and anything not shown above. Model names must match ComfyUI's lists exactly. Fields above win over the same keys here only if you changed them.</p>
+      <div class="form-grid"><div><label for="user">Your overrides</label><textarea id="user" class="mono" spellcheck="false" style="min-height:360px">${esc(JSON.stringify(d.user, null, 2))}</textarea></div>
+      <div><label>Effective settings (read only)</label><pre class="prompt" style="max-height:392px;overflow:auto">${esc(JSON.stringify(d.effective, null, 2))}</pre></div></div></details>
+    <div class="row save-bar page-save"><button class="primary" id="save">Save settings</button><span class="muted small" id="save-note"></span></div>`;
   $("#save").onclick = async () => {
-    let obj; try { obj = JSON.parse($("#user").value || "{}"); } catch (e) { return toast("Invalid JSON: " + e.message, true); }
-    await PUT("/api/settings", obj); toast("Saved."); refreshStatus(); route();
+    let obj; try { obj = JSON.parse($("#user").value || "{}"); } catch (e) { return toast("Advanced JSON is invalid: " + e.message, true); }
+    const bad = [];
+    for (const [, , fields] of SETTING_FIELDS) for (const [path, label, type, , min, max] of fields) {
+      const el = $("#set-" + path.replace(/\./g, "-")); let v;
+      if (type === "bool") v = el.checked;
+      else if (type === "int" || type === "num") {
+        v = el.value.trim() === "" ? NaN : Number(el.value);
+        if (!Number.isFinite(v) || (type === "int" && !Number.isInteger(v)) || v < min || v > max) { bad.push(`${label}: enter ${type === "int" ? "a whole number" : "a number"} from ${min} to ${max}`); el.setAttribute("aria-invalid", "true"); continue; }
+      } else v = el.value.trim();
+      el.removeAttribute("aria-invalid");
+      if (v !== getPath(d.effective, path) && !(v === "" && getPath(d.effective, path) == null)) setPath(obj, path, v);
+    }
+    if (bad.length) return toast(bad.join("\n"), true);
+    await PUT("/api/settings", obj); App.dirty = false; toast("Settings saved."); refreshStatus(); route();
   };
 }
 
@@ -633,7 +740,7 @@ async function viewModels(view) {
   const cfg = settings.effective, face = cfg.face_correction;
   view.innerHTML = `<h1>Models</h1><h2>Video generation</h2>
     <p>Choose a model when rendering in Takes, or set a default engine in Style &amp; props.</p>
-    <div class="card">${models.map(m => `<p>${esc(m.name)}</p>`).join("")}</div>
+    <div class="card model-list">${models.map(m => { const [nm, ...rest] = String(m.name).split(" · "); return `<div class="model-row"><b>${esc(nm)}</b><span class="grow"></span>${rest.join(" · ").split(", ").filter(Boolean).map(t => `<span class="chip ${/cloud/.test(t) ? "warn" : /silent/.test(t) ? "" : "good"}">${esc(t)}</span>`).join("")}</div>`; }).join("")}</div>
     <h2>Lip-sync · local</h2><p>LatentSync 1.6 synchronizes existing shots to an uploaded music or voice recording. Optional Demucs vocal isolation separates the singing voice for guidance while keeping the full music mix in the export. Upload audio in Cut, choose the character and shots, then review the new version. Runs in ComfyUI on this PC with no paid API.</p>
     <h2>MiniMax H3 · local</h2><p>Generates video and sound on this PC through ComfyUI, with no API key or per-generation API fee. Uses quantized open weights and 4-step Turbo sampling. Local clips are at least 4 seconds; trim shorter shots in Takes. Model weight license: <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE" target="_blank" rel="noopener">MiniMax H3 Community License</a>.</p>
     <h2>MiniMax cloud (optional, paid)</h2><p>Cloud generation sends your first frame and prompt to MiniMax and uses your paid API account. Set <code>${esc(cfg.minimax.api_key_env)}</code> in the server environment, then restart Studio.</p>
@@ -667,3 +774,11 @@ setInterval(refreshStatus, 15000);
 pollJobs();
 setInterval(pollJobs, 2000);
 window.addEventListener("load", route);
+
+// Visible "unsaved changes" state (App.dirty is set by edits and cleared on save).
+(() => {
+  const chip = document.createElement("span");
+  chip.className = "chip warn dirty-chip"; chip.textContent = "Unsaved changes"; chip.hidden = true; chip.setAttribute("role", "status");
+  $("#crumbs").after(chip);
+  setInterval(() => { chip.hidden = !App.dirty; }, 400);
+})();

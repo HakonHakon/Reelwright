@@ -167,7 +167,7 @@ def test_character_reference_correction_model_settings(mobile_server):
         page.get_by_text('Local character reference files', exact=True).tap()
         page.locator('#identity-unet').fill('custom-ref2va.safetensors')
         page.locator('#save-models').tap()
-        page.get_by_text('Model settings saved.', exact=True).wait_for()
+        page.get_by_text('Model settings saved.', exact=True).first.wait_for()
         cfg = settings.load()['face_correction']
         assert cfg['model'] == 'minimax_identity'
         assert cfg['identity_unet'] == 'custom-ref2va.safetensors'
@@ -177,7 +177,7 @@ def test_character_reference_correction_model_settings(mobile_server):
         page.goto(f'{base}/#/models')
         page.locator('#face-model').select_option('qwen_identity')
         page.locator('#save-models').tap()
-        page.get_by_text('Model settings saved.', exact=True).wait_for()
+        page.get_by_text('Model settings saved.', exact=True).first.wait_for()
         page.goto(f'{base}/#/s/{sid}/e/{eid}/takes')
         assert page.locator('#face-S01_SH01').input_value() == 'qwen_identity'
         from studio import store
@@ -190,6 +190,7 @@ def test_character_reference_correction_model_settings(mobile_server):
             route.fulfill(json={'id': 'qwen-test'})
         page.route('**/frame_correction', submit)
         page.locator('[data-qwenface="0"]').tap()
+        page.wait_for_function('true'); [page.wait_for_timeout(100) for _ in range(30) if not sent]  # the request is asynchronous
         assert sent == [{'index': 0}]
         assert not errors, errors
         browser.close()

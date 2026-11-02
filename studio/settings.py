@@ -99,6 +99,9 @@ DEFAULTS = {
         "identity_lora": "h3_character_swap_v1.5.safetensors",
         "identity_turbo_lora": "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
     },
+    # LatentSync 1.6. Guidance 2.0 scored clearly better lip-sync than the upstream 1.5 on A/B tests of this project's
+    # clips (SyncNet confidence +33..72%) at the same speed; more steps cost ~60% more time for little gain.
+    "lipsync": {"steps": 20, "guidance": 2.0, "seed": 1247},
     "loudness_lufs": -16,
     "continuity": {
         "punch_in_denoise": 0.32,   # low: keep the master's face, age and clothes; only re-sharpen
@@ -181,6 +184,26 @@ def raw_user() -> dict:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
             return json.load(f)
     return {}
+
+
+def lipsync_params(cfg: dict) -> dict:
+    """The LatentSync settings, each clamped to what the ComfyUI node accepts (bad values fall back to the defaults)."""
+    import math
+    raw = (cfg or {}).get("lipsync")
+    if not isinstance(raw, dict):
+        raw = {}
+    defaults = DEFAULTS["lipsync"]
+
+    def pick(key, kind, low, high):
+        try:
+            value = kind(raw.get(key, defaults[key]))
+            if isinstance(raw.get(key), bool) or not math.isfinite(value):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            value = defaults[key]
+        return max(low, min(high, value))
+    return {"steps": pick("steps", int, 1, 100), "guidance": round(pick("guidance", float, 1.0, 3.0), 1),
+            "seed": pick("seed", int, 0, 2**32 - 1)}
 
 
 def for_episode(s: dict, episode: dict) -> dict:

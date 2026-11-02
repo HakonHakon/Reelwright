@@ -17,6 +17,19 @@ VIDEO_MODELS = [
 ]
 
 
+def engine_problem(s, engine):
+    """Why an engine cannot run on this install (a readable sentence), or "" when it can."""
+    if engine == "ltx":
+        from . import settings as settings_mod
+        template = s["ltx"]["template"]
+        path = template if os.path.isabs(template) else os.path.join(settings_mod.REPO_ROOT, template)
+        if not os.path.isfile(path):
+            return (f"LTX-2.3 is not set up: its ComfyUI workflow file is missing ({template}). "
+                    "Choose Wan 2.2 or MiniMax H3, or export your LTX image-to-video workflow from ComfyUI "
+                    "(API format) to that path.")
+    return ""
+
+
 def validate_model(engine, model=""):
     if engine not in {m["engine"] for m in VIDEO_MODELS}:
         raise ValueError(f"Unknown video engine: {engine}")

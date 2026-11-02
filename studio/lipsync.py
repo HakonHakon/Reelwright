@@ -52,7 +52,7 @@ def correct_clip(job, cfg, client, source, voice, destination, frames, width, he
     with tempfile.TemporaryDirectory(prefix='reelwright_clip_sync_') as work:
         video_name = client.upload(source, prefix + '.mp4')
         audio_name = client.upload(voice, prefix + '.wav')
-        result = client.run(workflows.lipsync_video(video_name, audio_name), cancel=lambda: job.cancel_flag)
+        result = client.run(workflows.lipsync_video(video_name, audio_name, **settings.lipsync_params(cfg)), cancel=lambda: job.cancel_flag)
         if not result['videos']:
             raise RuntimeError('Lip-sync produced no video')
         rendered = str(Path(work) / 'model.mp4')
@@ -110,7 +110,7 @@ def render(job, sid, eid, timeline, audio_file, audio_offset=0, isolate_vocals=T
                         '-t', str(clip['duration']), '-ar', '16000', '-ac', '1', str(voice)])
             video_name = client.upload(str(source), f'lipsync_{token}_{i}.mp4')
             audio_name = client.upload(str(voice), f'lipsync_{token}_{i}.wav')
-            result = client.run(workflows.lipsync_video(video_name, audio_name), cancel=lambda: job.cancel_flag)
+            result = client.run(workflows.lipsync_video(video_name, audio_name, **settings.lipsync_params(cfg)), cancel=lambda: job.cancel_flag)
             if not result['videos']:
                 raise RuntimeError(f"{clip['shot_id']}: lip-sync produced no video")
             rendered = out / f'{i:03d}_model.mp4'
@@ -132,7 +132,7 @@ def render(job, sid, eid, timeline, audio_file, audio_offset=0, isolate_vocals=T
     if abs(info['video_duration'] - duration) > 1 / fps:
         raise RuntimeError('Lip-sync changed the timeline duration; original final retained')
     job.check()
-    item = {'file': store.rel(str(final)), 'created': store.now(), 'model': 'LatentSync 1.6',
+    item = {'file': store.rel(str(final)), 'created': store.now(), 'model': 'LatentSync 1.6', 'params': settings.lipsync_params(cfg),
             'audio_file': audio_file, 'audio_offset': audio_offset, 'isolated_vocals': isolate_vocals,
             'runtime': duration, 'timeline': timeline, 'source_final': episode.get('outputs', {}).get('final')}
     (out / 'workflow_report.json').write_text(json.dumps(item, indent=2))

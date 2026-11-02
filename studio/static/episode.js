@@ -9,41 +9,77 @@ async function viewEpisode(view, sid, eid, tab) {
   const [d, e] = await Promise.all([getSeries(sid), GET(`/api/s/${sid}/e/${eid}`)]);
   const ctx = { sid, eid, d, e, base: `/api/s/${sid}/e/${eid}`, chars: d.bible.characters, locs: d.bible.locations };
   crumbs([[d.series.name, `#/s/${sid}`], [e.title, null]]);
-  const g = e.gates || {};
-  const done = { story: e.shots.length > 0 || (e.scenes || []).length > 0, shots: !!g.shots, frames: !!g.frames, animatic: !!g.animatic, takes: !!g.takes, cut: !!(e.outputs && e.outputs.final) };
-  const nDone = Object.values(done).filter(Boolean).length;
-  view.innerHTML = `
+  view.innerHTML = `<div id="ep-head"></div><div id="tab"></div>`;
+  const paintHead = () => {
+    const e = ctx.e, g = e.gates || {};
+    const done = { story: e.shots.length > 0 || (e.scenes || []).length > 0, shots: !!g.shots, frames: !!g.frames, animatic: !!g.animatic, takes: !!g.takes, cut: !!(e.outputs && e.outputs.final) };
+    const nDone = Object.values(done).filter(Boolean).length;
+    $("#ep-head").innerHTML = `
     <div class="page-head"><div class="grow"><h1>${esc(e.title)}</h1>
       <div class="row sub"><span class="chip">${e.shots.length} shots</span><span class="chip">runtime ${fmtSec(e._runtime)}</span><span class="chip">est. render ${fmtSec(e._estimate_s)} at ${e._settings.takes_per_shot} takes/shot</span><span class="chip ${nDone === 6 ? "good" : "accent"}">${nDone}/6 stages done</span></div></div></div>
-    <div class="tabs">${TABS.map(([k, label, gate], i) => `<a href="#/s/${sid}/e/${eid}/${k}" class="${k === tab ? "on" : ""} ${done[k] ? "done" : ""}"><span class="n">${done[k] ? ic("check") : i + 1}</span><span>${label.replace(/^\d+\.\s*/, "")}</span>${gate && g[gate] ? `<span class="gate chip good">approved</span>` : ""}</a>`).join("")}</div>
-    <div class="progress"><div style="width:${Math.round((nDone / 6) * 100)}%"></div></div>
-    <div id="tab"></div>`;
-  const deleteEpisode = document.createElement("button"); deleteEpisode.textContent = "Delete episode"; deleteEpisode.className = "danger";
-  $(".page-head", view).append(deleteEpisode);
-  deleteEpisode.onclick = async () => {
-    if (await ask(`Delete episode ${e.title}? Files are kept in a .deleted folder.`, "Delete", true)) {
-      await api("DELETE", ctx.base); location.hash = `#/s/${sid}`;
-    }
+    <div class="tabs">${TABS.map(([k, label, gate], i) => `<a href="#/s/${sid}/e/${eid}/${k}" class="${k === tab ? "on" : ""} ${done[k] ? "done" : ""}" ${k === tab ? 'aria-current="page"' : ""}><span class="n">${done[k] ? ic("check") : i + 1}</span><span>${label.replace(/^\d+\.\s*/, "")}</span>${gate && g[gate] ? `<span class="gate chip good">approved</span>` : ""}</a>`).join("")}</div>
+    <div class="progress"><div style="width:${Math.round((nDone / 6) * 100)}%"></div></div>`;
+    pageMenu($("#ep-head"), [["Delete episode…", async () => {
+      if (await ask(`Delete episode ${ctx.e.title}? Files are kept in a .deleted folder.`, "Delete", true)) {
+        await api("DELETE", ctx.base); location.hash = `#/s/${sid}`;
+      }
+    }, true]]);
   };
+  paintHead();
   const el = $("#tab");
   const fn = { story: tabStory, shots: tabShots, frames: tabFrames, animatic: tabAnimatic, takes: tabTakes, cut: tabCut }[tab] || tabStory;
   await fn(el, ctx);
-  if (tab === "frames" || tab === "takes") {
-    bulkSelect(tab === 'takes' ? $('#take-library', el) : el, "[data-rm]", async targets => {
+  const bulkRoot = () => (tab === "takes" ? $("#take-library", el) : el);
+  const setupBulk = () => {
+    if (tab !== "frames" && tab !== "takes") return;
+    bulkSelect(bulkRoot(), "[data-rm]", async targets => {
       const items = {};
       for (const t of targets) (items[t.dataset.shot] ||= []).push(+t.dataset.rm);
       await POST(`${ctx.base}/delete_assets`, {kind: tab === "frames" ? "frame" : "take", items});
     }, reload, tab === "frames" ? "frames" : "takes");
+  };
+  setupBulk();
+  // Soft reload: fetch the episode again and repaint only what changed. The page, the scroll position, open panels,
+  // playing videos and the timeline editor (with its undo history) stay as they are.
+  if (["frames", "takes", "animatic"].includes(tab)) {
+    let chain = Promise.resolve();
+    const run = async () => {
+      let fresh;
+      try { fresh = await GET(ctx.base); } catch { return route(); }
+      const old = ctx.e;
+      if (fresh.shots.length !== old.shots.length || fresh.shots.some((s, i) => s.id !== old.shots[i].id)) return route();  // shots added or removed
+      const changed = fresh.shots.filter((s, i) => JSON.stringify(s) !== JSON.stringify(old.shots[i])).map((s) => s.id);
+      old.shots.splice(0, old.shots.length, ...fresh.shots);  // same arrays and object, so open handlers see the new data
+      const { shots: _ignored, ...rest } = fresh; Object.assign(old, rest);
+      paintHead();
+      if (ctx.repaint) {
+        ctx.repaint(changed);
+        const root = bulkRoot();
+        if (root) { $$(".bulk-actions, .bulk-check", root).forEach((x) => x.remove()); root.classList.remove("bulk-off"); App.selecting = false; setupBulk(); }
+      }
+      $$("[data-gate]", el).forEach((b) => { b.outerHTML = gateBtn(ctx, b.dataset.gate, b.dataset.label); });
+      App.timelineEditor?.draw();
+    };
+    App.soft = () => (chain = chain.then(run, run));
   }
 }
 
-const reload = () => route();
+const reload = () => (App.soft ? App.soft() : route());
 async function setGate(ctx, gate, value) { await POST(`${ctx.base}/gate`, { gate, value }); toast(value ? "Approved." : "Gate reopened."); reload(); }
 const charName = (ctx, id) => ctx.chars[id]?.name || id;
 const selFrame = (sh) => (sh.frame.selected != null ? sh.frame.candidates[sh.frame.selected] : null);
 const gateBtn = (ctx, gate, label) => ctx.e.gates[gate]
-  ? `<button data-gate="${gate}" data-val="0">Reopen ${label}</button>`
-  : `<button class="primary" data-gate="${gate}" data-val="1">Approve ${label}</button>`;
+  ? `<button data-gate="${gate}" data-label="${esc(label)}" data-val="0">Reopen ${label}</button>`
+  : `<button class="primary" data-gate="${gate}" data-label="${esc(label)}" data-val="1">Approve ${label}</button>`;
+
+/** Replace just the cards that changed. Untouched cards keep their DOM, scroll position and playing video. */
+function repaintCards(root, ctx, ids, make) {
+  if (!root) return;
+  for (const id of ids) {
+    const shot = ctx.e.shots.find((s) => s.id === id), card = $(`[data-card="${CSS.escape(id)}"]`, root);
+    if (shot && card) card.outerHTML = make(ctx, shot);
+  }
+}
 
 // ── 1. Story ────────────────────────────────────────────────────────────
 async function tabStory(el, ctx) {
@@ -92,46 +128,49 @@ async function tabShots(el, ctx) {
     let lastScene = null;
     const sceneById = Object.fromEntries(ctx.e.scenes.map((s) => [s.id, s]));
     el.innerHTML = `
-      <div class="row" style="margin-bottom:10px"><button class="primary" id="save">Save shot list</button>
-        ${gateBtn(ctx, "shots", "shot list")}<button id="add">Add shot</button><button id="cont" title="master per scene, punch-ins for closer shots, reuse for returns to wide">Auto continuity</button>
-        <span class="muted small grow">Characters: <code>id:position:outfit</code>, comma separated. Dialogue: one <code>id: line</code> per line. Editing a duration locks it.</span></div>
-      <table class="shots"><thead><tr><th style="width:90px">Shot</th><th style="width:150px">Framing / camera</th><th style="width:170px">Where / who</th>
-        <th>Action</th><th style="width:24%">Dialogue / sound</th><th style="width:150px">Timing / source</th><th style="width:96px"></th></tr></thead><tbody>
+      <div class="toolbar"><div class="tb-group"><button class="primary" id="save">Save shot list</button><button id="add">Add shot</button></div>
+        <div class="tb-group"><button id="cont" title="master per scene, punch-ins for closer shots, reuse for returns to wide">Auto continuity</button></div>
+        <span class="grow"></span>${gateBtn(ctx, "shots", "shot list")}</div>
+      <p class="muted small" style="margin:0 0 16px">Characters: <code>id:position:outfit</code>, comma separated. Dialogue: one <code>id: line</code> per line. Editing a duration locks it.</p>
+      <div class="shot-rows">
       ${shots.map((sh, i) => {
         let head = "";
         if (sh.scene_id !== lastScene) {
           lastScene = sh.scene_id; const sc = sceneById[sh.scene_id];
-          head = `<tr class="scene-row"><td colspan="7"><b>${esc(sh.scene_id || "no scene")}</b> ${sc ? esc(sc.summary) : ""}
-            ${sc ? `<button class="link" data-replan="${esc(sc.id)}">re-plan this scene</button>` : ""}</td></tr>`;
+          head = `<div class="scene-head"><b>${esc(sh.scene_id || "no scene")}</b><span>${sc ? esc(sc.summary) : ""}</span>
+            ${sc ? `<button class="link" data-replan="${esc(sc.id)}">re-plan this scene</button>` : ""}</div>`;
         }
-        return head + `<tr>
-          <td><b>${esc(sh.id || "new")}</b>${sh._stale ? `<br><span class="chip warn">stale</span>` : ""}${sh.frame?.locked ? `<br><span class="chip good">frame locked</span>` : ""}</td>
-          <td>${sel("framing", i, sh.framing, FRAMINGS)}<input data-i="${i}" data-f="camera" value="${esc(sh.camera)}" placeholder="camera" style="margin-top:4px"></td>
-          <td>${sel("location_id", i, sh.location_id, locIds, locIds.map((l) => ctx.locs[l].name))}
-            <input data-i="${i}" data-f="time_of_day" value="${esc(sh.time_of_day)}" placeholder="time of day" style="margin-top:4px">
-            <input data-i="${i}" data-f="characters" value="${esc(charsToText(sh.characters))}" placeholder="sam:left" style="margin-top:4px"></td>
-          <td><textarea data-i="${i}" data-f="action">${esc(sh.action)}</textarea>
-            <details><summary>prompts${sh.image_prompt_override || sh.motion_prompt_override ? " (overridden)" : ""}</summary>
-              <label>Image prompt (auto)</label><pre class="prompt">${esc(sh._image_prompt)}</pre>
-              <label>Extra for image</label><input data-i="${i}" data-f="image_prompt_extra" value="${esc(sh.image_prompt_extra)}" style="width:100%">
-              <label>Motion prompt (auto, ${esc(sh._engine)})</label><pre class="prompt">${esc(sh._motion_prompt)}</pre>
-              <label>Extra for motion</label><input data-i="${i}" data-f="motion_prompt_extra" value="${esc(sh.motion_prompt_extra)}" style="width:100%">
-              <label>Full image prompt override (replaces auto)</label><textarea data-i="${i}" data-f="image_prompt_override">${esc(sh.image_prompt_override)}</textarea>
-              <label>Full motion prompt override</label><textarea data-i="${i}" data-f="motion_prompt_override">${esc(sh.motion_prompt_override)}</textarea>
-            </details></td>
-          <td><textarea data-i="${i}" data-f="dialogue">${esc(dlgToText(sh.dialogue))}</textarea><input data-i="${i}" data-f="sound" value="${esc(sh.sound)}" placeholder="sound" style="margin-top:4px"></td>
-          <td><div class="row"><input data-i="${i}" data-f="duration_s" type="number" step="0.1" value="${sh.duration_s}" style="width:70px">s
-              ${sh.duration_locked ? `<button class="link" data-unlock="${i}" title="locked - click to auto-compute">🔒</button>` : ""}</div>
-            ${sel("start_mode", i, sh.start_mode, ["new", "punch_in", "reuse", "chain"], ["new frame (master)", "punch-in from scene master", "reuse master angle", "chain: last frame of prev take"])}
-            ${sel("frame_source", i, sh.frame_source, ["", "flux_lora", "zimage", "qwen_refs", "auto", "upload"], ["source: inherit (" + sourceLabel(sh._source) + ")", "Flux + LoRA", "Z-Image", "Reference photos (Qwen Edit)", "Auto (LoRA > photos > Z-Image)", "Upload"])}
-            ${sel("engine", i, sh.engine, ["", "minimax_local", "ltx", "wan", "minimax"], ["engine: series default", "MiniMax H3 (local)", "LTX-2.3", "Wan 2.2", "MiniMax (cloud)"])}</td>
-          <td><div class="row" style="gap:2px"><button class="link" data-up="${i}" title="move up">↑</button><button class="link" data-down="${i}" title="move down">↓</button>
-            <button class="link" data-dup="${i}" title="split: duplicate below">split</button><button class="link" data-merge="${i}" title="merge with next">merge</button>
-            <button class="link danger" data-del="${i}">delete</button></div></td></tr>`;
-      }).join("")}</tbody></table>`;
-    $$("table.shots tbody tr:not(.scene-row)", el).forEach(row => {
-      [...row.children].forEach((cell, index) => { cell.dataset.label = ["Shot", "Framing / camera", "Where / who", "Action", "Dialogue / sound", "Timing / source", "Actions"][index]; });
-    });
+        const f = (label, html, cls = "") => `<div class="sr-f ${cls}"><label>${label}</label>${html}</div>`;
+        return head + `<article class="shot-row">
+          <header class="sr-head"><b class="sr-id">${esc(sh.id || "new")}</b>
+            ${sh._stale ? `<span class="chip warn">stale</span>` : ""}${sh.frame?.locked ? `<span class="chip good">frame locked</span>` : ""}
+            <span class="muted small">${fmtDur(sh.duration_s)}</span><span class="grow"></span>
+            <div class="row sr-acts"><button class="link" data-up="${i}" title="Move up" aria-label="Move shot up">↑</button><button class="link" data-down="${i}" title="Move down" aria-label="Move shot down">↓</button>
+              <button class="link" data-dup="${i}" title="Duplicate below">split</button><button class="link" data-merge="${i}" title="Merge with next">merge</button>
+              <button class="link danger" data-del="${i}">delete</button></div></header>
+          <div class="sr-grid">
+            ${f("Framing", sel("framing", i, sh.framing, FRAMINGS))}
+            ${f("Camera", `<input data-i="${i}" data-f="camera" value="${esc(sh.camera)}" placeholder="e.g. static, slow push-in">`)}
+            ${f("Location", sel("location_id", i, sh.location_id, locIds, locIds.map((l) => ctx.locs[l].name)))}
+            ${f("Time of day", `<input data-i="${i}" data-f="time_of_day" value="${esc(sh.time_of_day)}" placeholder="e.g. night">`)}
+            ${f("Characters <span class='muted small'>id:position:outfit</span>", `<input data-i="${i}" data-f="characters" value="${esc(charsToText(sh.characters))}" placeholder="sam:left">`, "span2")}
+            ${f("Action", `<textarea data-i="${i}" data-f="action" rows="3">${esc(sh.action)}</textarea>`, "span2 tall")}
+            ${f("Dialogue <span class='muted small'>one id: line per row</span>", `<textarea data-i="${i}" data-f="dialogue" rows="3">${esc(dlgToText(sh.dialogue))}</textarea>`, "span2")}
+            ${f("Sound", `<input data-i="${i}" data-f="sound" value="${esc(sh.sound)}" placeholder="sound">`, "span2")}
+            ${f(`Duration ${sh.duration_locked ? `<button class="link" data-unlock="${i}" title="Locked - click to auto-compute">🔒 locked</button>` : ""}`, `<input data-i="${i}" data-f="duration_s" type="number" step="0.1" value="${Math.round((+sh.duration_s || 0) * 100) / 100}" aria-label="Duration in seconds">`)}
+            ${f("Start", sel("start_mode", i, sh.start_mode, ["new", "punch_in", "reuse", "chain"], ["New frame (master)", "Punch-in from scene master", "Reuse master angle", "Chain: last frame of prev take"]))}
+            ${f("Frame source", sel("frame_source", i, sh.frame_source, ["", "flux_lora", "zimage", "qwen_refs", "auto", "upload"], ["Inherit (" + sourceLabel(sh._source) + ")", "Flux + LoRA", "Z-Image", "Reference photos (Qwen Edit)", "Auto (LoRA > photos > Z-Image)", "Upload"]))}
+            ${f("Video engine", sel("engine", i, sh.engine, ["", "minimax_local", "ltx", "wan", "minimax"], ["Series default", "MiniMax H3 (local)", "LTX-2.3", "Wan 2.2", "MiniMax (cloud)"]))}
+          </div>
+          <details class="sr-prompts"><summary>Prompts${sh.image_prompt_override || sh.motion_prompt_override ? " (overridden)" : ""}</summary>
+            <label>Image prompt (auto)</label><pre class="prompt">${esc(sh._image_prompt)}</pre>
+            <label>Extra for image</label><input data-i="${i}" data-f="image_prompt_extra" value="${esc(sh.image_prompt_extra)}">
+            <label>Motion prompt (auto, ${esc(sh._engine)})</label><pre class="prompt">${esc(sh._motion_prompt)}</pre>
+            <label>Extra for motion</label><input data-i="${i}" data-f="motion_prompt_extra" value="${esc(sh.motion_prompt_extra)}">
+            <label>Full image prompt override (replaces auto)</label><textarea data-i="${i}" data-f="image_prompt_override">${esc(sh.image_prompt_override)}</textarea>
+            <label>Full motion prompt override</label><textarea data-i="${i}" data-f="motion_prompt_override">${esc(sh.motion_prompt_override)}</textarea>
+          </details></article>`;
+      }).join("")}</div>`;
     bulkSelect(el, "[data-del]", async targets => {
       const indices = targets.map(t => +t.dataset.del).sort((a,b) => b-a);
       indices.forEach(i => shots.splice(i, 1)); App.dirty = true;
@@ -303,26 +342,41 @@ function checkChip(c) {
   return `<span class="chip ${cls}" title="${esc((c.check.issues || []).join("\n") || "no issues")}">check ${c.check.score}/10</span>`;
 }
 
+function framesStatus(ctx) {
+  const needs = ctx.e.shots.filter((s) => s.start_mode !== "chain" && s.frame.selected == null).length;
+  return { needs, html: `${needs ? `<span class="chip warn">${pl(needs, "shot")} without a frame</span>` : `<span class="chip good">${ic("check")} Every shot has a frame</span>`}
+      <span class="muted small">${ctx.e._settings.candidates_per_shot} candidates per render. Chained shots get their frame from the previous take in Takes.</span>` };
+}
+
 async function tabFrames(el, ctx) {
   const shots = ctx.e.shots;
   const needs = shots.filter((s) => s.start_mode !== "chain" && s.frame.selected == null).length;
   el.innerHTML = `
     ${!ctx.e.gates.shots ? `<div class="notice">The shot list isn't approved yet. You can still render frames, but edits to shots later will mark them stale.</div>` : ""}
-    <div class="card row">
-      <button class="primary" id="render-missing">Render missing frames</button>
-      <select id="src-override"><option value="">per-shot source</option><option value="flux_lora">force Flux + LoRA</option><option value="zimage">force Z-Image</option><option value="qwen_refs">force reference photos</option></select>
-      <button id="render-all">Re-render all unlocked</button><button id="vision">Vision check</button>
+    <div class="toolbar">
+      <div class="tb-group">
+        <button class="${needs ? "primary" : ""}" id="render-missing" ${needs ? "" : "disabled title=\"Every shot already has a frame\""}>Render missing frames</button>
+        <select id="src-override" aria-label="Frame source"><option value="">Per-shot source</option><option value="flux_lora">Force Flux + LoRA</option><option value="zimage">Force Z-Image</option><option value="qwen_refs">Force reference photos</option></select>
+      </div>
+      <div class="tb-group">
+        <button id="render-all">Re-render unlocked</button><button id="vision">Vision check</button>
+        <label class="btn file-pick" title="Files named by shot id, e.g. S01_SH02.png">Bulk upload…<input type="file" id="bulk" multiple accept="image/*" aria-label="Bulk upload frames named by shot id"></label>
+      </div>
       <span class="grow"></span>
-      <input type="file" id="bulk" multiple accept="image/*" title="files named by shot id, e.g. S01_SH02.png"><button id="bulk-up">Bulk upload by shot id</button>
       ${gateBtn(ctx, "frames", "frames")}
     </div>
-    <p class="muted small">${needs} shot(s) still need a selected frame. ${ctx.e._settings.candidates_per_shot} candidates per render. Chained shots get their frame from the previous take at the Takes stage.</p>
+    <p class="status-line">${framesStatus(ctx).html}</p>
     <div id="frames-list">${shots.map((sh) => frameCard(ctx, sh)).join("")}</div>`;
+  ctx.repaint = (ids) => {
+    repaintCards($("#frames-list", el), ctx, ids, frameCard);
+    const s = framesStatus(ctx), b = $("#render-missing", el);
+    $(".status-line", el).innerHTML = s.html; b.disabled = !s.needs; b.className = s.needs ? "primary" : ""; b.title = s.needs ? "" : "Every shot already has a frame";
+  };
   $("#render-missing").onclick = () => startJob(`${ctx.base}/frames`, { source: $("#src-override").value });
   $("#render-all").onclick = async () => { if (await ask("Render new candidates for every unlocked shot?", "Render")) startJob(`${ctx.base}/frames`, { force: true, source: $("#src-override").value, shot_ids: shots.filter((s) => !s.frame.locked).map((s) => s.id) }); };
   $("#vision").onclick = () => startJob(`${ctx.base}/vision`, {});
-  $("#bulk-up").onclick = async () => {
-    const files = $("#bulk").files; if (!files.length) return toast("Choose files first", true);
+  $("#bulk").onchange = async () => {
+    const files = $("#bulk").files; if (!files.length) return;
     const fd = new FormData(); [...files].forEach((f) => fd.append("files", f));
     const r = await FORM(`${ctx.base}/bulk_upload`, fd);
     toast(`Matched ${r.matched.length}${r.skipped.length ? `, skipped ${r.skipped.join(", ")}` : ""}`); reload();
@@ -352,8 +406,8 @@ function frameCard(ctx, sh) {
   const who = (sh.characters || []).map((c) => esc(charName(ctx, c.id) + (c.position ? ` (${c.position})` : ""))).join(", ");
   const cands = sh.frame.candidates || [];
   const chained = sh.start_mode === "chain";
-  return `<div class="shot-card ${sh.frame.locked ? "locked" : ""}">
-    <div class="shot-head"><span class="id">${esc(sh.id)}</span><span class="muted">${esc(sh.framing)} · ${who || "no characters"} · ${sh.duration_s}s</span>
+  return `<div class="shot-card ${sh.frame.locked ? "locked" : ""}" data-card="${esc(sh.id)}">
+    <div class="shot-head"><span class="id">${esc(sh.id)}</span><span class="muted">${esc(sh.framing)} · ${who || "no characters"} · ${fmtDur(sh.duration_s)}</span>
       <span class="chip accent">${sourceLabel(sh._source)}</span>${sh._loras.length ? `<span class="chip" title="${esc(sh._loras.map((l) => l.name + " @" + l.strength).join("\n"))}">${sh._loras.length} LoRA</span>` : ""}
       ${sh._stale ? `<span class="chip warn" title="bible changed since these frames were made">stale</span>` : ""}
       ${sh.frame.locked ? `<span class="chip good">locked</span>` : ""}<span class="grow"></span>
@@ -372,11 +426,12 @@ function frameCard(ctx, sh) {
       <div class="frame"><img src="${media(c.file)}" data-zoom="${media(c.file)}" loading="lazy"></div>
       <div class="meta"><span class="code">${esc(sh.id)}/${String.fromCharCode(65 + k)}</span>${sh.frame.selected === k ? `<span class="pick">picked</span>` : ""}<span>${sourceLabel(c.source)}${c.plate ? ", on location plate" : ""}</span> ${checkChip(c)}</div>
       <div class="acts">${sh.frame.selected === k ? ""  : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
-        <button data-qwenface="${k}" data-shot="${sh.id}" title="Correct this frame using the uploaded character portrait">Correct face · Qwen</button>
-        <button data-refine="flux_lora" data-idx="${k}" data-shot="${sh.id}" title="img2img with the character LoRA">Refine Flux</button>
-        <button data-refine="zimage" data-idx="${k}" data-shot="${sh.id}" title="img2img to match style">Refine Z</button>
-        <button data-asend="${esc(c.file)}" data-shot="${sh.id}" title="use as this shot's end frame">as end</button>
-        <button class="danger" data-rm="${k}" data-shot="${sh.id}">✕</button></div></div>`).join("") || `<p class="muted" style="padding:20px">No candidates yet.</p>`}</div></div></div>`;
+        <button data-qwenface="${k}" data-shot="${sh.id}" title="Correct this frame using the uploaded character portrait">Correct face</button>
+        <details class="cand-more"><summary aria-label="More actions for ${esc(sh.id)}/${String.fromCharCode(65 + k)}">More</summary><div class="cand-pop">
+          <button data-refine="flux_lora" data-idx="${k}" data-shot="${sh.id}" title="img2img with the character LoRA">Refine with Flux + LoRA</button>
+          <button data-refine="zimage" data-idx="${k}" data-shot="${sh.id}" title="img2img to match style">Refine with Z-Image</button>
+          <button data-asend="${esc(c.file)}" data-shot="${sh.id}">Use as end frame</button></div></details>
+        <button class="danger" data-rm="${k}" data-shot="${sh.id}" aria-label="Delete candidate ${String.fromCharCode(65 + k)}" title="Delete">✕</button></div></div>`).join("") || `<p class="muted" style="padding:20px">No candidates yet.</p>`}</div></div></div>`;
 }
 
 // ── 4. Animatic ─────────────────────────────────────────────────────────
@@ -394,13 +449,13 @@ async function tabAnimatic(el, ctx) {
       <button id="export">Export animatic.mp4</button>${ctx.e.outputs?.animatic ? `<a href="${media(ctx.e.outputs.animatic)}" target="_blank">open animatic.mp4</a>` : ""}
       ${gateBtn(ctx, "animatic", "pacing")}</div>
     <div class="player"><img id="pimg"><div class="tag" id="ptag"></div><div class="cap" id="pcap"></div></div>
-    <div class="timeline" id="tl">${items.map((it, k) => `<div data-k="${k}" style="flex:${it.dur}" title="${esc(it.id)} ${it.dur}s">${esc(it.id)}</div>`).join("")}</div>
+    <div class="timeline" id="tl">${items.map((it, k) => `<div data-k="${k}" style="flex:${it.dur}" title="${esc(it.id)} ${fmtDur(it.dur)}">${esc(it.id)}</div>`).join("")}</div>
     <p class="muted small">Change durations in the Shot list tab (editing a duration locks it).</p>`;
   let k = 0, timer = null, playing = false;
   const show = (i) => {
     k = i; const it = items[i]; if (!it) return;
     $("#pimg").src = it.src || ""; $("#pimg").style.visibility = it.src ? "visible" : "hidden";
-    $("#ptag").textContent = `${it.id} · ${it.dur}s${it.missing ? " · no frame" : ""}`;
+    $("#ptag").textContent = `${it.id} · ${fmtDur(it.dur)}${it.missing ? " · no frame" : ""}`;
     $("#pcap").textContent = $("#showact").checked && it.action ? `${it.cap ? it.cap + "\n" : ""}[${it.action}]` : it.cap;
     $$("#tl div").forEach((d, j) => d.classList.toggle("on", j === i));
   };
@@ -424,18 +479,60 @@ async function tabTakes(el, ctx) {
     <details class="take-library-panel"><summary>Take library &amp; batch generation</summary>
     <div class="card row">
       <label class="row" style="margin:0">takes per shot <input id="ntakes" type="number" min="1" max="8" value="${ctx.e._settings.takes_per_shot}" style="width:60px"></label>
-      <label>Video model <select id="take-model"><option value="">Per-shot / project default</option>${models.map(m => `<option value="${esc(m.id)}" data-engine="${m.engine}">${esc(m.name)}</option>`).join("")}</select></label>
+      <label>Video model <select id="take-model"><option value="">Per-shot / project default</option>${models.map(m => `<option value="${esc(m.id)}" data-engine="${m.engine}" ${m.available === false ? `disabled title="${esc(m.note)}"` : ""}>${esc(m.name)}${m.available === false ? " (not installed)" : ""}</option>`).join("")}</select></label>
       <button class="primary" id="render-missing">Render shots without takes</button>
-      <button id="render-checked">Render checked shots</button>
-      <span class="muted small grow">Measured speed: ${Object.entries(spf).map(([k, v]) => `${k} ${v} s/frame`).join(", ") || "not measured yet"} · est. ${fmtSec(ctx.e._estimate_s)} for all</span>
+      <label class="row small check-all" style="margin:0"><input type="checkbox" id="chk-all" data-chk-all aria-label="Select all shots for batch render"> All shots</label>
+      <button id="render-checked" title="Render only the shots ticked on their cards">Render checked shots</button>
+      <span class="grow"></span>
+      <button class="danger" id="delete-checked" disabled title="Remove the takes of the ticked shots from their cards. The video files stay on disk.">Delete checked</button>
+      <button class="danger" id="delete-all" title="Remove every take from every shot. The video files stay on disk.">Delete all takes</button>
       ${gateBtn(ctx, "takes", "takes")}
+      <p class="muted small" style="flex-basis:100%;margin:2px 0 0">Measured speed: ${Object.entries(spf).map(([k, v]) => `${k} ${v} s/frame`).join(", ") || "not measured yet"} · est. ${fmtSec(ctx.e._estimate_s)} for all</p>
     </div>
     <h2>Take library</h2><p class="muted small">Generate candidates here, then add them to the timeline or replace its selected clip. Library picks and source files stay available.</p>
     <div id="take-library">${shots.map((sh) => takeCard(ctx, sh)).join("")}</div></details>`;
+  // "All shots" ticks every shot card; the button shows how many are ticked. Ticks survive in-place updates of the cards.
+  const boxes = () => $$("input[data-chk]", el);
+  const refreshChecks = () => {
+    const all = $("#chk-all", el), count = boxes().filter((b) => b.checked).length;
+    all.checked = count > 0 && count === boxes().length; all.indeterminate = count > 0 && count < boxes().length;
+    $("#render-checked", el).textContent = count ? `Render checked shots (${count})` : "Render checked shots";
+    const del = $("#delete-checked", el); del.disabled = !count; del.textContent = count ? `Delete checked (${count})` : "Delete checked";
+  };
+  $("#chk-all", el).onchange = (ev) => { boxes().forEach((b) => { b.checked = ev.target.checked; }); refreshChecks(); };
+  el.addEventListener("change", (ev) => { if (ev.target.matches("input[data-chk]")) refreshChecks(); });
+  // Delete takes of the ticked shots, or of all shots. Locked shots are skipped. Only the lists change: the files stay on disk.
+  const deleteTakes = async (ids) => {
+    const items = {}; let takes = 0, locked = 0;
+    for (const sh of ctx.e.shots) {
+      if (ids && !ids.includes(sh.id)) continue;
+      const count = (sh.takes.items || []).length;
+      if (!count) continue;
+      if (sh.takes.locked) { locked++; continue; }
+      items[sh.id] = [...Array(count).keys()]; takes += count;
+    }
+    const shotCount = Object.keys(items).length;
+    if (!takes) return toast(locked ? `${pl(locked, "shot")} with takes ${locked === 1 ? "is" : "are"} locked. Unlock ${locked === 1 ? "it" : "them"} first.` : "There are no takes to delete.", true);
+    const note = locked ? ` ${pl(locked, "locked shot")} will be skipped.` : "";
+    if (!(await ask(`Delete ${pl(takes, "take")} from ${pl(shotCount, "shot")}? The video files stay on disk, but the shots lose these takes, the Takes approval is reopened, and the rendered films listed in Cut are cleared (you can render again).${note}`, `Delete ${pl(takes, "take")}`, true))) return;
+    try {
+      await POST(`${ctx.base}/delete_assets`, { kind: "take", items });
+      boxes().forEach((b) => { b.checked = false; }); refreshChecks();
+      toast(`Deleted ${pl(takes, "take")}.`); await reload();
+    } catch { /* the server's reason is already shown */ }
+  };
+  $("#delete-checked", el).onclick = () => deleteTakes($$("input[data-chk]:checked", el).map((x) => x.dataset.chk));
+  $("#delete-all", el).onclick = () => deleteTakes(null);
   const n = () => parseInt($("#ntakes").value) || 1;
   const modelChoice = () => {
     const option = $("#take-model").selectedOptions[0];
     return { engine: option.dataset.engine || "", model: option.value };
+  };
+  ctx.repaint = (ids) => {
+    const ticked = new Set($$("input[data-chk]:checked", el).map((b) => b.dataset.chk));
+    repaintCards($("#take-library", el), ctx, ids, takeCard);
+    $$("input[data-chk]", el).forEach((b) => { b.checked = ticked.has(b.dataset.chk); });
+    refreshChecks();  // the "All shots" state and the count follow the restored ticks
   };
   const editor = await mountTakeTimeline($("#take-timeline"), ctx, shotId =>
     startJob(`${ctx.base}/takes`, {shot_ids: [shotId], takes: n(), force: true, ...modelChoice()}));
@@ -466,15 +563,17 @@ async function tabTakes(el, ctx) {
 function takeCard(ctx, sh) {
   const f = selFrame(sh);
   const items = sh.takes.items || [];
-  return `<div class="shot-card ${sh.takes.locked ? "locked" : ""}">
-    <div class="shot-head"><input type="checkbox" data-chk="${sh.id}"><span class="id">${esc(sh.id)}</span>
-      <span class="chip accent">${esc(sh._engine)}</span><span class="muted">${sh.duration_s}s · ${esc(sh.start_mode)}</span>
+  return `<div class="shot-card ${sh.takes.locked ? "locked" : ""}" data-card="${esc(sh.id)}">
+    <div class="shot-head"><input type="checkbox" data-chk="${sh.id}" aria-label="Select ${esc(sh.id)} for batch render" title="Select for batch render"><span class="id">${esc(sh.id)}</span>
+      <span class="chip accent">${esc(sh._engine)}</span><span class="muted">${fmtDur(sh.duration_s)} · ${esc(sh.start_mode)}</span>
       ${f ? `<img src="${media(f.file)}" style="height:40px;border-radius:4px" data-zoom="${media(f.file)}">` : sh.start_mode === "chain" ? `<span class="chip">frame from previous take</span>` : `<span class="chip bad">no frame</span>`}
       ${sh.end_frame ? `<span class="chip">end frame</span>` : ""}<span class="grow"></span>
-      <select id="face-${sh.id}" aria-label="Face correction model"><option value="qwen_identity" ${ctx.e._settings.face_model === "qwen_identity" ? "selected" : ""}>Qwen Image Edit · every frame</option><option value="minimax_identity" ${ctx.e._settings.face_model === "minimax_identity" ? "selected" : ""}>Match character references · MiniMax H3</option><option value="keep" ${ctx.e._settings.face_model === "keep" ? "selected" : ""}>KEEP (main face, temporal)</option><option value="codeformer" ${ctx.e._settings.face_model === "codeformer" ? "selected" : ""}>CodeFormer (all faces)</option></select>
       <button data-more="1" data-shot="${sh.id}">Render more takes</button>
-      <button data-next="1" data-shot="${sh.id}" title="extract the last frame of the selected take as the next shot's first frame">Last frame → next shot</button>
-      <button data-lock="${sh.takes.locked ? 0 : 1}" data-shot="${sh.id}">${sh.takes.locked ? "Unlock" : "Lock"}</button></div>
+      <button data-lock="${sh.takes.locked ? 0 : 1}" data-shot="${sh.id}">${sh.takes.locked ? "Unlock" : "Lock"}</button>
+      <details class="more-menu"><summary class="icon-btn" aria-label="More actions for ${esc(sh.id)}" title="More actions">${ic("dots")}</summary><div class="more-pop">
+        <label for="face-${sh.id}" style="margin:6px 8px 2px">Face correction model</label>
+        <select id="face-${sh.id}" style="margin:0 8px 6px;width:calc(100% - 16px)" aria-label="Face correction model"><option value="qwen_identity" ${ctx.e._settings.face_model === "qwen_identity" ? "selected" : ""}>Qwen Image Edit · every frame</option><option value="minimax_identity" ${ctx.e._settings.face_model === "minimax_identity" ? "selected" : ""}>Match character references · MiniMax H3</option><option value="keep" ${ctx.e._settings.face_model === "keep" ? "selected" : ""}>KEEP (main face, temporal)</option><option value="codeformer" ${ctx.e._settings.face_model === "codeformer" ? "selected" : ""}>CodeFormer (all faces)</option></select>
+        <button data-next="1" data-shot="${sh.id}" title="Extract the last frame of the selected take as the next shot's first frame">Last frame → next shot's first frame</button></div></details></div>
     <details><summary>motion prompt</summary><pre class="prompt">${esc(sh._motion_prompt)}</pre></details>
     <div class="cands"><div class="cands-in">${items.map((t, k) => `<div class="cand ${sh.takes.selected === k || (sh.takes.selected == null && k === 0) ? "sel" : ""}">
       <div class="frame"><video playsinline preload="none" controls ${t.first_frame || f?.file ? `poster="${media(t.first_frame || f.file)}"` : ''} src="${media(t.file)}"></video></div>

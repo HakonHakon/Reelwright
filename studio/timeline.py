@@ -6,13 +6,22 @@ import math
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import uuid
 
-from . import media, settings, store, workflows
+import re
+
+from . import media, settings, store, titles as titles_mod, workflows
 
 
 class EditConflict(ValueError):
     pass
+
+
+MARKER_COLORS = ('red', 'orange', 'yellow', 'green', 'blue', 'purple')
+MAX_MARKERS = 500
+MAX_TITLES = 200
+MAX_FRAME = 10_000_000
 
 
 def assets(episode):
@@ -45,6 +54,38 @@ def source_info(episode, file, cfg, audio=False):
     return info
 
 
+_THUMBS = threading.BoundedSemaphore(3)
+
+
+def thumbnail(sid, eid, episode, file, seconds, height, cfg):
+    """One cached JPEG frame of a timeline source, for the clips' filmstrips."""
+    if not isinstance(file, str) or file not in assets(episode):
+        raise ValueError('Choose media from this episode')
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
+        raise ValueError('Choose a time inside the video')
+    path = Path(store.abs_media(file))
+    if not path.is_file():
+        raise ValueError('Source media is missing; replace or remove this clip')
+    height = max(32, min(256, int(height)))
+    seconds = round(seconds * 25) / 25
+    stat = path.stat()
+    key = hashlib.sha1(f'{file}|{stat.st_mtime_ns}|{stat.st_size}|{seconds:.2f}|{height}'.encode()).hexdigest()[:24]
+    folder = Path(store.ep_dir(sid, eid)) / 'out' / 'thumbs'
+    target = folder / f'{key}.jpg'
+    if not target.is_file():
+        folder.mkdir(parents=True, exist_ok=True)
+        with _THUMBS:  # keep a burst of tiles from starting dozens of ffmpeg processes
+            if not target.is_file():
+                partial = folder / f'{key}.part.jpg'
+                media._run([cfg['ffmpeg'], '-y', '-v', 'error', '-ss', f'{seconds:.3f}', '-i', str(path),
+                            '-frames:v', '1', '-vf', f'scale=-2:{height}', '-q:v', '5', str(partial)])
+                if not partial.is_file() or not partial.stat().st_size:
+                    partial.unlink(missing_ok=True)
+                    raise media.MediaError('There is no frame at that time')
+                partial.replace(target)
+    return target
+
+
 def default_edit(episode, cfg, selected_takes=False):
     fps = settings.for_episode(cfg, episode)['video']['fps']
     clips = []
@@ -54,7 +95,7 @@ def default_edit(episode, cfg, selected_takes=False):
         for i, c in enumerate(selected_version['timeline']):
             clips.append({'id': f'clip_{i}', 'shot_id': c['shot_id'], 'source': selected_version['file'],
                           'source_in': c['start'], 'frames': round(c['duration'] * fps),
-                          'muted': True, 'volume': 1, 'lipsync': False})
+                          'muted': True, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1})
     else:
         for sh in sorted(episode['shots'], key=lambda x: x['order']):
             items = sh['takes'].get('items', [])
@@ -71,7 +112,7 @@ def default_edit(episode, cfg, selected_takes=False):
             duration -= tin + float(sh['takes'].get('trim_out') or 0)
             clips.append({'id': 'clip_' + sh['id'], 'shot_id': sh['id'], 'source': take['file'],
                           'source_in': tin, 'frames': max(1, round(duration * fps)),
-                          'muted': False, 'volume': 1, 'lipsync': False})
+                          'muted': False, 'volume': 1, 'lipsync': False, 'fade_in': 0, 'fade_out': 0, 'speed': 1})
     music = None
     m = episode.get('music') or {}
     if m.get('file'):
@@ -83,12 +124,17 @@ def default_edit(episode, cfg, selected_takes=False):
         except (ValueError, media.MediaError):
             pass
     return {'schema_version': 1, 'revision': episode.get('timeline', {}).get('revision', 0),
-            'fps': fps, 'clips': clips, 'music': music}
+            'fps': fps, 'clips': clips, 'music': music, 'markers': [], 'range': None, 'titles': []}
 
 
 def view(episode, cfg):
     edit = copy.deepcopy(episode.get('timeline') or default_edit(episode, cfg))
     edit = retime(edit, settings.for_episode(cfg, episode)['video']['fps'])
+    for clip in edit['clips']:  # timelines saved before fades existed
+        clip.setdefault('fade_in', 0); clip.setdefault('fade_out', 0); clip.setdefault('speed', 1)
+    edit.setdefault('markers', [])  # timelines saved before markers and ranges existed
+    edit.setdefault('range', None)
+    edit.setdefault('titles', [])
     sources = {}
     for c in edit['clips']:
         if c['source'] in sources:
@@ -111,11 +157,36 @@ def retime(edit, fps):
         edit = copy.deepcopy(edit)
         for clip in edit['clips']:
             clip['frames'] = max(1, round(number(clip['frames'], 'Clip length', 1) * fps / old))
+            fade_in = min(clip['frames'], round(number(clip.get('fade_in', 0), 'Fade in') * fps / old))
+            clip['fade_in'] = fade_in
+            clip['fade_out'] = min(clip['frames'] - fade_in, round(number(clip.get('fade_out', 0), 'Fade out') * fps / old))
         if edit.get('music'):
             edit['music']['start_frame'] = round(number(edit['music']['start_frame'], 'Music position') * fps / old)
             edit['music']['frames'] = max(1, round(number(edit['music']['frames'], 'Music length', 1) * fps / old))
+        for marker in edit.get('markers') or []:
+            marker['frame'] = round(number(marker['frame'], 'Marker position') * fps / old)
+        for title in edit.get('titles') or []:
+            title['start_frame'] = round(number(title['start_frame'], 'Title start') * fps / old)
+            title['frames'] = max(1, round(number(title['frames'], 'Title length', 1) * fps / old))
+        if edit.get('range'):
+            start = round(number(edit['range']['start'], 'Range start') * fps / old)
+            edit['range'] = {'start': start, 'end': max(start + 1, round(number(edit['range']['end'], 'Range end') * fps / old))}
     edit['fps'] = fps
     return edit
+
+
+MIN_SPEED, MAX_SPEED = 0.25, 4
+
+
+def atempo(speed):
+    """An ffmpeg audio filter chain that plays audio `speed` times faster (each atempo factor must be 0.5..2)."""
+    chain = []
+    while speed > 2:
+        chain.append('atempo=2'); speed /= 2
+    while speed < 0.5:
+        chain.append('atempo=0.5'); speed /= 0.5
+    chain.append(f'atempo={speed:.8f}')
+    return ','.join(chain)
 
 
 def number(value, name, minimum=0, maximum=None):
@@ -130,6 +201,69 @@ def flag(value, name):
     if type(value) is not bool:
         raise ValueError(f'{name} must be on or off')
     return value
+
+
+def parse_markers(value):
+    """Named, coloured points on the timeline. They never move or change the picture."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_MARKERS:
+        raise ValueError(f'Markers must be a list of at most {MAX_MARKERS}')
+    out, seen = [], set()
+    for m in value:
+        if not isinstance(m, dict) or not isinstance(m.get('id'), str) or not 0 < len(m['id']) <= 64 or m['id'] in seen:
+            raise ValueError('Each marker needs a unique id')
+        seen.add(m['id'])
+        frame = number(m.get('frame'), 'Marker position', 0, MAX_FRAME)
+        label, color = m.get('label', ''), m.get('color', 'blue')
+        if type(frame) is not int:
+            raise ValueError('A marker must sit on a whole frame')
+        if not isinstance(label, str) or len(label) > 80:
+            raise ValueError('Marker names are at most 80 characters')
+        if color not in MARKER_COLORS:
+            raise ValueError('Choose a marker colour from the list')
+        out.append({'id': m['id'], 'frame': frame, 'label': label.strip(), 'color': color})
+    return sorted(out, key=lambda m: (m['frame'], m['id']))
+
+
+def parse_titles(value):
+    """Text drawn over the picture for a span of the timeline (position and size relative to the frame)."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_TITLES:
+        raise ValueError(f'Titles must be a list of at most {MAX_TITLES}')
+    out, seen = [], set()
+    for t in value:
+        if not isinstance(t, dict) or not isinstance(t.get('id'), str) or not 0 < len(t['id']) <= 64 or t['id'] in seen:
+            raise ValueError('Each title needs a unique id')
+        seen.add(t['id'])
+        text = t.get('text')
+        if not isinstance(text, str) or not 0 < len(text.strip()) <= 200 or any(ord(ch) < 32 and ch != '\n' for ch in text):
+            raise ValueError('A title needs 1 to 200 characters of text')
+        start, frames = number(t.get('start_frame'), 'Title start', 0, MAX_FRAME), number(t.get('frames'), 'Title length', 1, MAX_FRAME)
+        if type(start) is not int or type(frames) is not int:
+            raise ValueError('Title timing must be whole frames')
+        color = t.get('color', '#ffffff')
+        if not isinstance(color, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}', color):
+            raise ValueError('Choose a title colour like #ffffff')
+        out.append({'id': t['id'], 'text': text.strip(), 'start_frame': start, 'frames': frames,
+                    'x': float(number(t.get('x', .5), 'Title position', 0, 1)), 'y': float(number(t.get('y', .85), 'Title position', 0, 1)),
+                    'size': float(number(t.get('size', .06), 'Title size', .02, .3)), 'color': color.lower(),
+                    'box': flag(t.get('box', True), 'Title box')})
+    return sorted(out, key=lambda x: (x['start_frame'], x['id']))
+
+
+def parse_range(value):
+    """The In/Out span used by "Render range". Clamped to the timeline when rendering."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError('The render range needs a start and an end')
+    start = number(value.get('start'), 'Range start', 0, MAX_FRAME)
+    end = number(value.get('end'), 'Range end', 1, MAX_FRAME)
+    if type(start) is not int or type(end) is not int or end <= start:
+        raise ValueError('The render range must end after it starts')
+    return {'start': start, 'end': end}
 
 
 def validate(episode, body, cfg):
@@ -148,15 +282,23 @@ def validate(episode, body, cfg):
             probes[file] = source_info(episode, file, cfg)
         start = round(number(c.get('source_in', 0), 'Clip start') * fps)
         frames = number(c.get('frames'), 'Clip length', 1)
-        if type(frames) is not int or start + frames > round(probes[file]['video_duration'] * fps):
+        speed = number(c.get('speed', 1), 'Clip speed', MIN_SPEED, MAX_SPEED)
+        # a clip at speed s uses frames * s frames of its source
+        if type(frames) is not int or start + round(frames * speed) > round(probes[file]['video_duration'] * fps):
             raise ValueError('Clip trim extends beyond its source video')
         shot_id = c.get('shot_id') if c.get('shot_id') in shots else None
         sync = flag(c.get('lipsync', False), 'Lip-sync')
         if sync and (not shot_id or len(shots[shot_id].get('characters', [])) != 1):
             raise ValueError('Lip-sync clips must belong to a single-character shot')
+        if sync and speed != 1:
+            raise ValueError('Lip-sync clips must play at normal speed')
+        fade_in, fade_out = number(c.get('fade_in', 0), 'Fade in'), number(c.get('fade_out', 0), 'Fade out')
+        if type(fade_in) is not int or type(fade_out) is not int or fade_in + fade_out > frames:
+            raise ValueError('Fades must be whole frames and fit inside the clip')
         clips.append({'id': c['id'], 'shot_id': shot_id, 'source': file, 'source_in': start / fps,
                       'frames': frames, 'muted': flag(c.get('muted', False), 'Clip mute'),
-                      'volume': number(c.get('volume', 1), 'Clip volume', 0, 2), 'lipsync': sync})
+                      'volume': number(c.get('volume', 1), 'Clip volume', 0, 2), 'lipsync': sync,
+                      'fade_in': fade_in, 'fade_out': fade_out, 'speed': speed})
     music = body.get('music')
     if music is not None:
         if not isinstance(music, dict):
@@ -176,7 +318,9 @@ def validate(episode, body, cfg):
     if any(c['lipsync'] for c in clips) and not music:
         raise ValueError('Add a music or voice track before enabling lip-sync')
     return {'schema_version': 1, 'revision': episode.get('timeline', {}).get('revision', 0),
-            'fps': fps, 'clips': clips, 'music': music}
+            'fps': fps, 'clips': clips, 'music': music,
+            'markers': parse_markers(body.get('markers')), 'range': parse_range(body.get('range')),
+            'titles': parse_titles(body.get('titles'))}
 
 
 def save(sid, eid, body, cfg):
@@ -232,25 +376,48 @@ def prepare_music(job, cfg, music, frames, fps, out, guide=False):
     return destination
 
 
-def render(job, sid, eid, edit, video):
+def slice_clips(clips, first, last, fps):
+    """The part of the picture between two timeline frames, as ordinary clips (lip-sync is not applied)."""
+    out, position = [], 0
+    for c in clips:
+        start, end = position, position + c['frames']
+        position = end
+        lo, hi = max(start, first), min(end, last)
+        if lo < hi:
+            # a fade belongs to its clip edge: keep it only if that edge is inside the range
+            out.append({**c, 'source_in': c['source_in'] + (lo - start) / fps * c.get('speed', 1), 'frames': hi - lo, 'lipsync': False,
+                        'fade_in': c.get('fade_in', 0) if lo == start else 0, 'fade_out': c.get('fade_out', 0) if hi == end else 0})
+    return out
+
+
+def render(job, sid, eid, edit, video, window=None):
+    """Render the whole timeline, or with `window=(first, last)` only that range as a quick preview.
+
+    A preview never replaces the current final film, and it skips lip-sync so it never needs the GPU."""
     from . import jobs, comfy, lipsync
     cfg = settings.load()
     episode = store.get_episode(sid, eid)
     cfg['video'] = video
     fps, width, height = [video[k] for k in ('fps', 'width', 'height')]
-    total = sum(c['frames'] for c in edit['clips'])
-    if not total:
+    full = sum(c['frames'] for c in edit['clips'])
+    if not full:
         raise ValueError('Add clips to the timeline before rendering')
-    out = Path(store.ep_dir(sid, eid)) / 'out' / ('timeline_' + uuid.uuid4().hex)
+    first, last = window if window else (0, full)
+    if not 0 <= first < last <= full:
+        raise ValueError('The render range is outside the timeline')
+    clips_in = slice_clips(edit['clips'], first, last, fps) if window else edit['clips']
+    total = last - first
+    out = Path(store.ep_dir(sid, eid)) / 'out' / (('preview_' if window else 'timeline_') + uuid.uuid4().hex)
     out.mkdir(parents=True)
-    (out / 'edit.json').write_text(json.dumps(edit, indent=2))
-    sync = any(c['lipsync'] for c in edit['clips'])
+    (out / 'edit.json').write_text(json.dumps({**edit, 'render_window': [first, last]} if window else edit, indent=2))
+    skipped_sync = bool(window) and any(c['lipsync'] for c in edit['clips'])
+    sync = not window and any(c['lipsync'] for c in edit['clips'])
     guide = None
     client = None
     if sync:
         client = comfy.Comfy(cfg['comfy_host'])
         jobs._gpu_prepare(job, cfg, client)
-        guide = prepare_music(job, cfg, edit['music'], total, fps, out, guide=True)
+        guide = prepare_music(job, cfg, edit['music'], full, fps, out, guide=True)
         if edit['music']['isolate_vocals']:
             job.say('Isolating vocals for the edited timeline')
             uploaded = client.upload(str(guide), out.name + '_guide.wav')
@@ -259,23 +426,26 @@ def render(job, sid, eid, edit, video):
                 raise RuntimeError('Vocal isolation produced no audio')
             guide = out / 'vocals.flac'
             client.download(result['audios'][0], str(guide))
-    music = prepare_music(job, cfg, edit.get('music'), total, fps, out)
+    music = prepare_music(job, cfg, edit.get('music'), full, fps, out)
     cache = Path(store.ep_dir(sid, eid)) / 'out' / 'timeline_cache'
     cache.mkdir(exist_ok=True)
     clips, events, position = [], [], 0
-    for i, c in enumerate(edit['clips']):
+    for i, c in enumerate(clips_in):
         job.check()
         source = store.abs_media(c['source'])
         info = media.probe(cfg['ffprobe'], source)
         duration = c['frames'] / fps
+        speed = c.get('speed', 1)
         base = out / f'{i:04d}_source.mp4'
         command = [cfg['ffmpeg'], '-y', '-v', 'error', '-ss', str(c['source_in']), '-i', source]
         if not info['has_audio']:
             command += ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']
+        # start_time=0 keeps the first frame when a trim lands between the source's own frames
+        # (e.g. a 24 fps take on a 30 fps timeline); otherwise the clip comes out one frame short.
         command += ['-map', '0:v:0', '-map', '0:a:0' if info['has_audio'] else '1:a:0',
                     '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
-                    f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps},tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
-                    '-af', f'aresample=48000,apad,atrim=end_sample={round(duration*48000)}',
+                    f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2' + (f',setpts=PTS/{speed:.8f}' if speed != 1 else '') + f',fps={fps}:start_time=0,tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                    '-af', (atempo(speed) + ',' if speed != 1 else '') + f'aresample=48000,apad,atrim=end_sample={round(duration*48000)}',
                     '-frames:v', str(c['frames']), '-t', str(duration), '-c:v', 'libx264', '-crf', '16',
                     '-c:a', 'aac', '-b:a', '256k', str(base)]
         run(job, command)
@@ -285,7 +455,8 @@ def render(job, sid, eid, edit, video):
             run(job, [cfg['ffmpeg'], '-y', '-v', 'error', '-ss', str(position/fps), '-i', str(guide),
                       '-t', str(duration), '-ar', '16000', '-ac', '1', str(voice)])
             fingerprint = [source, Path(source).stat().st_mtime_ns, Path(source).stat().st_size,
-                           c['source_in'], c['frames'], video, hashlib.sha256(voice.read_bytes()).hexdigest(), 'LatentSync1.6-20-1.5-1247']
+                           c['source_in'], c['frames'], video, hashlib.sha256(voice.read_bytes()).hexdigest(),
+                           'LatentSync1.6-{steps}-{guidance}-{seed}'.format(**settings.lipsync_params(cfg))]
             key = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
             picture = cache / (key + '.mp4')
             if not picture.is_file():
@@ -304,22 +475,36 @@ def render(job, sid, eid, edit, video):
         clips.append(clip)
         events.append({'clip': Path(source).name, 'src_in': c['source_in'], 'duration': duration})
         position += c['frames']
-        job.progress = [i + 1, len(edit['clips'])]
-        job.say(f'Clip {i+1}/{len(edit["clips"])} ready')
+        job.progress = [i + 1, len(clips_in)]
+        job.say(f'Clip {i+1}/{len(clips_in)} ready')
     command = [cfg['ffmpeg'], '-y', '-v', 'error']
     for path in clips:
         command += ['-i', str(path)]
+    shown = []
+    for title in edit.get('titles') or []:  # titles overlapping the rendered span, in span time
+        a, b = max(title['start_frame'], first) - first, min(title['start_frame'] + title['frames'], last) - first
+        if a < b:
+            shown.append((titles_mod.render_png(title, width, height, out / f'title_{len(shown)}.png'), a, b))
     if music:
-        command += ['-i', str(music)]
+        command += (['-ss', f'{first / fps:.6f}', '-t', f'{total / fps:.6f}'] if window else []) + ['-i', str(music)]
+    for png, _, _ in shown:
+        command += ['-i', str(png)]
     graph, inputs = [], ''
-    for i, c in enumerate(edit['clips']):
-        graph += [f'[{i}:v]trim=end_frame={c["frames"]},setpts=N/({fps}*TB)[v{i}]',
-                  f'[{i}:a]aresample=48000,atrim=end_sample={round(c["frames"]/fps*48000)},asetpts=N/SR/TB[a{i}]']
+    for i, c in enumerate(clips_in):
+        fi, fo = c.get('fade_in', 0), c.get('fade_out', 0)
+        fade_v = (f',fade=t=in:s=0:n={fi}' if fi else '') + (f',fade=t=out:s={c["frames"] - fo}:n={fo}' if fo else '')
+        fade_a = (f',afade=t=in:st=0:d={fi / fps:.6f}' if fi else '') + (f',afade=t=out:st={(c["frames"] - fo) / fps:.6f}:d={fo / fps:.6f}' if fo else '')
+        graph += [f'[{i}:v]trim=end_frame={c["frames"]},setpts=N/({fps}*TB){fade_v}[v{i}]',
+                  f'[{i}:a]aresample=48000,atrim=end_sample={round(c["frames"]/fps*48000)},asetpts=N/SR/TB{fade_a}[a{i}]']
         inputs += f'[v{i}][a{i}]'
-    graph += [f'{inputs}concat=n={len(clips)}:v=1:a=1[v][a]', f'[v]setpts=N/({fps}*TB)[picture]']
+    first_input = len(clips) + (1 if music else 0)
+    graph += [f'{inputs}concat=n={len(clips)}:v=1:a=1[v][a]', f'[v]setpts=N/({fps}*TB)[pic0]']
+    for j, (_, a, b) in enumerate(shown):
+        graph.append(f"[pic{j}][{first_input + j}:v]overlay=0:0:enable='between(n,{a},{b - 1})'[pic{j + 1}]")
+    graph.append(f'[pic{len(shown)}]null[picture]')
     graph += [f'[a][{len(clips)}:a]amix=inputs=2:duration=first:normalize=0[mix]'] if music else ['[a]anull[mix]']
     graph += ['[mix]alimiter=limit=0.95:level=false:latency=true[sound]']
-    final = out / 'timeline.mp4'
+    final = out / ('preview.mp4' if window else 'timeline.mp4')
     job.check()
     run(job, command + ['-filter_complex_threads', '1', '-filter_complex', ';'.join(graph),
                        '-map', '[picture]', '-map', '[sound]', '-r', str(fps), '-frames:v', str(total),
@@ -334,13 +519,18 @@ def render(job, sid, eid, edit, video):
     (out / 'timeline.edl').write_text(media.edl(episode.get('title', eid), events, fps))
     version = {'file': store.rel(str(final)), 'created': store.now(), 'runtime': total/fps,
                'revision': edit['revision'], 'edit': edit, 'video': video, 'frames': total, 'lipsync': sync}
+    if window:
+        version.update(window=[first, last], lipsync_skipped=skipped_sync)
     (out / 'verification.json').write_text(json.dumps(version, indent=2))
     def publish(ep):
         outputs = ep.setdefault('outputs', {})
+        if window:  # a preview is kept beside the film, never as the film
+            outputs.setdefault('timeline_previews', []).append(version)
+            return
         previous = outputs.get('final')
         outputs.setdefault('timeline_versions', []).append(version)
         outputs.update(final=version['file'], runtime=version['runtime'], previous_final=previous,
                        edl=store.rel(str(out/'timeline.edl')), timeline_revision=edit['revision'])
         outputs.pop('srt', None)
     store.update_episode(sid, eid, publish)
-    job.say('Timeline export ready in Cut. Source takes retained.')
+    job.say('Range preview ready in Takes.' if window else 'Timeline export ready in Cut. Source takes retained.')

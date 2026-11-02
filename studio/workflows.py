@@ -140,7 +140,7 @@ def _latent(wf, s, vae_id, width, height, batch, init_image, use_sd3_latent):
 
 # ── Video: LTX-2.3 image-to-video (two-stage, with audio) ───────────────
 
-def lipsync_video(video: str, audio: str, steps=20, guidance=1.5, seed=1247,
+def lipsync_video(video: str, audio: str, steps=20, guidance=2.0, seed=1247,
                   prefix='studio/lipsync') -> dict:
     return {
         '1': {'class_type': 'LoadVideo', 'inputs': {'file': video}},

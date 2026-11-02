@@ -65,6 +65,112 @@ The timeline scrolls horizontally, while grips and trim edges support touch drag
 first editor supports one ripple video track and one music track; it does not add overlays,
 transitions or separate overlapping audio lanes.
 
+### Timeline shortcuts
+
+Click the editor first so it has keyboard focus. Shortcuts are ignored while you type in a field.
+
+| Key | Action |
+| --- | --- |
+| `Space` / `L` / `K` | Play-pause / play / pause |
+| `←` `→` | Step one frame (hold `Shift` for one second) |
+| `↑` `↓` | Previous / next cut |
+| `Home` `End` | Start / end of the timeline |
+| `S` | Split the selected clip at the playhead |
+| `Q` / `W` | Trim the selected clip's start / end to the playhead |
+| `M` | Mute or unmute the selected clip |
+| `Delete` | Delete the selected clip and close the gap |
+| `Alt` + `←` `→` | Move the selected clip earlier / later |
+| `Ctrl` + `Z` / `Shift+Z` / `Y` | Undo / redo |
+| `Ctrl` + `D` / `S` | Duplicate clip / save now |
+| `N` | Toggle snapping (hold `Alt` while dragging to bypass it once) |
+| `+` `-` `\` | Zoom in / out / fit the whole timeline |
+| `Shift`/`Ctrl`-click, `Ctrl` `A` | Select a range / add or remove one clip / select all |
+| `Ctrl` `C` / `X` / `V` | Copy / cut / paste clips (pasted after the selection) |
+| `V` / `Y` / `R` | Select-trim tool / **Slip** tool / **Roll** tool |
+| `B` | Turn the beat grid on or off |
+| `,` `.` | Previous / next beat |
+| `Shift` `M` | Add a marker at the playhead (again on the same frame removes it) |
+| `Alt` `↑` `↓` | Previous / next marker |
+| `I` / `O` / `Alt` `X` | Set the range start / end at the playhead / clear the range |
+
+Each clip shows a filmstrip of frames from its take. Group edits (mute, volume, lip-sync, delete,
+duplicate, move) apply to every selected clip; moving a group needs neighbouring clips.
+
+**Slip** (`Y`): drag a clip to change which part of its take it shows, without moving it or changing
+its length. **Roll** (`R`): drag the edge between two clips to move the cut; the total length never
+changes, and it stops where either clip runs out of footage.
+
+### Beats
+
+Turn on **Beats** (`B`) with music on the timeline. Studio finds the tempo and beat times of the
+recording (about a tenth of a second for a song; the result is cached) and draws the beat grid
+over the tracks, with estimated bar lines in amber. Beats are also snap targets for trims, rolls and
+scrubbing (hold `Alt` to bypass). If the tempo comes out at double or half what you feel, use
+**½×** or **2×**. **◂ Beat / Beat ▸** jump between beats.
+
+**Cut to beat…** opens a preview of what it would do, applied as one undo step:
+move existing cuts onto the nearest beat (only if they are within a distance you choose, and only
+as far as the footage allows), and/or add a cut every beat, 2 beats, bar or 2 bars, for the
+selected clips or the whole timeline. Bar lines are a best guess from the accents in the music;
+they are only marked when the guess is confident. Beat detection works on the recording's rhythm,
+so very quiet, ambient or free-tempo audio may report "No clear beat found".
+
+### Fades
+
+Select a clip (or several) and set **Fade in** / **Fade out** in the inspector, in seconds. The picture
+fades from/to black and the clip's sound fades with it; the clip keeps its length, and lip-sync is not
+affected. A dark triangle on the clip shows each fade. Splitting a clip keeps the fade-in on the first
+piece and moves the fade-out to the last; a fade can never be longer than its clip.
+
+### Speed
+
+Select a clip (or several) and set **Speed (×)** in the inspector, from 0.25 to 4. The clip keeps the same
+piece of the take, so 2× makes it half as long on the timeline and 0.5× twice as long; sound is sped up or
+slowed without changing pitch. **Source in / out** always show the take's own times, and trimming, slipping,
+rolling, splitting and Cut to beat all work in timeline frames. A clip cannot be longer than the take has
+footage for at that speed. Lip-sync clips must play at normal speed: turn lip-sync off first, and a sped-up
+clip cannot be lip-synced. Range previews and exports use the same speed.
+
+### Titles
+
+**Title** adds on-screen text at the playhead (3 seconds by default) and opens its editor; **Titles (n)**
+lists them all. For each title you set the text (several lines are fine), when it starts and how long it
+lasts, where it sits (percent across and down the frame), its size (percent of the frame height), its
+colour and whether it has a dark box behind it. A **TITLES** lane under the music shows each title; click
+one to jump to it, tap it twice to edit it, and press `Delete` while it is selected to remove it. The
+monitor previews the text live. It is drawn in a bundled bold sans font at the same relative size and
+position as the export, so the film matches; line breaks may differ by a word for very long text.
+Titles appear in **Render timeline** and in **Render range** previews, and they are saved with the timeline.
+
+### Markers
+
+Markers are named, coloured flags on the ruler for the moments you want to find again: the chorus,
+a drop, a lyric you must hit. They are saved with the timeline, are undoable, and never change the
+picture or the rendered film. Add one with `Shift`+`M` or the **Marker** button. Click a flag to jump
+there, drag it to move it (it snaps to cuts, beats, other markers and the playhead), tap it twice to
+rename it, and press `Delete` while it is selected to remove it. **Markers (n)** lists all of them
+with their timecodes, names and colours, and can copy the list as plain text. Trims, rolls and the
+range handles snap to markers too.
+
+### Render range (quick previews)
+
+Set **In** (`I`) and **Out** (`O`) to mark a span; it is shaded on the ruler and the rest of the
+timeline is dimmed. Drag its handles to adjust. **Render range** renders only that span, with its
+picture and its part of the music, into **Range previews**. A preview:
+
+- is a quick check, not the film: it never replaces your current final, and it is not offered in Cut;
+- **skips lip-sync**, so it needs no GPU and starts at once (previews note "lip-sync skipped");
+- stays available under **Range previews** with Watch and Download.
+
+**Render timeline** always renders the whole film, whatever range is set. The range is saved with
+the timeline. Markers and the range stay on the same moments if you change the project frame rate.
+
+Hold `Ctrl` and scroll over the tracks to zoom around the pointer. Drag along the ruler to scrub.
+Trims and music moves snap to the playhead, clip edges, the music's start and end, and the end of
+the picture; a dashed guide shows what you snapped to. Tap a clip twice to jump to its start.
+The **M** buttons on the track labels mute all clip audio or the music. The `M` and `LS` badges on
+a clip show that it is muted or set to lip-sync.
+
 ## Notes
 - Data lives in `studio_data/` (JSON + images/videos, editable by hand).
 - Editing a character/location/style marks dependent shots **stale**; nothing re-renders automatically.
@@ -90,6 +196,12 @@ time in the recording, and choose **Run lip-sync**. Demucs vocal isolation is on
 default for music; turn it off for an already clean voice recording.
 
 LatentSync 1.6 runs each chosen shot against the corresponding audio segment.
+
+**Quality settings** (Settings, *Lip-sync*): **Guidance** defaults to 2.0 and **Steps** to 20. On an A/B test with this
+project's own clips, guidance 2.0 raised the SyncNet sync score by 33 to 72 percent over the upstream default of 1.5 at the
+same speed; doubling the steps to 40 cost about 60 percent more time for a small and inconsistent gain. Guidance runs from 1
+to 3; very high values can over-articulate the mouth, so check a preview before using more. Changing either value makes
+Studio re-run lip-sync for clips it had already finished, because the finished clips are cached by these settings.
 Other shots retain their picture. The export uses the full uploaded music mix at
 full volume, replacing take audio; bed volume and ducking apply only to the ordinary
 final-cut render. Short recordings are padded with silence, long recordings are

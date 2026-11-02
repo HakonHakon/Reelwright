@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
-from . import jobs, llm, media, planner, prompts, store, providers, timeline
+from . import beats, jobs, llm, media, planner, prompts, store, providers, timeline
 from . import settings as settings_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -568,6 +568,26 @@ def timeline_waveform(sid: str, eid: str, file: str):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.get('/api/s/{sid}/e/{eid}/timeline/thumb')
+def timeline_thumb(sid: str, eid: str, file: str, t: float = 0.0, h: int = 96):
+    try:
+        path = timeline.thumbnail(sid, eid, _ep(sid, eid), file, t, h, _s())
+    except (ValueError, TypeError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return FileResponse(path, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=3600'})
+
+
+@app.get('/api/s/{sid}/e/{eid}/timeline/beats')
+def timeline_beats(sid: str, eid: str, file: str):
+    """Tempo and beat times for the episode's music (cached per file)."""
+    try:
+        cfg = _s()
+        timeline.source_info(_ep(sid, eid), file, cfg, audio=True)
+        return beats.analyze_file(cfg['ffmpeg'], store.abs_media(file), os.path.join(store.ep_dir(sid, eid), 'out', 'beats'))
+    except (ValueError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.put('/api/s/{sid}/e/{eid}/timeline')
 def save_timeline(sid: str, eid: str, body: dict = Body(...)):
     _ep(sid, eid)
@@ -580,22 +600,34 @@ def save_timeline(sid: str, eid: str, body: dict = Body(...)):
         raise HTTPException(400, str(exc)) from exc
 
 
-def _timeline_export(sid, eid):
+def _timeline_export(sid, eid, window=None):
     episode = _ep(sid, eid)
     cfg = settings_mod.for_episode(_s(), episode)
     try:
         edit = timeline.validate(episode, episode.get('timeline') or timeline.default_edit(episode, cfg), cfg)
         if not edit['clips']:
             raise ValueError('Add clips to the timeline before rendering')
+        if window:
+            total = sum(c['frames'] for c in edit['clips'])
+            if window[0] >= total:
+                raise ValueError('The range starts after the end of the timeline')
+            window = (window[0], min(window[1], total))
     except (ValueError, TypeError, media.MediaError) as exc:
         raise HTTPException(400, str(exc)) from exc
-    return _submit('timeline', f'Timeline export {eid}', timeline.render, sid=sid, eid=eid,
-                   edit=edit, video=dict(cfg['video']))
+    return _submit('timeline', f'Timeline {"preview" if window else "export"} {eid}', timeline.render, sid=sid, eid=eid,
+                   edit=edit, video=dict(cfg['video']), window=window)
 
 
 @app.post('/api/s/{sid}/e/{eid}/timeline/export')
-def export_timeline(sid: str, eid: str):
-    return _timeline_export(sid, eid)
+def export_timeline(sid: str, eid: str, body: dict | None = Body(default=None)):
+    """Render the whole timeline, or `{"range": [first_frame, end_frame]}` as a quick preview."""
+    window = None
+    value = (body or {}).get('range')
+    if value is not None:
+        if not isinstance(value, list) or len(value) != 2 or any(type(x) is not int for x in value) or value[0] < 0 or value[1] <= value[0]:
+            raise HTTPException(400, 'Choose a range that ends after it starts')
+        window = (value[0], value[1])
+    return _timeline_export(sid, eid, window)
 
 
 @app.post("/api/s/{sid}/e/{eid}/takes")
@@ -604,6 +636,9 @@ def ep_takes(sid: str, eid: str, body: dict = Body(default={})):
     try:
         if body.get("engine"):
             providers.validate_model(body["engine"], body.get("model") or "")
+            problem = providers.engine_problem(_s(), body["engine"])
+            if problem:
+                raise ValueError(problem)
         elif body.get("model"):
             raise ValueError("Choose an engine with the model")
         if not 1 <= int(body.get("takes") or _s()["takes_per_shot"]) <= 8:
@@ -817,7 +852,8 @@ def face_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default=
 @app.get("/api/models")
 def video_models():
     from .providers import VIDEO_MODELS
-    return VIDEO_MODELS
+    cfg = _s()
+    return [{**m, "available": not (note := providers.engine_problem(cfg, m["engine"])), "note": note} for m in VIDEO_MODELS]
 
 
 

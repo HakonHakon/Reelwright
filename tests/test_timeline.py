@@ -719,3 +719,147 @@ def test_a_sped_up_clip_keeps_the_audio_length_and_pitch_free_tempo(film):
     assert len(video) == 15
     assert abs(len(audio) / 8000 - .5) < .05
     assert np.sqrt(np.mean(audio[:3000] ** 2)) > 0, 'audio from the whole 1 s source is squeezed into 0.5 s'
+
+
+# ── extra audio lanes ────────────────────────────────────────────────────
+
+def _tone(tmp_path, name, hz, seconds=1.0):
+    path = tmp_path / name
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', f'sine=frequency={hz}:duration={seconds}', str(path)], check=True)
+    return path
+
+
+def _upload_lane_audio(client, sid, eid, path):
+    response = client.post(f'/api/s/{sid}/e/{eid}/timeline/audio', files={'file': (path.name, path.read_bytes(), 'audio/wav')})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _lane_film(film, tmp_path, **override):
+    client, sid, eid, shots, music = film
+    low = _upload_lane_audio(client, sid, eid, _tone(tmp_path, 'low.wav', 880))
+    high = _upload_lane_audio(client, sid, eid, _tone(tmp_path, 'high.wav', 1320))
+    edit = timeline.default_edit(store.get_episode(sid, eid), settings.load())
+    for clip in edit['clips']:
+        clip['muted'] = True
+    edit['music'] = None
+    edit['audio'] = [{'id': 'a', 'file': low['file'], 'lane': 0, 'source_in': 0, 'start_frame': 0, 'frames': 20, 'volume': 1},
+                     {'id': 'b', 'file': high['file'], 'lane': 1, 'source_in': 0, 'start_frame': 30, 'frames': 20, 'volume': 1}]
+    for k, v in override.items():
+        edit[k] = v
+    return sid, eid, edit
+
+
+def test_audio_lanes_default_empty_and_are_validated_saved_and_rejected_atomically(film, tmp_path):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    assert client.get(url).json()['edit']['audio'] == []
+    _, _, edit = _lane_film(film, tmp_path)
+    edit['revision'] = 0
+    saved = client.put(url, json=edit)
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    assert [t['id'] for t in body['edit']['audio']] == ['a', 'b'] and body['edit']['audio'][1]['start_frame'] == 30
+    assert all(t['file'] in body['sources'] and not body['sources'][t['file']].get('missing') for t in body['edit']['audio'])
+    revision = body['edit']['revision']
+
+    def rejected(change):
+        bad = copy.deepcopy(body['edit']); change(bad)
+        r = client.put(url, json=bad)
+        assert r.status_code == 400, (r.status_code, change)
+        assert store.get_episode(sid, eid)['timeline']['revision'] == revision
+    rejected(lambda e: e['audio'][0].update(file='../x.wav'))
+    rejected(lambda e: e['audio'][0].update(file=e['clips'][0]['source']))      # video takes are not audio lane media
+    rejected(lambda e: e['audio'][0].update(frames=999))                          # longer than the recording, no loop
+    rejected(lambda e: e['audio'][0].update(source_in=5))
+    rejected(lambda e: e['audio'][0].update(start_frame=-1))
+    rejected(lambda e: e['audio'][0].update(start_frame=1.5))
+    rejected(lambda e: e['audio'][0].update(volume=3))
+    rejected(lambda e: e['audio'][0].update(muted='no'))
+    rejected(lambda e: e['audio'][0].update(lane=8))
+    rejected(lambda e: e['audio'][0].update(fade_in=15, fade_out=15))
+    rejected(lambda e: e['audio'][1].update(id='a'))
+    rejected(lambda e: e.update(audio=[{**e['audio'][0], 'id': str(i)} for i in range(9)]))
+    rejected(lambda e: e.update(audio='nope'))
+    body['edit']['audio'][0].update(frames=90, loop=True)                         # looping may exceed the recording
+    assert client.put(url, json=body['edit']).status_code == 200
+
+
+def test_uploading_lane_audio_rejects_non_audio_and_leaves_music_alone(film, tmp_path):
+    client, sid, eid, shots, music = film
+    before = copy.deepcopy(store.get_episode(sid, eid))
+    junk = client.post(f'/api/s/{sid}/e/{eid}/timeline/audio', files={'file': ('x.wav', b'not audio', 'audio/wav')})
+    assert junk.status_code == 400
+    _upload_lane_audio(client, sid, eid, _tone(tmp_path, 'ok.wav', 440))
+    after = store.get_episode(sid, eid)
+    assert after.get('music') == before.get('music') and len(after['audio_assets']) == len(before.get('audio_assets', [])) + 1
+
+
+def test_changing_project_fps_keeps_audio_lanes_on_the_same_moments(film, tmp_path):
+    client, sid, eid, shots, music = film
+    url = f'/api/s/{sid}/e/{eid}/timeline'
+    _, _, edit = _lane_film(film, tmp_path)
+    edit['audio'][1].update(fade_in=5, fade_out=10)
+    assert client.put(url, json={**edit, 'revision': 0}).status_code == 200
+    store.update_episode(sid, eid, lambda e: e.update(video={'fps': 24, 'width': 64, 'height': 96}))
+    changed = client.get(url).json()['edit']
+    b = changed['audio'][1]
+    assert (b['start_frame'], b['frames'], b['fade_in'], b['fade_out']) == (24, 16, 4, 8)
+    assert client.put(url, json=changed).status_code == 200
+
+
+def test_export_mixes_lanes_at_their_positions(film, tmp_path):
+    sid, eid, edit = _lane_film(film, tmp_path)
+    edit = timeline.validate(store.get_episode(sid, eid), edit, settings.load())
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, edit, settings.load()['video'])
+    video, audio = _frames_and_audio(store.abs_media(store.get_episode(sid, eid)['outputs']['final']))
+    assert len(video) == 60
+    f1, r1 = _dominant(audio, .05, .6)
+    f2, r2 = _dominant(audio, 1.05, 1.6)
+    assert abs(f1 - 880) < 12 and r1 > .05, (f1, r1)
+    assert abs(f2 - 1320) < 12 and r2 > .05, (f2, r2)
+    assert _dominant(audio, .75, .95)[1] < .01, 'silent between the lanes'
+    assert _dominant(audio, 1.75, 1.95)[1] < .01
+
+
+def test_overlapping_lanes_add_up_and_mute_removes_a_lane(film, tmp_path):
+    sid, eid, edit = _lane_film(film, tmp_path)
+    edit['audio'][1].update(start_frame=0, frames=20)
+    edit['audio'][0]['volume'] = edit['audio'][1]['volume'] = .5
+    both = timeline.validate(store.get_episode(sid, eid), copy.deepcopy(edit), settings.load())
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, both, settings.load()['video'])
+    _, audio = _frames_and_audio(store.abs_media(store.get_episode(sid, eid)['outputs']['final']))
+    two = _dominant(audio, .05, .6)[1]
+    edit['audio'][1]['muted'] = True
+    one_only = timeline.validate(store.get_episode(sid, eid), edit, settings.load())
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, one_only, settings.load()['video'])
+    _, audio = _frames_and_audio(store.abs_media(store.get_episode(sid, eid)['outputs']['final']))
+    single = _dominant(audio, .05, .6)[1]
+    assert two > single * 1.25, (two, single)
+
+
+def test_lanes_mix_with_music_and_fades_shape_them(film, tmp_path):
+    client, sid, eid, shots, music = film
+    sid, eid, edit = _lane_film(film, tmp_path)
+    edit['music'] = timeline.default_edit(store.get_episode(sid, eid), settings.load())['music']
+    edit['music'].update(start_frame=0, frames=60, volume=1)
+    edit['audio'][0].update(fade_in=10, fade_out=0)
+    edit = timeline.validate(store.get_episode(sid, eid), edit, settings.load())
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, edit, settings.load()['video'])
+    _, audio = _frames_and_audio(store.abs_media(store.get_episode(sid, eid)['outputs']['final']))
+    spectrum = lambda a, b: np.abs(np.fft.rfft(audio[int(a * 8000):int(b * 8000)]))
+    bin_of = lambda a, b, hz: spectrum(a, b)[round(hz * (b - a))]
+    assert bin_of(.4, .6, 330) > 50 and bin_of(.4, .6, 880) > 50, 'music and lane are both audible'
+    assert bin_of(0, .1, 880) < bin_of(.4, .6, 880) * .7, 'the lane fades in'
+
+
+def test_a_range_preview_seeks_into_the_lanes(film, tmp_path):
+    sid, eid, edit = _lane_film(film, tmp_path)
+    edit = timeline.validate(store.get_episode(sid, eid), edit, settings.load())
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, edit, settings.load()['video'], window=(15, 45))
+    preview = store.get_episode(sid, eid)['outputs']['timeline_previews'][-1]
+    video, audio = _frames_and_audio(store.abs_media(preview['file']))
+    assert len(video) == 30
+    assert abs(_dominant(audio, .02, .14)[0] - 880) < 30 and _dominant(audio, .02, .14)[1] > .03, 'frames 15-20 still hear the first lane'
+    assert _dominant(audio, .2, .45)[1] < .01, 'silence until the second lane'
+    assert abs(_dominant(audio, .55, .95)[0] - 1320) < 15 and _dominant(audio, .55, .95)[1] > .05, 'the second lane starts 15 frames in'

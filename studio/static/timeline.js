@@ -1,6 +1,7 @@
 // Takes editor: the saved edit is independent of its source takes.
 "use strict";
 const editClone = value => JSON.parse(JSON.stringify(value));
+const LANE_HEIGHT = 40, MAX_LANES = 8;
 const MARKER_COLORS = ["red", "orange", "yellow", "green", "blue", "purple"];
 const markerId = () => `mk_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 const editId = () => `clip_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
@@ -39,10 +40,11 @@ class TakeTimelineEditor {
         <div class="tb-group" role="group" aria-label="Markers"><button data-edit="marker-add" title="Add a marker at the playhead, or remove the one under it (Shift+M)">⚑ Marker <span class="kbd">⇧M</span></button><button data-edit="markers" title="Name, colour, jump to and list markers">Markers (0)</button><button data-edit="title-add" title="Add on-screen text at the playhead">T Title</button><button data-edit="titles" title="Edit all titles">Titles (0)</button></div>
         <span class="grow"></span>
         <div class="tb-group" role="group" aria-label="Render range"><button data-edit="range-in" title="Start the range at the playhead (I)">In <span class="kbd">I</span></button><button data-edit="range-out" title="End the range at the playhead (O)">Out <span class="kbd">O</span></button><button data-edit="range-clear" title="Clear the range (Alt+X)" disabled>Clear</button><button data-edit="export-range" title="Render only this range as a quick preview. Lip-sync is skipped, and your current final film is not replaced." disabled>Render range</button><span class="range-info" data-edit-range-info></span></div></div>
-      <div class="edit-tracks"><div class="edit-labels"><div>TIME</div><div><span>VIDEO</span><button class="trk-btn" data-edit="track-video-mute" aria-pressed="false" aria-label="Mute all clip audio" title="Mute / unmute all clip audio">M</button></div><div><span>MUSIC</span><button class="trk-btn" data-edit="track-music-mute" aria-pressed="false" aria-label="Mute music" title="Mute / unmute music">M</button></div><div><span>TITLES</span></div></div>
-        <div class="edit-scroll"><div class="edit-canvas"><div class="edit-ruler"></div><div class="edit-video-track"></div><div class="edit-music-track"></div><div class="edit-title-track"></div><div class="edit-beatgrid" aria-hidden="true"></div><div class="edit-rangeview" hidden><i class="dim a" aria-hidden="true"></i><i class="dim b" aria-hidden="true"></i><i class="bar" aria-hidden="true"></i><b class="handle in" data-range-handle="in" role="slider" aria-label="Range start" title="Drag the range start"></b><b class="handle out" data-range-handle="out" role="slider" aria-label="Range end" title="Drag the range end"></b></div><div class="edit-markers"></div>
+      <div class="edit-tracks"><div class="edit-labels"><div>TIME</div><div><span>VIDEO</span><button class="trk-btn" data-edit="track-video-mute" aria-pressed="false" aria-label="Mute all clip audio" title="Mute / unmute all clip audio">M</button></div><div><span>MUSIC</span><button class="trk-btn" data-edit="track-music-mute" aria-pressed="false" aria-label="Mute music" title="Mute / unmute music">M</button></div><div class="lbl-titles"><span>TITLES</span></div></div>
+        <div class="edit-scroll"><div class="edit-canvas"><div class="edit-ruler"></div><div class="edit-video-track"></div><div class="edit-music-track"></div><div class="edit-audio-track"></div><div class="edit-title-track"></div><div class="edit-beatgrid" aria-hidden="true"></div><div class="edit-rangeview" hidden><i class="dim a" aria-hidden="true"></i><i class="dim b" aria-hidden="true"></i><i class="bar" aria-hidden="true"></i><b class="handle in" data-range-handle="in" role="slider" aria-label="Range start" title="Drag the range start"></b><b class="handle out" data-range-handle="out" role="slider" aria-label="Range end" title="Drag the range end"></b></div><div class="edit-markers"></div>
           <div class="edit-snap-line" hidden aria-hidden="true"></div><div class="edit-playhead" aria-hidden="true"></div></div></div></div>
       <div class="edit-footer row"><label class="btn file-pick">Add music / voice<input data-edit-audio type="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac" aria-label="Add timeline music"></label>
+        <label class="btn file-pick" title="Voice-over or sound effects on their own lane (up to 8)">Add audio lane<input data-edit-lane type="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac" aria-label="Add audio lane"></label>
         <button data-edit="mute-all">Mute all takes</button><button data-edit="shot-lengths">Use shot lengths</button><button data-edit="sync">Choose lip-sync clips</button>
         <span class="grow"></span><button data-edit="reload" title="Throw away unsaved edits and reload the saved timeline">Discard unsaved edits</button><button data-edit="picked" title="Rebuild the timeline from the takes picked in the library">Reset to picked takes</button></div>
       <p class="muted small edit-help">Drag a clip’s grip (⠿) to reorder, or its edges to trim. <span class="kbd">Shift</span>/<span class="kbd">Ctrl</span>-click selects several clips. Split and delete ripple the video track. Edits autosave. <span class="kbd">Space</span> play · <span class="kbd">Delete</span> remove clip · <span class="kbd">Ctrl</span> <span class="kbd">Z</span> undo</p>
@@ -70,6 +72,7 @@ class TakeTimelineEditor {
     };
     $('.edit-scroll', root).addEventListener('scroll', () => { if (this.thumbRaf) return; this.thumbRaf = requestAnimationFrame(() => { this.thumbRaf = 0; if (!this.destroyed && this.thumbsStale()) this.tracks(); }); }, {passive: true});
     this.monitorObserver = new ResizeObserver(() => this.titlePreview()); this.monitorObserver.observe($('.edit-monitor', root));
+    this.laneEls = new Map(); this.laneWaves = {}; this.laneWavePending = new Set();
     this.draw(); this.seek(0); this.loadWaveform(); this.ensureBeats();
     const versions = this.ctx.e.outputs?.timeline_versions || [], previews = this.ctx.e.outputs?.timeline_previews || [];
     const span = v => v.window ? `${(v.window[0] / (v.video?.fps || this.fps)).toFixed(2)}–${(v.window[1] / (v.video?.fps || this.fps)).toFixed(2)} s` : '';
@@ -108,6 +111,7 @@ class TakeTimelineEditor {
   seconds(frame) { return (frame / this.fps).toFixed(3); }
   label(c) { return c.shot_id || 'Video clip'; }
   sourceFrames(c) { return Math.round((this.sources[c.source]?.video_duration || c.source_in + c.frames / this.fps) * this.fps); }
+  audioEnd() { return Math.max(0, ...(this.edit.audio || []).map(t => t.start_frame + t.frames)); }
   speed(c) { return c.speed || 1; }
   // source frames used by `frames` timeline frames of clip c, and the most timeline frames `source` frames can fill
   usedFrames(c, frames = c.frames) { return Math.round(frames * this.speed(c)); }
@@ -181,7 +185,7 @@ class TakeTimelineEditor {
   }
   tracks() {
     const music = this.edit.music;
-    const end = Math.max(this.total, music ? music.start_frame + music.frames : 0, this.fps);
+    const end = Math.max(this.total, music ? music.start_frame + music.frames : 0, this.audioEnd(), this.fps);
     const width = Math.max(260, end / this.fps * this.zoom + 30);
     const canvas = $('.edit-canvas', this.root); canvas.style.width = width + 'px';
     const secs = end / this.fps, nice = [.1, .2, .5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
@@ -209,19 +213,41 @@ class TakeTimelineEditor {
         ${c.fade_in ? `<i class="edit-fade in" style="width:${Math.min(px, c.fade_in / this.fps * this.zoom)}px" aria-hidden="true"></i>` : ''}${c.fade_out ? `<i class="edit-fade out" style="width:${Math.min(px, c.fade_out / this.fps * this.zoom)}px" aria-hidden="true"></i>` : ''}<span class="edit-grip" data-grip="move" aria-label="Drag to reorder">⠿</span><span class="edit-edge left" data-edge="left"></span><span class="edit-edge right" data-edge="right"></span></button>`;
     }).join('');
     this.drawBeats(); this.drawMarks(); this.drawTitles();
-    let waveform = '';
-    if (music && this.waveform?.file === music.file) {
-      const points = [], {peaks, duration} = this.waveform;
-      const remaining = Math.max(.001, duration - music.source_in);
-      for (let x = 0; x <= 400; x++) {
-        let t = x / 400 * music.frames / this.fps;
-        if (music.loop) t %= remaining;
-        const index = Math.floor((music.source_in + t) / duration * peaks.length);
-        points.push([x, (peaks[index] || 0) * 18]);
-      }
-      waveform = `<svg viewBox="0 0 400 40" preserveAspectRatio="none" aria-hidden="true"><polygon points="${points.map(([x, h]) => `${x},${20-h}`).join(' ')} ${points.reverse().map(([x, h]) => `${x},${20+h}`).join(' ')}"/></svg>`;
-    }
+    const waveform = music && this.waveform?.file === music.file ? this.waveSvg(music, this.waveform) : '';
     $('.edit-music-track', this.root).innerHTML = music ? `<button class="edit-music-clip ${music.muted ? 'muted' : ''}" data-music-move style="left:${music.start_frame / this.fps * this.zoom}px;width:${Math.max(8, music.frames / this.fps * this.zoom)}px" aria-label="Music timeline clip">${waveform}<span>${esc(music.file.split('/').pop())}${music.muted ? ' · muted' : ''}</span></button>` : '<span class="edit-track-empty">Add a song or voice recording</span>';
+    this.laneTracks();
+  }
+  waveSvg(t, {peaks, duration}) {
+    const points = [], remaining = Math.max(.001, duration - t.source_in);
+    for (let x = 0; x <= 400; x++) {
+      let time = x / 400 * t.frames / this.fps;
+      if (t.loop) time %= remaining;
+      points.push([x, (peaks[Math.floor((t.source_in + time) / duration * peaks.length)] || 0) * 18]);
+    }
+    return `<svg viewBox="0 0 400 40" preserveAspectRatio="none" aria-hidden="true"><polygon points="${points.map(([x, h]) => `${x},${20-h}`).join(' ')} ${points.reverse().map(([x, h]) => `${x},${20+h}`).join(' ')}"/></svg>`;
+  }
+  laneTracks() {
+    const lanes = this.edit.audio || [], labels = $('.edit-labels', this.root);
+    $$('.lbl-lane', labels).forEach(el => el.remove());
+    const before = $('.lbl-titles', labels);
+    lanes.forEach((t, i) => before.insertAdjacentHTML('beforebegin', `<div class="lbl-lane"><span>A${i + 1}</span><button class="trk-btn" data-edit="lane-mute" data-lane="${esc(t.id)}" aria-pressed="${!!t.muted}" aria-label="Mute audio lane ${i + 1}" title="Mute / unmute this lane">M</button></div>`));
+    $('.edit-audio-track', this.root).style.height = lanes.length * LANE_HEIGHT + 'px';
+    $('.edit-audio-track', this.root).innerHTML = lanes.map((t, i) => {
+      const wave = this.laneWaves[t.file], name = t.file.split('/').pop();
+      const fadeW = f => Math.min(t.frames, f) / this.fps * this.zoom;
+      return `<div class="edit-lane" style="top:${i * LANE_HEIGHT}px"><button type="button" class="edit-lane-clip ${t.muted ? 'muted' : ''}" data-lane-move="${esc(t.id)}" style="left:${t.start_frame / this.fps * this.zoom}px;width:${Math.max(8, t.frames / this.fps * this.zoom)}px" title="${esc(name)} · ${this.seconds(t.frames)}s" aria-label="Audio lane ${i + 1} clip ${esc(name)}">${wave ? this.waveSvg(t, wave) : ''}<span>${esc(name)}${t.muted ? ' · muted' : ''}</span>${t.fade_in ? `<i class="edit-fade in" style="width:${fadeW(t.fade_in)}px" aria-hidden="true"></i>` : ''}${t.fade_out ? `<i class="edit-fade out" style="width:${fadeW(t.fade_out)}px" aria-hidden="true"></i>` : ''}</button></div>`;
+    }).join('');
+    this.ensureLaneWaves();
+  }
+  async ensureLaneWaves() {
+    for (const t of this.edit.audio || []) {
+      if (this.laneWaves[t.file] || this.laneWavePending.has(t.file) || this.sources[t.file]?.missing) continue;
+      this.laneWavePending.add(t.file);
+      try {
+        const data = await GET(this.api + '/waveform?file=' + encodeURIComponent(t.file));
+        if (this.destroyed) return; this.laneWaves[t.file] = data; this.tracks();
+      } catch { /* the lane still plays without a waveform */ } finally { this.laneWavePending.delete(t.file); }
+    }
   }
   inspector() {
     const c = this.clip, m = this.edit.music, picked = this.selectedClips();
@@ -236,7 +262,7 @@ class TakeTimelineEditor {
         <label class="row"><input data-edit-lipsync type="checkbox" ${all('lipsync') ? 'checked' : ''} ${eligible ? '' : 'disabled'}>Lip-sync these clips to music</label>
         ${eligible ? '' : '<p class="muted small">Lip-sync needs single-character shots.</p>'}
         <p class="muted small">Copy <span class="kbd">Ctrl</span> <span class="kbd">C</span>, paste <span class="kbd">Ctrl</span> <span class="kbd">V</span>, duplicate <span class="kbd">Ctrl</span> <span class="kbd">D</span>, delete <span class="kbd">Delete</span>.</p>
-        <h3>Music / voice</h3>${this.musicInspector()}`;
+        <h3>Music / voice</h3>${this.musicInspector()}${this.laneInspector()}`;
       const mixed = $('[data-mixed]', this.root); if (mixed) mixed.indeterminate = true;
       return;
     }
@@ -253,7 +279,7 @@ class TakeTimelineEditor {
       <label class="row"><input data-edit-lipsync type="checkbox" ${c.lipsync ? 'checked' : ''} ${this.eligible(c) ? '' : 'disabled'}>Lip-sync this clip to music</label>
       <label>Generate with<select data-edit-model aria-label="Timeline generation model">${$('#take-model')?.innerHTML || ''}</select></label>
       <button data-edit="generate" ${sh ? '' : 'disabled'}>Generate take for this shot</button>` : '<p class="muted small">Select a clip or add a take below.</p>'}
-      <h3>Music / voice</h3>${this.musicInspector()}`;
+      <h3>Music / voice</h3>${this.musicInspector()}${this.laneInspector()}`;
     const model = $('[data-edit-model]', this.root); if (model) model.value = $('#take-model').value;
   }
   fadeFields(clips) {
@@ -261,6 +287,56 @@ class TakeTimelineEditor {
     const longest = (Math.min(...clips.map(c => c.frames)) / this.fps).toFixed(2);
     return `<div class="edit-field-pair"><label>Fade in (s)<input data-edit-fade="in" type="number" min="0" max="${longest}" step=".1" value="${same('fade_in')}" placeholder="mixed" aria-label="Fade in, seconds"></label>
       <label>Fade out (s)<input data-edit-fade="out" type="number" min="0" max="${longest}" step=".1" value="${same('fade_out')}" placeholder="mixed" aria-label="Fade out, seconds"></label></div>`;
+  }
+  laneInspector() {
+    const lanes = this.edit.audio || [], sec = f => (f / this.fps).toFixed(2);
+    return `<h3>Audio lanes (${lanes.length}/${MAX_LANES})</h3>` + (lanes.length ? lanes.map((t, i) => `<fieldset class="edit-lane-box" data-lane-box="${esc(t.id)}"><legend>A${i + 1} · ${esc(t.file.split('/').pop())}</legend>
+      <div class="edit-field-pair"><label>Source in (s)<input data-lane-field="in" data-lane="${esc(t.id)}" type="number" min="0" step=".1" value="${t.source_in}" aria-label="Lane ${i + 1} source in"></label>
+      <label>Timeline start (s)<input data-lane-field="start" data-lane="${esc(t.id)}" type="number" min="0" step=".1" value="${this.seconds(t.start_frame)}" aria-label="Lane ${i + 1} timeline start"></label></div>
+      <label>Length (s)<input data-lane-field="length" data-lane="${esc(t.id)}" type="number" min="${1/this.fps}" step=".1" value="${this.seconds(t.frames)}" aria-label="Lane ${i + 1} length"></label>
+      <div class="edit-field-pair"><label>Fade in (s)<input data-lane-field="fade_in" data-lane="${esc(t.id)}" type="number" min="0" step=".1" value="${sec(t.fade_in || 0)}" aria-label="Lane ${i + 1} fade in"></label>
+      <label>Fade out (s)<input data-lane-field="fade_out" data-lane="${esc(t.id)}" type="number" min="0" step=".1" value="${sec(t.fade_out || 0)}" aria-label="Lane ${i + 1} fade out"></label></div>
+      <label>Volume<input data-lane-field="volume" data-lane="${esc(t.id)}" type="range" min="0" max="1" step=".05" value="${t.volume}" aria-label="Lane ${i + 1} volume"></label>
+      <label class="row"><input data-lane-field="muted" data-lane="${esc(t.id)}" type="checkbox" ${t.muted ? 'checked' : ''}>Mute</label>
+      <label class="row"><input data-lane-field="loop" data-lane="${esc(t.id)}" type="checkbox" ${t.loop ? 'checked' : ''}>Loop</label>
+      <button data-edit="lane-remove" data-lane="${esc(t.id)}" class="danger">Remove this lane</button></fieldset>`).join('') : '<p class="muted small">Use "Add audio lane" for voice-over or sound effects. Music stays the lip-sync guide.</p>');
+  }
+  laneChange(t) {
+    const lane = (this.edit.audio || []).find(x => x.id === t.dataset.lane); if (!lane) return;
+    const field = t.dataset.laneField, box = t.closest('[data-lane-box]'), value = f => box.querySelector(`[data-lane-field="${f}"]`).value;
+    const duration = this.sources[lane.file]?.duration || 0;
+    if (['in', 'start', 'length'].includes(field)) {
+      const begin = Number(value('in')), start = Math.round(Number(value('start')) * this.fps), frames = Math.round(Number(value('length')) * this.fps);
+      const available = Math.round((duration - begin) * this.fps);
+      if (![begin, start, frames].every(Number.isFinite) || begin < 0 || start < 0 || frames < 1 || available < 1 || !lane.loop && frames > available) { this.inspector(); return toast('Choose audio timing within the recording, or enable looping.', true); }
+      return this.changeEdit(() => { Object.assign(lane, {source_in: Math.round(begin * this.fps) / this.fps, start_frame: start, frames}); this.clampLane(lane); });
+    }
+    if (field === 'fade_in' || field === 'fade_out') {
+      const frames = Math.max(0, Math.round(Number(t.value) * this.fps));
+      if (!Number.isFinite(frames)) return this.inspector();
+      return this.changeEdit(() => { lane[field] = Math.min(frames, lane.frames); const other = field === 'fade_in' ? 'fade_out' : 'fade_in'; lane[other] = Math.min(lane[other] || 0, lane.frames - lane[field]); });
+    }
+    if (field === 'volume') return this.changeEdit(() => { lane.volume = +t.value; });
+    if (field === 'muted') return this.changeEdit(() => { lane.muted = t.checked; });
+    if (field === 'loop') return this.changeEdit(() => { lane.loop = t.checked; if (!lane.loop) lane.frames = Math.max(1, Math.min(lane.frames, Math.round((duration - lane.source_in) * this.fps))); this.clampLane(lane); });
+  }
+  clampLane(t) { t.fade_in = Math.max(0, Math.min(t.frames, Math.round(t.fade_in || 0))); t.fade_out = Math.max(0, Math.min(t.frames - t.fade_in, Math.round(t.fade_out || 0))); }
+  async uploadLane(input) {
+    const file = input.files[0]; if (!file) return;
+    if ((this.edit.audio || []).length >= MAX_LANES) { input.value = ''; return toast(`At most ${MAX_LANES} audio lanes.`, true); }
+    App.interactionBusy = true;
+    try {
+      const fd = new FormData(); fd.append('file', file);
+      const saved = await FORM(this.api + '/audio', fd);
+      if (this.destroyed) return;
+      const info = await GET(this.api + '/source?audio=true&file=' + encodeURIComponent(saved.file));
+      if (this.destroyed) return;
+      this.sources[saved.file] = info;
+      this.changeEdit(() => {
+        this.edit.audio = this.edit.audio || [];
+        this.edit.audio.push({id: editId(), file: saved.file, lane: this.edit.audio.length, source_in: 0, start_frame: this.frame, frames: Math.max(1, Math.round(info.duration * this.fps)), volume: 1, muted: false, loop: false, fade_in: 0, fade_out: 0});
+      });
+    } catch (error) { toast(error.message || 'Could not add that audio file.', true); } finally { input.value = ''; App.interactionBusy = false; }
   }
   musicInspector() {
     const m = this.edit.music;
@@ -285,8 +361,27 @@ class TakeTimelineEditor {
     if (this.playing) this.clock = performance.now() - this.frame / this.fps * 1000;
     this.position(); this.syncMedia(true);
   }
+  syncLanes(force) {
+    const ids = new Set();
+    for (const t of this.edit.audio || []) {
+      ids.add(t.id);
+      let el = this.laneEls.get(t.id);
+      if (t.muted || this.frame < t.start_frame || this.frame >= t.start_frame + t.frames) { el?.pause(); continue; }
+      if (!el) { el = new Audio(); el.preload = 'metadata'; el.onloadedmetadata = () => this.syncMedia(true); this.laneEls.set(t.id, el); }
+      const src = media(t.file);
+      if (el.dataset.source !== src) { el.dataset.source = src; el.src = src; }
+      let offset = (this.frame - t.start_frame) / this.fps;
+      const remaining = (this.sources[t.file]?.duration || 0) - t.source_in;
+      if (t.loop && remaining > 0) offset %= remaining;
+      if (el.readyState >= 1 && (force || Math.abs(el.currentTime - (t.source_in + offset)) > .16)) el.currentTime = t.source_in + offset;
+      el.volume = Math.min(1, t.volume);
+      if (this.playing && el.paused) el.play().catch(() => {});
+    }
+    for (const [id, el] of this.laneEls) if (!ids.has(id)) { el.pause(); el.removeAttribute('src'); this.laneEls.delete(id); }
+  }
   syncMedia(force = false) {
     if (this.destroyed) return;
+    this.syncLanes(force);
     let start = 0, clip;
     for (const c of this.edit.clips) { if (this.frame < start + c.frames) { clip = c; break; } start += c.frames; }
     if (!clip) { this.video.pause(); this.video.removeAttribute('src'); return; }
@@ -330,7 +425,7 @@ class TakeTimelineEditor {
   }
   pause() {
     this.playing = false; App.interactionBusy = false; cancelAnimationFrame(this.animation);
-    this.video.pause(); this.audio.pause();
+    this.video.pause(); this.audio.pause(); this.laneEls?.forEach(el => el.pause());
     const button = $('[data-edit="play"]', this.root); if (button) button.textContent = '▶';
   }
   remove() {
@@ -371,7 +466,7 @@ class TakeTimelineEditor {
   }
   fit() {
     const scroll = $('.edit-scroll', this.root), music = this.edit.music;
-    const end = Math.max(this.total, music ? music.start_frame + music.frames : 0, this.fps) / this.fps;
+    const end = Math.max(this.total, music ? music.start_frame + music.frames : 0, this.audioEnd(), this.fps) / this.fps;
     this.setZoom((scroll.clientWidth - 40) / end); scroll.scrollLeft = 0;
   }
   step(frames) { this.pause(); this.seek(this.frame + frames); this.ensureVisible(); }
@@ -767,7 +862,7 @@ class TakeTimelineEditor {
   }
   snapTargets(d) {
     const out = new Set([0, this.frame]), before = d.before, music = before.music;
-    const global = ['music', 'marker', 'range-in', 'range-out'].includes(d.mode);
+    const global = ['music', 'lane', 'marker', 'range-in', 'range-out'].includes(d.mode);
     let p = 0, own = null;
     for (const c of before.clips) { if (c.id === d.id) own = p; p += c.frames; }
     const total = p; p = 0;
@@ -775,9 +870,10 @@ class TakeTimelineEditor {
       if (global || (own != null && p + c.frames <= own)) { out.add(p); out.add(p + c.frames); }
       p += c.frames;
     }
-    if (d.mode !== 'music') for (const b of this.beatFrames()) out.add(b.frame);
+    if (d.mode !== 'music' && d.mode !== 'lane') for (const b of this.beatFrames()) out.add(b.frame);
     if (global) out.add(total);
     if (d.mode !== 'music' && music) { out.add(music.start_frame); out.add(music.start_frame + music.frames); }
+    for (const t of before.audio || []) if (!(d.mode === 'lane' && t.id === d.laneId)) { out.add(t.start_frame); out.add(t.start_frame + t.frames); }
     for (const m of before.markers || []) if (!(d.mode === 'marker' && m.id === d.id)) out.add(m.frame);
     return [...out];
   }
@@ -834,6 +930,13 @@ class TakeTimelineEditor {
     if (action === 'zoom-fit') return this.fit();
     if (action === 'track-video-mute') return this.changeEdit(() => { const muted = !this.edit.clips.every(c => c.muted); this.edit.clips.forEach(c => { c.muted = muted; }); });
     if (action === 'track-music-mute' && this.edit.music) return this.changeEdit(() => { this.edit.music.muted = !this.edit.music.muted; });
+    if (action === 'lane-mute' || action === 'lane-remove') {
+      const id = event.target.closest('[data-lane]')?.dataset.lane, lane = (this.edit.audio || []).find(x => x.id === id); if (!lane) return;
+      return this.changeEdit(() => {
+        if (action === 'lane-mute') lane.muted = !lane.muted;
+        else { this.edit.audio = this.edit.audio.filter(x => x !== lane); this.edit.audio.forEach((x, i) => { x.lane = i; }); }
+      });
+    }
     if (action === 'duplicate' && c) return this.duplicate();
     if ((action === 'earlier' || action === 'later') && c) return this.moveClip(action === 'earlier' ? -1 : 1);
     if (action === 'mute-all') return this.changeEdit(() => { const muted = !this.edit.clips.every(c => c.muted); this.edit.clips.forEach(c => { c.muted = muted; }); });
@@ -860,6 +963,8 @@ class TakeTimelineEditor {
   }
   async change(event) {
     const t = event.target, c = this.clip, m = this.edit.music;
+    if (t.matches('[data-lane-field]')) return this.laneChange(t);
+    if (t.matches('[data-edit-lane]')) return this.uploadLane(t);
     if (t.matches('[data-edit-model]')) { $('#take-model').value = t.value; return; }
     if (t.matches('[data-edit-audio]')) return this.uploadMusic(t);
     if (t.matches('[data-edit-take]') && c) {
@@ -951,17 +1056,17 @@ class TakeTimelineEditor {
       event.preventDefault(); this.pause(); App.interactionBusy = true; this.scrubbing = {pointer: event.pointerId};
       $('.edit-canvas', this.root).setPointerCapture(event.pointerId); this.scrubTo(event); $('.take-editor', this.root).focus({preventScroll: true}); return;
     }
-    const edge = event.target.closest('[data-edge]'), grip = event.target.closest('[data-grip]'), music = event.target.closest('[data-music-move]');
-    const body = this.tool === 'slip' && !edge && !grip && !music ? event.target.closest('[data-clip]') : null;
-    if (!edge && !grip && !music && !body) return;
+    const edge = event.target.closest('[data-edge]'), grip = event.target.closest('[data-grip]'), music = event.target.closest('[data-music-move]'), lane = event.target.closest('[data-lane-move]');
+    const body = this.tool === 'slip' && !edge && !grip && !music && !lane ? event.target.closest('[data-clip]') : null;
+    if (!edge && !grip && !music && !lane && !body) return;
     event.preventDefault(); this.pause(); App.interactionBusy = true;
     const button = event.target.closest('[data-clip]'); if (button) this.selected = button.dataset.clip;
-    let mode = music ? 'music' : body ? 'slip' : edge?.dataset.edge || 'move', id = this.selected, rightId = null;
+    let mode = lane ? 'lane' : music ? 'music' : body ? 'slip' : edge?.dataset.edge || 'move', id = this.selected, rightId = null;
     if (this.tool === 'roll' && edge && button) {
       const i = this.edit.clips.findIndex(c => c.id === button.dataset.clip), left = edge.dataset.edge === 'right' ? i : i - 1;
       if (i >= 0 && left >= 0 && left + 1 < this.edit.clips.length) { mode = 'roll'; id = this.edit.clips[left].id; rightId = this.edit.clips[left + 1].id; }
     }
-    this.drag = {pointer: event.pointerId, x: event.clientX, before: editClone(this.edit), mode, id, rightId};
+    this.drag = {pointer: event.pointerId, x: event.clientX, before: editClone(this.edit), mode, id, rightId, laneId: lane?.dataset.laneMove};
     $('.edit-canvas', this.root).setPointerCapture(event.pointerId);
   }
   dragMove(event) {
@@ -980,6 +1085,16 @@ class TakeTimelineEditor {
         else if (b != null) { begin = b - frames; this.snapAt = b; }
       }
       this.edit.music.start_frame = Math.max(0, begin);
+    }
+    else if (d.mode === 'lane') {
+      const t = d.before.audio.find(x => x.id === d.laneId), now = this.edit.audio.find(x => x.id === d.laneId);
+      let begin = Math.max(0, t.start_frame + delta);
+      if (snapping) {
+        const a = this.nearest(begin, targets), b = this.nearest(begin + t.frames, targets);
+        if (a != null && (b == null || Math.abs(a - begin) <= Math.abs(b - begin - t.frames))) { begin = a; this.snapAt = a; }
+        else if (b != null) { begin = b - t.frames; this.snapAt = b; }
+      }
+      now.start_frame = Math.max(0, begin);
     }
     else if (d.mode === 'left') { const origin = this.start(c.id), hit = snapping ? this.nearest(origin + delta, targets) : null; if (hit != null) { delta = hit - origin; this.snapAt = hit; } const offset = Math.max(-this.fitFrames(c, Math.round(c.source_in * this.fps)), Math.min(c.frames - 1, delta)); c.source_in = Math.max(0, c.source_in + offset / this.fps * this.speed(c)); c.frames -= offset; }
     else if (d.mode === 'right') { const end = this.start(c.id) + c.frames, hit = snapping ? this.nearest(end + delta, targets) : null; if (hit != null) { delta = hit - end; this.snapAt = hit; } c.frames = Math.max(1, Math.min(this.fitFrames(c, this.sourceFrames(c) - Math.round(c.source_in * this.fps)), c.frames + delta)); }
@@ -1032,6 +1147,7 @@ class TakeTimelineEditor {
     this.pause(); this.destroyed = true; clearTimeout(this.saveTimer); cancelAnimationFrame(this.thumbRaf); this.monitorObserver?.disconnect();
     document.body.classList.remove('timeline-focus');
     this.video.removeAttribute('src'); this.audio.removeAttribute('src'); this.video.load(); this.audio.load();
+    this.laneEls.forEach(el => { el.pause(); el.removeAttribute('src'); }); this.laneEls.clear();
   }
 }
 

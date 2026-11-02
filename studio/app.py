@@ -588,6 +588,28 @@ def timeline_beats(sid: str, eid: str, file: str):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.post('/api/s/{sid}/e/{eid}/timeline/audio')
+async def upload_timeline_audio(sid: str, eid: str, file: UploadFile = File(...)):
+    """A voice-over or sound effect for an extra audio lane; the music track is not touched."""
+    _ep(sid, eid)
+    p = await _save_upload(file, os.path.join(store.ep_dir(sid, eid), "uploads"))
+    try:
+        info = media.probe(_s()['ffprobe'], p)
+        if not info['has_audio'] or not math.isfinite(info['duration']) or info['duration'] <= 0:
+            raise ValueError('Upload a playable audio file')
+    except (ValueError, media.MediaError) as exc:
+        os.unlink(p)
+        raise HTTPException(400, 'Upload a playable audio file') from exc
+    rel = store.rel(p)
+
+    def apply(e):
+        assets = e.setdefault('audio_assets', [])
+        if rel not in assets:
+            assets.append(rel)
+    store.update_episode(sid, eid, apply)
+    return {'file': rel, 'duration': info['duration']}
+
+
 @app.put('/api/s/{sid}/e/{eid}/timeline')
 def save_timeline(sid: str, eid: str, body: dict = Body(...)):
     _ep(sid, eid)

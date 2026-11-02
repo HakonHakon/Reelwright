@@ -17,7 +17,8 @@ User docs: `STUDIO.md` ("Editing in Takes", shortcuts, Beats, Markers, Render ra
 | D1 | per-clip fade in / fade out (video + audio) | done |
 | D2 | crossfades between clips | not started |
 | E | titles / captions overlay | done |
-| F | extra audio lanes, then a video overlay lane | not started |
+| F1 | extra audio lanes | done |
+| F2 | video overlay lane | not started |
 | G1 | clip speed (0.25-4x, pitch-preserving audio) | done |
 | G2 | reframe (crop / position / scale) | not started |
 
@@ -133,13 +134,14 @@ final graph (then lip-sync sees the uncropped picture).
 - D1 fades: `fade_in`/`fade_out` per clip (frames); validated, retimed, applied in the final filter graph (lip-sync cache unaffected); clamped client-side after every edit; split gives the fade-out to the right half; range previews keep a fade only at a true clip edge. Inspector fields (single + group) and a triangle overlay on the clip. +11 tests (backend render checks picture and audio ramps). Left over: drag handles on the clip corners (see Smaller ideas).
 - E titles: `titles[]` (text, start_frame, frames, x, y, size, color, box) validated (max 200), retimed, shifted into range previews; drawn with Pillow (`studio/titles.py`, bundled `DejaVuSans-Bold.ttf`) and overlaid in the final graph with `overlay=enable='between(n,a,b)'`. Editor: TITLES lane, add/edit dialog, live preview over the monitor (same font and maths), Delete-key priority marker > title > clips. +36 tests (real renders prove the text shows exactly in its frames, also in range previews). Left over: drag/resize titles on the lane, fade/animate titles, per-title font choice, title templates, subtitles import (.srt).
 - G1 speed: per-clip `speed` (0.25..4, default 1; old projects load as 1). `validate` counts `round(frames*speed)` source frames and rejects speed != 1 on lip-sync clips; `slice_clips` advances `source_in` by `offset*speed`; render adds `setpts=PTS/speed` + an `atempo` chain (`timeline.atempo`) in the per-clip extraction (lip-sync cache unaffected because lip-sync clips are always 1x). Client: `speed()/usedFrames()/fitFrames()` helpers used by right-trim, left-trim, slip, roll, Cut to beat, split, trimTo, addTake, thumbnails and the monitor (`playbackRate`); inspector Speed field changes the timeline length and keeps the source range; badge shows `N×`. +19 backend tests (frame-exact at 0.25/0.5/1.5/2/3x, 24 fps take, range preview equals full export, audio length) and 1 browser test. Baseline now: 196 passed in Chromium. Left over: speed ramps, reverse, a drag handle for speed, EDL events still log timeline duration only.
+- F1 audio lanes: `audio: [{id, file, lane, source_in, start_frame, frames, volume, muted, loop, fade_in, fade_out}]` (max 8; old projects load as `[]`). `parse_audio` validates like music (trim within the recording unless looping, fades fit), `retime` scales position/length/fades, `source_info(audio=True)` also allows files of saved lanes, new `POST /timeline/audio` stores an upload in `audio_assets` without touching `music`. Render: `prepare_music(..., name='laneK')` per unmuted lane (now also applies fades), one `-i` each (seeked like music for range previews), `amix` of clips + music + lanes before the limiter. Client: lane rows under MUSIC with `LANE_HEIGHT`, label rows (`.lbl-lane`) with M buttons, waveforms via `/timeline/waveform`, one `Audio` element per active lane (`syncLanes`), drag with snapping (`mode 'lane'`), inspector section with per-lane fields. +7 backend tests (frequency checks at the right times, overlap adds up, mute, fades, range preview, fps change, validation) and 1 browser test. Left over: per-lane solo, edge-trim handles and vertical lane drag, Delete key on a lane clip, lane clip fade preview in the monitor, deleting unused uploaded files.
 - Tap counting: browsers drop `dblclick` when a click redraws the element, so double actions on clips, markers and titles use `tap()` (two quick taps). Found because "double-click a clip" (phase A) had silently never worked.
 
 ## Next steps for the phases not built yet (execution plan)
 
 Baseline when this was written: `pytest -q tests` = 167 passed + the 3 unrelated e2e errors. Keep it green after each step.
 Each phase below is a vertical slice: backend + tests, then UI + browser test, then docs + the log above.
-Recommended order (value over risk): **~~G1 speed~~ (done) -> F1 audio lanes -> D2 crossfades -> F2 overlay lane -> G2 reframe.**
+Recommended order (value over risk): **~~G1 speed~~ (done) -> ~~F1 audio lanes~~ (done) -> D2 crossfades -> F2 overlay lane -> G2 reframe.**
 
 ### G1. Clip speed (DONE, see the progress log)
 1. `timeline.py`: clip field `speed` (float 0.25..4, default 1). `validate`: source needed = `frames * speed` frames,
@@ -158,7 +160,7 @@ Recommended order (value over risk): **~~G1 speed~~ (done) -> F1 audio lanes -> 
    preview slice with speed; browser test for the inspector field, split keeping content continuous, roll bounds.
 5. Docs: STUDIO.md "Speed". Risk: off-by-one source frames; the frame-count check will catch them.
 
-### F1. Extra audio lanes (about 1-2 sessions)
+### F1. Extra audio lanes (DONE, see the progress log)
 1. Schema: `audio: [{id, file, lane, source_in, start_frame, frames, volume, muted, loop, fade_in, fade_out}]` (max 8);
    keep `music` as the lip-sync guide. `source_info(audio=True)` must also allow files uploaded for lanes
    (`episode['audio_assets']` already exists; add an upload endpoint modelled on `/music`).
@@ -191,7 +193,7 @@ Fade handles on clip corners; delete/clean range previews; title drag on the lan
 EDL markers once the Resolve format is verified; clip waveforms; J/K/L shuttle; group drag of a selection.
 
 ### Starting prompt for the next session
-"Read docs/TIMELINE-ROADMAP.md and STUDIO.md, run the test suite for a baseline, then implement phase F1 (extra audio lanes)
+"Read docs/TIMELINE-ROADMAP.md and STUDIO.md, run the test suite for a baseline, then implement phase D2 (crossfades)
 following the 'How a new saved field must be added' checklist. Try risky edits on a copy of studio_data
 (STUDIO_DATA=...) first. Update the Progress log and STUDIO.md when done."
 - Lip-sync quality: no better free local model found (LatentSync 1.6 remains the best dedicated video-to-video option for a 24 GB card; MuseTalk is faster but 256 px, InfiniteTalk regenerates the performance). A/B on 3 project clips: guidance 2.0 beats 1.5 on SyncNet (LSE-C +33..72%, LSE-D lower) at equal time. New `lipsync` setting (steps 20, guidance 2.0, seed 1247) via `settings.lipsync_params()`, used by both lip-sync call sites and part of the render cache key. The A/B scripts were throwaway (SyncNet weights come from `ByteDance/LatentSync-1.6/auxiliary/`). Untested ideas: KeySync (occlusion/microphone handling; license unconfirmed), MuseTalk as a fast-preview engine.

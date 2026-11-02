@@ -772,6 +772,73 @@ def test_speed_inspector_split_continuity_lipsync_exclusion_and_persistence(edit
         browser.close()
 
 
+def test_audio_lanes_add_drag_mute_inspector_remove_and_persist(edit_server):
+    base, sid, eid, shots, music, submitted = edit_server
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(viewport={'width': 1440, 'height': 1100}, service_workers='block').new_page()
+        errors, ed = _open_editor(page, base, sid, eid)
+        lanes = lambda: page.evaluate('App.timelineEditor.edit.audio.map(t => [t.start_frame, t.frames, t.muted, t.fade_in, t.fade_out, t.lane])')
+        assert page.locator('.edit-lane-clip').count() == 0 and 'Audio lanes (0/8)' in page.locator('[data-edit-inspector]').inner_text()
+        page.locator('[data-edit-zoom]').fill('100'); page.evaluate('App.timelineEditor.snap = false')
+
+        # Adding audio puts a lane clip at the playhead, with its own label row and mute button; music is untouched.
+        music_before = page.evaluate('JSON.stringify(App.timelineEditor.edit.music)')
+        page.locator('[data-edit-scrub]').fill('6')
+        page.locator('[data-edit-lane]').set_input_files(str(music))
+        page.locator('.edit-lane-clip').first.wait_for()
+        page.locator('[data-edit-scrub]').fill('0')
+        page.locator('[data-edit-lane]').set_input_files(str(music))
+        playwright.expect(page.locator('.edit-lane-clip')).to_have_count(2)
+        assert page.evaluate('JSON.stringify(App.timelineEditor.edit.music)') == music_before
+        assert page.locator('.lbl-lane').count() == 2 and [a[0] for a in lanes()] == [6, 0] and [a[5] for a in lanes()] == [0, 1]
+        rows = page.evaluate("[...document.querySelectorAll('.edit-lane')].map(e => e.getBoundingClientRect().top)")
+        labels = page.evaluate("[...document.querySelectorAll('.lbl-lane')].map(e => e.getBoundingClientRect().top)")
+        assert all(abs(a - b) < 2 for a, b in zip(rows, labels)), 'labels line up with their lane rows'
+        page.wait_for_function("document.querySelectorAll('.edit-lane-clip svg').length === 2")  # waveforms loaded
+
+        # Dragging moves it in time (one second = 30 frames at this zoom) and is one undo step.
+        page.locator('.edit-lane-clip').nth(1).scroll_into_view_if_needed()
+        box = page.locator('.edit-lane-clip').nth(1).bounding_box()
+        page.mouse.move(box['x'] + 20, box['y'] + 10); page.mouse.down(); page.mouse.move(box['x'] + 70, box['y'] + 10, steps=4); page.mouse.move(box['x'] + 120, box['y'] + 10, steps=4); page.mouse.up()
+        assert lanes()[1][0] == 30, lanes()
+        page.locator('.take-editor').focus(); page.keyboard.press('Control+z'); assert lanes()[1][0] == 0
+        page.keyboard.press('Control+Shift+z'); assert lanes()[1][0] == 30
+
+        # Mute from the label; the clip dims.
+        page.locator('[data-edit="lane-mute"]').first.click()
+        assert lanes()[0][2] is True and 'muted' in page.locator('.edit-lane-clip').first.get_attribute('class')
+
+        # The inspector edits the second lane: start, fades (clamped to the length), then loop off/on.
+        box2 = page.locator('[data-lane-box]').nth(1)
+        start = box2.locator('[data-lane-field="start"]'); start.fill('0.5'); start.press('Tab')
+        assert lanes()[1][0] == 15
+        box2.locator('[data-lane-field="fade_in"]').fill('0.5'); box2.locator('[data-lane-field="fade_in"]').press('Tab')
+        assert lanes()[1][3] == 15 and page.locator('.edit-lane-clip').nth(1).locator('.edit-fade.in').count() == 1
+        box2.locator('[data-lane-field="length"]').fill('0.3'); box2.locator('[data-lane-field="length"]').press('Tab')
+        assert lanes()[1][1] == 9 and lanes()[1][3] == 9, 'a shorter lane clip shortens its fade'
+        too_long = box2.locator('[data-lane-field="length"]'); too_long.fill('9999'); too_long.press('Tab')
+        assert lanes()[1][1] == 9, 'longer than the recording without Loop is refused'
+        box2.locator('[data-lane-field="loop"]').check(); too_long = page.locator('[data-lane-box]').nth(1).locator('[data-lane-field="length"]')
+        too_long.fill('9999'); too_long.press('Tab')
+        assert lanes()[1][1] == 299970, lanes()
+
+        # Autosave persists the lanes; removing one re-numbers the other.
+        page.locator('[data-edit="save"]').click()
+        page.wait_for_function('!App.timelineEditor.dirty && !App.timelineEditor.saving')
+        saved = store.get_episode(sid, eid)['timeline']['audio']
+        assert [t['id'] for t in saved] == [t['id'] for t in page.evaluate('App.timelineEditor.edit.audio')] and saved[1]['loop'] is True
+        page.locator('[data-lane-box]').first.locator('[data-edit="lane-remove"]').click()
+        assert len(lanes()) == 1 and lanes()[0][5] == 0 and page.locator('.edit-lane-clip').count() == 1 and page.locator('.lbl-lane').count() == 1
+        page.locator('.take-editor').focus(); page.keyboard.press('Control+z'); assert len(lanes()) == 2
+
+        # Play: both lane players exist only while their clip is under the playhead.
+        page.locator('[data-edit-scrub]').fill('20')
+        assert page.evaluate('App.timelineEditor.laneEls.size') >= 1
+        assert not errors, errors
+        browser.close()
+
+
 def test_titles_dialog_lane_live_preview_delete_and_persistence(edit_server):
     base, sid, eid, shots, music, submitted = edit_server
     with playwright.sync_playwright() as p:

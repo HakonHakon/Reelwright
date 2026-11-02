@@ -734,9 +734,9 @@ input[aria-invalid="true"] { border-color: var(--bad); outline: 2px solid color-
 @media (max-width: 760px) { .mk-row { grid-template-columns: auto minmax(0, 1fr) auto; } .mk-row select { grid-column: 2; } .mk-row [data-mk-del] { grid-row: 1; grid-column: 3; } }
 
 /* Fades */
-.edit-clip .edit-fade { position: absolute; top: 0; bottom: 0; background: #000000b8; pointer-events: none; z-index: 1; }
-.edit-clip .edit-fade.in { left: 0; clip-path: polygon(0 0, 100% 0, 0 100%); }
-.edit-clip .edit-fade.out { right: 0; clip-path: polygon(0 0, 100% 0, 100% 100%); }
+.edit-clip .edit-fade, .edit-lane-clip .edit-fade { position: absolute; top: 0; bottom: 0; background: #000000b8; pointer-events: none; z-index: 1; }
+.edit-clip .edit-fade.in, .edit-lane-clip .edit-fade.in { left: 0; clip-path: polygon(0 0, 100% 0, 0 100%); }
+.edit-clip .edit-fade.out, .edit-lane-clip .edit-fade.out { right: 0; clip-path: polygon(0 0, 100% 0, 100% 100%); }
 .edit-inspector input[data-edit-fade]::placeholder { color: var(--faint); }
 
 /* Titles */
@@ -748,7 +748,17 @@ input[aria-invalid="true"] { border-color: var(--bad); outline: 2px solid color-
 .edit-title { position: absolute; top: 3px; height: 20px; min-height: 0; min-width: 0; padding: 0 6px; overflow: hidden; border: 1px solid #a98be0; border-radius: 3px; background: #4b3a73; color: #efe8ff; font: 600 11px/18px var(--f-body); text-align: left; white-space: nowrap; cursor: pointer; display: block; }
 .edit-title span { display: block; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
 .edit-title.sel { outline: 2px solid #fff; outline-offset: 1px; }
-.edit-labels div:nth-child(4) { height: 26px; border-top: 1px solid #303b4d; }
+.edit-labels .lbl-titles { height: 26px; border-top: 1px solid #303b4d; }
+.edit-labels .lbl-lane { height: 40px; border-top: 1px solid #303b4d; flex-direction: row; gap: 4px; }
+.edit-audio-track { position: relative; }
+.edit-lane { position: absolute; left: 0; right: 0; height: 40px; border-top: 1px solid #303b4d; }
+.edit-lane-clip { position: absolute; top: 5px; height: 29px; border: 1px solid #5a86b8; background: #20395a; color: #dce9ff; overflow: hidden; min-width: 0; padding: 0 8px; cursor: grab; touch-action: none; text-align: left; }
+.edit-lane-clip svg { position: absolute; inset: 0; height: 100%; width: 100%; opacity: .45; fill: #8cb6e8; pointer-events: none; }
+.edit-lane-clip span { position: relative; font: 11px var(--f-code); white-space: nowrap; text-shadow: 0 1px 3px #000; pointer-events: none; }
+.edit-lane-clip.muted { opacity: .55; }
+.edit-lane-clip:focus-visible { outline: 2px solid #f1b56e; outline-offset: 1px; z-index: 5; }
+.edit-lane-box { border: 1px solid #394352; border-radius: 4px; margin: 8px 0; padding: 6px 8px; }
+.edit-lane-box legend { font: 11px var(--f-code); color: #a8b7cc; padding: 0 4px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .edit-canvas { min-height: 212px; }
 .edit-marker::before { height: 212px; }
 .tt-list { display: flex; flex-direction: column; gap: 12px; min-width: min(620px, 82vw); max-height: 52vh; overflow: auto; margin-bottom: 4px; }

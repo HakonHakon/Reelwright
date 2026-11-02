@@ -38,7 +38,7 @@ def source_info(episode, file, cfg, audio=False):
     allowed = assets(episode)
     if audio:
         allowed = {episode.get('music', {}).get('file'), (episode.get('timeline', {}).get('music') or {}).get('file'),
-                   *episode.get('audio_assets', [])}
+                   *episode.get('audio_assets', []), *(t.get('file') for t in episode.get('timeline', {}).get('audio') or [])}
     if not isinstance(file, str) or file not in allowed:
         raise ValueError('Choose media from this episode')
     path = Path(store.abs_media(file))
@@ -124,7 +124,7 @@ def default_edit(episode, cfg, selected_takes=False):
         except (ValueError, media.MediaError):
             pass
     return {'schema_version': 1, 'revision': episode.get('timeline', {}).get('revision', 0),
-            'fps': fps, 'clips': clips, 'music': music, 'markers': [], 'range': None, 'titles': []}
+            'fps': fps, 'clips': clips, 'music': music, 'markers': [], 'range': None, 'titles': [], 'audio': []}
 
 
 def view(episode, cfg):
@@ -135,6 +135,7 @@ def view(episode, cfg):
     edit.setdefault('markers', [])  # timelines saved before markers and ranges existed
     edit.setdefault('range', None)
     edit.setdefault('titles', [])
+    edit.setdefault('audio', [])  # timelines saved before audio lanes existed
     sources = {}
     for c in edit['clips']:
         if c['source'] in sources:
@@ -143,11 +144,11 @@ def view(episode, cfg):
             sources[c['source']] = source_info(episode, c['source'], cfg)
         except (ValueError, media.MediaError):
             sources[c['source']] = {'missing': True}
-    if edit.get('music'):
+    for track in [edit['music']] * bool(edit.get('music')) + edit['audio']:
         try:
-            sources[edit['music']['file']] = source_info(episode, edit['music']['file'], cfg, audio=True)
+            sources[track['file']] = source_info(episode, track['file'], cfg, audio=True)
         except (ValueError, media.MediaError):
-            sources[edit['music']['file']] = {'missing': True}
+            sources[track['file']] = {'missing': True}
     return {'edit': edit, 'sources': sources}
 
 
@@ -163,6 +164,12 @@ def retime(edit, fps):
         if edit.get('music'):
             edit['music']['start_frame'] = round(number(edit['music']['start_frame'], 'Music position') * fps / old)
             edit['music']['frames'] = max(1, round(number(edit['music']['frames'], 'Music length', 1) * fps / old))
+        for track in edit.get('audio') or []:
+            track['start_frame'] = round(number(track['start_frame'], 'Audio position') * fps / old)
+            track['frames'] = max(1, round(number(track['frames'], 'Audio length', 1) * fps / old))
+            fade_in = min(track['frames'], round(number(track.get('fade_in', 0), 'Audio fade in') * fps / old))
+            track['fade_in'] = fade_in
+            track['fade_out'] = min(track['frames'] - fade_in, round(number(track.get('fade_out', 0), 'Audio fade out') * fps / old))
         for marker in edit.get('markers') or []:
             marker['frame'] = round(number(marker['frame'], 'Marker position') * fps / old)
         for title in edit.get('titles') or []:
@@ -253,6 +260,39 @@ def parse_titles(value):
     return sorted(out, key=lambda x: (x['start_frame'], x['id']))
 
 
+MAX_AUDIO = 8
+
+
+def parse_audio(episode, value, fps, cfg):
+    """Extra audio lanes (voice-over, effects) mixed under the picture. Music stays the lip-sync guide."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_AUDIO:
+        raise ValueError(f'Use at most {MAX_AUDIO} audio lanes')
+    out, seen = [], set()
+    for t in value:
+        if not isinstance(t, dict) or not isinstance(t.get('id'), str) or not t['id'] or t['id'] in seen:
+            raise ValueError('Each audio lane clip needs a unique id')
+        seen.add(t['id'])
+        info = source_info(episode, t.get('file'), cfg, audio=True)
+        start = round(number(t.get('source_in', 0), 'Audio source start') * fps)
+        position, frames = number(t.get('start_frame', 0), 'Audio position', 0, MAX_FRAME), number(t.get('frames'), 'Audio length', 1, MAX_FRAME)
+        loop = flag(t.get('loop', False), 'Audio loop')
+        available = round(info['duration'] * fps) - start
+        if type(position) is not int or type(frames) is not int or available < 1 or not loop and frames > available:
+            raise ValueError('Audio trim extends beyond the recording; enable looping or shorten it')
+        fade_in, fade_out = number(t.get('fade_in', 0), 'Audio fade in'), number(t.get('fade_out', 0), 'Audio fade out')
+        if type(fade_in) is not int or type(fade_out) is not int or fade_in + fade_out > frames:
+            raise ValueError('Audio fades must be whole frames and fit inside the clip')
+        lane = number(t.get('lane', len(out)), 'Audio lane', 0, MAX_AUDIO - 1)
+        if type(lane) is not int:
+            raise ValueError('Audio lane must be a whole number')
+        out.append({'id': t['id'], 'file': t['file'], 'lane': lane, 'source_in': start / fps, 'start_frame': position,
+                    'frames': frames, 'loop': loop, 'volume': number(t.get('volume', 1), 'Audio volume', 0, 2),
+                    'muted': flag(t.get('muted', False), 'Audio mute'), 'fade_in': fade_in, 'fade_out': fade_out})
+    return out
+
+
 def parse_range(value):
     """The In/Out span used by "Render range". Clamped to the timeline when rendering."""
     if value is None:
@@ -320,7 +360,7 @@ def validate(episode, body, cfg):
     return {'schema_version': 1, 'revision': episode.get('timeline', {}).get('revision', 0),
             'fps': fps, 'clips': clips, 'music': music,
             'markers': parse_markers(body.get('markers')), 'range': parse_range(body.get('range')),
-            'titles': parse_titles(body.get('titles'))}
+            'titles': parse_titles(body.get('titles')), 'audio': parse_audio(episode, body.get('audio'), fps, cfg)}
 
 
 def save(sid, eid, body, cfg):
@@ -357,20 +397,22 @@ def run(job, command):
             raise media.MediaError('Timeline processing failed: ' + log.read()[-2000:])
 
 
-def prepare_music(job, cfg, music, frames, fps, out, guide=False):
+def prepare_music(job, cfg, music, frames, fps, out, guide=False, name='music'):
     """Place and trim audio on the same frame clock as the picture."""
-    destination = out / ('guide.wav' if guide else 'music.wav')
+    destination = out / ('guide.wav' if guide else name + '.wav')
     if not music:
         return None
-    trimmed = out / 'music_source.wav'
+    trimmed = out / (name + '_source.wav')
     if not trimmed.exists():
         run(job, [cfg['ffmpeg'], '-y', '-v', 'error', '-ss', str(music['source_in']),
                   '-i', store.abs_media(music['file']), '-vn', '-ar', '48000', '-ac', '2', str(trimmed)])
     loop = ['-stream_loop', '-1'] if music['loop'] else []
     volume = 1 if guide else 0 if music['muted'] else music['volume']
     delay = round(music['start_frame'] / fps * 48000)
+    fi, fo = music.get('fade_in', 0), music.get('fade_out', 0)
+    fades = (f',afade=t=in:st=0:d={fi / fps:.6f}' if fi else '') + (f',afade=t=out:st={(music["frames"] - fo) / fps:.6f}:d={fo / fps:.6f}' if fo else '')
     run(job, [cfg['ffmpeg'], '-y', '-v', 'error', *loop, '-i', str(trimmed), '-af',
-              f'atrim=duration={music["frames"]/fps},asetpts=N/SR/TB,volume={volume},'
+              f'atrim=duration={music["frames"]/fps},asetpts=N/SR/TB{fades},volume={volume},'
               f'adelay={delay}S:all=1,apad,atrim=end_sample={round(frames/fps*48000)}',
               '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', str(destination)])
     return destination
@@ -427,6 +469,7 @@ def render(job, sid, eid, edit, video, window=None):
             guide = out / 'vocals.flac'
             client.download(result['audios'][0], str(guide))
     music = prepare_music(job, cfg, edit.get('music'), full, fps, out)
+    lanes = [prepare_music(job, cfg, t, full, fps, out, name=f'lane{k}') for k, t in enumerate(edit.get('audio') or []) if not t['muted']]
     cache = Path(store.ep_dir(sid, eid)) / 'out' / 'timeline_cache'
     cache.mkdir(exist_ok=True)
     clips, events, position = [], [], 0
@@ -487,6 +530,8 @@ def render(job, sid, eid, edit, video, window=None):
             shown.append((titles_mod.render_png(title, width, height, out / f'title_{len(shown)}.png'), a, b))
     if music:
         command += (['-ss', f'{first / fps:.6f}', '-t', f'{total / fps:.6f}'] if window else []) + ['-i', str(music)]
+    for lane in lanes:
+        command += (['-ss', f'{first / fps:.6f}', '-t', f'{total / fps:.6f}'] if window else []) + ['-i', str(lane)]
     for png, _, _ in shown:
         command += ['-i', str(png)]
     graph, inputs = [], ''
@@ -497,12 +542,13 @@ def render(job, sid, eid, edit, video, window=None):
         graph += [f'[{i}:v]trim=end_frame={c["frames"]},setpts=N/({fps}*TB){fade_v}[v{i}]',
                   f'[{i}:a]aresample=48000,atrim=end_sample={round(c["frames"]/fps*48000)},asetpts=N/SR/TB{fade_a}[a{i}]']
         inputs += f'[v{i}][a{i}]'
-    first_input = len(clips) + (1 if music else 0)
+    first_input = len(clips) + (1 if music else 0) + len(lanes)
     graph += [f'{inputs}concat=n={len(clips)}:v=1:a=1[v][a]', f'[v]setpts=N/({fps}*TB)[pic0]']
     for j, (_, a, b) in enumerate(shown):
         graph.append(f"[pic{j}][{first_input + j}:v]overlay=0:0:enable='between(n,{a},{b - 1})'[pic{j + 1}]")
     graph.append(f'[pic{len(shown)}]null[picture]')
-    graph += [f'[a][{len(clips)}:a]amix=inputs=2:duration=first:normalize=0[mix]'] if music else ['[a]anull[mix]']
+    extra = ([len(clips)] if music else []) + [len(clips) + (1 if music else 0) + k for k in range(len(lanes))]
+    graph += [f'[a]' + ''.join(f'[{i}:a]' for i in extra) + f'amix=inputs={len(extra) + 1}:duration=first:normalize=0[mix]'] if extra else ['[a]anull[mix]']
     graph += ['[mix]alimiter=limit=0.95:level=false:latency=true[sound]']
     final = out / ('preview.mp4' if window else 'timeline.mp4')
     job.check()

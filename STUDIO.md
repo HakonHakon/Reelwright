@@ -131,6 +131,15 @@ rolling, splitting and Cut to beat all work in timeline frames. A clip cannot be
 footage for at that speed. Lip-sync clips must play at normal speed: turn lip-sync off first, and a sped-up
 clip cannot be lip-synced. Range previews and exports use the same speed.
 
+### Audio lanes
+
+**Add audio lane** (below the timeline) puts a voice-over or sound effect on its own lane under MUSIC, starting at
+the playhead. Up to 8 lanes; each has an **M** button in the labels column. Drag a lane clip to move it (it snaps to
+clip edges, other lanes, markers and the playhead; hold **Alt** to bypass). The inspector's **Audio lanes** section sets
+source in, timeline start, length, fade in/out, volume, mute, loop, and removes the lane. Lanes are mixed with the
+clip sounds and the music in the export and in range previews, and are previewed in the monitor. Music stays the
+guide for lip-sync; lanes never affect it.
+
 ### Titles
 
 **Title** adds on-screen text at the playhead (3 seconds by default) and opens its editor; **Titles (n)**

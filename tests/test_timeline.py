@@ -1249,3 +1249,47 @@ def test_range_previews_and_speed_keep_the_reframe(film):
     edit['clips'] = [clip]; edit['music'] = None
     video, _ = _render_edit(sid, eid, copy.deepcopy(edit), window=(5, 15))
     assert len(video) == 10 and video[0, 5, 8, 2] > 200 and video[0, 90, 8, 2] > 200, 'blue everywhere: cover at the right focus'
+
+
+def test_a_25_fps_lipsync_result_becomes_smooth_project_frames(film, tmp_path):
+    """LatentSync answers at 25 fps. Repeating frames to reach 30 froze the mouth every 6th frame."""
+    moving = tmp_path / 'model.mp4'   # a bar that moves 4 px every frame at 25 fps
+    frames = np.zeros((25, 96, 64, 3), dtype=np.uint8)
+    for n in range(25):
+        frames[n, :, n * 2:n * 2 + 6] = 255
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', '64x96', '-r', '25', '-i', 'pipe:0',
+                    '-c:v', 'libx264', '-crf', '0', str(moving)], input=frames.tobytes(), check=True)
+
+    class Model:
+        def upload(self, path, name): return name
+        def run(self, workflow, cancel=None): return {'videos': ['x']}
+        def download(self, name, path): Path(path).write_bytes(moving.read_bytes())
+    (tmp_path / 'a.mp4').write_bytes(b''); (tmp_path / 'v.wav').write_bytes(b'')
+    out = tmp_path / 'o.mp4'
+    lipsync.correct_clip(jobs.Job('t', 't', None, {}), settings.load(), Model(), str(tmp_path / 'a.mp4'), str(tmp_path / 'v.wav'),
+                         str(out), 30, 64, 96, 30, 'p')
+    video, = [np.frombuffer(subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(out), '-f', 'rawvideo', '-pix_fmt', 'gray', '-']), np.uint8).reshape(-1, 96, 64)]
+    assert len(video) == 30
+    centre = [float((np.arange(64) * row).sum() / max(row.sum(), 1)) for row in video[:28, 48].astype(float)]
+    steps = np.diff(centre)
+    assert steps.min() > .5, f'no frozen frames: {np.round(steps, 2)}'
+    assert lipsync.RETIME_VERSION, 'part of the lip-sync cache key, so old cached clips are made again'
+
+
+def test_a_24_fps_take_moves_on_every_frame_of_a_30_fps_export(film):
+    """Repeating every 4th frame to get from 24 to 30 fps made every take stutter; it is interpolated now."""
+    client, sid, eid, shots, music = film
+    source = store.abs_media(shots[0]['takes']['items'][0]['file'])
+    frames = np.zeros((24, 96, 64, 3), dtype=np.uint8)
+    for n in range(24):
+        frames[n, :, n * 2:n * 2 + 6] = 255
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', '64x96', '-r', '24', '-i', 'pipe:0',
+                    '-c:v', 'libx264', '-crf', '0', source], input=frames.tobytes(), check=True)
+    edit = timeline.default_edit(store.get_episode(sid, eid), settings.load())
+    edit['clips'] = [{**edit['clips'][0], 'frames': 28, 'muted': True}]; edit['music'] = None
+    video, _ = _render_edit(sid, eid, edit)
+    assert len(video) == 28
+    gray = video[:, 48, :, 0].astype(float)
+    centre = (gray * np.arange(64)).sum(axis=1) / np.maximum(gray.sum(axis=1), 1)
+    assert np.diff(centre).min() > .6, f'no repeated frames: {np.round(np.diff(centre), 2)}'
+    assert abs(centre[0] - 2.5) < 1 and abs(centre[-1] - (2.5 + 27 / 30 * 24 * 2)) < 2, 'starts and ends on the right moment'

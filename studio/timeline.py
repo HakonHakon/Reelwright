@@ -602,7 +602,7 @@ def render(job, sid, eid, edit, video, window=None):
         target = out / f'ov{k}.mp4'
         wide = max(2, round(o['scale'] * width / 2) * 2)
         run(job, [cfg['ffmpeg'], '-y', '-v', 'error', '-ss', str(o['source_in']), '-i', store.abs_media(o['source']), '-an',
-                  '-vf', f'scale={wide}:-2,fps={fps}:start_time=0,tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                  '-vf', f'scale={wide}:-2,{media.to_frame_rate(fps, media.probe(cfg["ffprobe"], store.abs_media(o["source"]))["fps"])},tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
                   '-frames:v', str(o['frames']), '-c:v', 'libx264', '-crf', '16', str(target)])
         overlay_files.append(target)
     cache = Path(store.ep_dir(sid, eid)) / 'out' / 'timeline_cache'
@@ -622,7 +622,7 @@ def render(job, sid, eid, edit, video, window=None):
         # start_time=0 keeps the first frame when a trim lands between the source's own frames
         # (e.g. a 24 fps take on a 30 fps timeline); otherwise the clip comes out one frame short.
         command += ['-map', '0:v:0', '-map', '0:a:0' if info['has_audio'] else '1:a:0',
-                    '-vf', reframe_filter(info['width'], info['height'], width, height, c.get('reframe') or DEFAULT_REFRAME) + (f',setpts=PTS/{speed:.8f}' if speed != 1 else '') + f',fps={fps}:start_time=0,tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                    '-vf', reframe_filter(info['width'], info['height'], width, height, c.get('reframe') or DEFAULT_REFRAME) + (f',setpts=PTS/{speed:.8f}' if speed != 1 else '') + f',{media.to_frame_rate(fps, info["fps"] * speed)},tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
                     '-af', (atempo(speed) + ',' if speed != 1 else '') + f'aresample=48000,apad,atrim=end_sample={round(duration*48000)}',
                     '-frames:v', str(c['frames']), '-t', str(duration), '-c:v', 'libx264', '-crf', '16',
                     '-c:a', 'aac', '-b:a', '256k', str(base)]
@@ -634,7 +634,7 @@ def render(job, sid, eid, edit, video, window=None):
                       '-t', str(duration), '-ar', '16000', '-ac', '1', str(voice)])
             fingerprint = [source, Path(source).stat().st_mtime_ns, Path(source).stat().st_size,
                            c['source_in'], c['frames'], video, hashlib.sha256(voice.read_bytes()).hexdigest(),
-                           'LatentSync1.6-{steps}-{guidance}-{seed}'.format(**settings.lipsync_params(cfg)), c.get('reframe')]
+                           'LatentSync1.6-{steps}-{guidance}-{seed}'.format(**settings.lipsync_params(cfg)), c.get('reframe'), lipsync.RETIME_VERSION]
             key = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
             picture = cache / (key + '.mp4')
             if not picture.is_file():

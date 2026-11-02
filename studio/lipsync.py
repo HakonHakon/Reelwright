@@ -7,6 +7,15 @@ import uuid
 from . import comfy, media, settings, store, workflows
 
 
+# LatentSync always returns 25 fps. Plain `fps=30` repeats every 5th frame, so the mouth freezes for a frame
+# six times a second (visible judder); motion-compensated interpolation makes the in-between frames instead.
+RETIME_VERSION = 'mci2'  # mci2: the takes fed to lip-sync are interpolated to the project rate too
+
+
+def to_project_rate(fps):
+    return media.to_frame_rate(fps, 25)
+
+
 def plan_episode(episode, shot_ids, cfg):
     if not isinstance(shot_ids, list) or not shot_ids or any(not isinstance(x, str) for x in shot_ids):
         raise ValueError('Choose at least one single-character shot to lip-sync')
@@ -59,7 +68,7 @@ def correct_clip(job, cfg, client, source, voice, destination, frames, width, he
         client.download(result['videos'][0], rendered)
         job.check()
         media._run([cfg['ffmpeg'], '-y', '-v', 'error', '-i', rendered, '-an', '-vf',
-                    f'scale={width}:{height},fps={fps},tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                    f'scale={width}:{height},{to_project_rate(fps)},tpad=stop_mode=clone:stop_duration=1,setpts=N/({fps}*TB),format=yuv420p',
                     '-frames:v', str(frames), '-c:v', 'libx264', '-crf', '16', destination])
     return destination
 
@@ -117,7 +126,7 @@ def render(job, sid, eid, timeline, audio_file, audio_offset=0, isolate_vocals=T
             client.download(result['videos'][0], str(rendered))
             chosen = out / f'{i:03d}_synced.mp4'
             media._run([cfg['ffmpeg'], '-y', '-v', 'error', '-i', str(rendered), '-an', '-vf',
-                        f'scale={width}:{height},fps={fps},tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                        f'scale={width}:{height},{to_project_rate(fps)},tpad=stop_mode=clone:stop_duration=1,setpts=N/({fps}*TB),format=yuv420p',
                         '-frames:v', str(clip['frames']), '-c:v', 'libx264', '-crf', '16', str(chosen)])
         clips.append(str(chosen))
         job.progress = [i + 1, len(timeline)]

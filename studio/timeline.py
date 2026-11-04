@@ -323,7 +323,8 @@ def parse_titles(value):
     return sorted(out, key=lambda x: (x['start_frame'], x['id']))
 
 
-MAX_AUDIO = 8
+MAX_AUDIO = 8            # audio lanes
+MAX_AUDIO_CLIPS = 64     # clips across all lanes (e.g. one per dialogue line)
 MAX_OVERLAYS = 8
 
 
@@ -370,11 +371,12 @@ def slice_overlays(overlays, first, last, fps):
 
 
 def parse_audio(episode, value, fps, cfg):
-    """Extra audio lanes (voice-over, effects) mixed under the picture. Music stays the lip-sync guide."""
+    """Extra audio lanes (voice-over, effects) mixed under the picture. Clips marked guide=True (dialogue lines)
+    are the lip-sync guide, so each line can be moved on its own and stay in sync; otherwise music is."""
     if value is None:
         return []
-    if not isinstance(value, list) or len(value) > MAX_AUDIO:
-        raise ValueError(f'Use at most {MAX_AUDIO} audio lanes')
+    if not isinstance(value, list) or len(value) > MAX_AUDIO_CLIPS:
+        raise ValueError(f'Use at most {MAX_AUDIO_CLIPS} audio clips')
     out, seen = [], set()
     for t in value:
         if not isinstance(t, dict) or not isinstance(t.get('id'), str) or not t['id'] or t['id'] in seen:
@@ -395,7 +397,8 @@ def parse_audio(episode, value, fps, cfg):
             raise ValueError('Audio lane must be a whole number')
         out.append({'id': t['id'], 'file': t['file'], 'lane': lane, 'source_in': start / fps, 'start_frame': position,
                     'frames': frames, 'loop': loop, 'volume': number(t.get('volume', 1), 'Audio volume', 0, 2),
-                    'muted': flag(t.get('muted', False), 'Audio mute'), 'fade_in': fade_in, 'fade_out': fade_out})
+                    'muted': flag(t.get('muted', False), 'Audio mute'), 'fade_in': fade_in, 'fade_out': fade_out,
+                    'guide': flag(t.get('guide', False), 'Lip-sync guide')})
     return out
 
 
@@ -470,12 +473,13 @@ def validate(episode, body, cfg):
                  'loop': loop, 'volume': number(music.get('volume', 1), 'Music volume', 0, 2),
                  'muted': flag(music.get('muted', False), 'Music mute'),
                  'isolate_vocals': flag(music.get('isolate_vocals', True), 'Vocal isolation')}
-    if any(c['lipsync'] for c in clips) and not music:
-        raise ValueError('Add a music or voice track before enabling lip-sync')
+    audio = parse_audio(episode, body.get('audio'), fps, cfg)
+    if any(c['lipsync'] for c in clips) and not music and not guide_clips(audio):
+        raise ValueError('Add a music track, or mark voice clips on an audio lane as the lip-sync guide, before enabling lip-sync')
     return {'schema_version': 1, 'revision': episode.get('timeline', {}).get('revision', 0),
             'fps': fps, 'clips': clips, 'music': music,
             'markers': parse_markers(body.get('markers')), 'range': parse_range(body.get('range')),
-            'titles': parse_titles(body.get('titles')), 'audio': parse_audio(episode, body.get('audio'), fps, cfg),
+            'titles': parse_titles(body.get('titles')), 'audio': audio,
             'overlays': parse_overlays(episode, body.get('overlays'), fps, cfg, set(seen))}
 
 
@@ -515,6 +519,25 @@ def prepare_music(job, cfg, music, frames, fps, out, guide=False, name='music'):
               f'atrim=duration={music["frames"]/fps},asetpts=N/SR/TB{fades},volume={volume},'
               f'adelay={delay}S:all=1,apad,atrim=end_sample={round(frames/fps*48000)}',
               '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', str(destination)])
+    return destination
+
+
+def guide_clips(tracks):
+    """Unmuted audio-lane clips marked as the lip-sync guide (dialogue lines)."""
+    return [t for t in tracks if t.get('guide') and not t.get('muted')]
+
+
+def lane_guide(job, cfg, tracks, frames, fps, out):
+    """Lip-sync guide mixed from the dialogue clips at their timeline positions (music and effects excluded)."""
+    parts = [prepare_music(job, cfg, {**t, 'volume': 1}, frames, fps, out, name=f'guide_lane{k}')
+             for k, t in enumerate(tracks)]
+    destination = out / 'guide.wav'
+    command = [cfg['ffmpeg'], '-y', '-v', 'error']
+    for p in parts:
+        command += ['-i', str(p)]
+    command += ['-filter_complex', ''.join(f'[{k}:a]' for k in range(len(parts))) + f'amix=inputs={len(parts)}:normalize=0[g]',
+                '-map', '[g]', '-t', f'{frames / fps:.6f}', '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', str(destination)]
+    run(job, command)
     return destination
 
 
@@ -564,8 +587,12 @@ def render(job, sid, eid, edit, video, window=None):
     if sync:
         client = comfy.Comfy(cfg['comfy_host'])
         jobs._gpu_prepare(job, cfg, client)
-        guide = prepare_music(job, cfg, edit['music'], full, fps, out, guide=True)
-        if edit['music']['isolate_vocals']:
+        voice = guide_clips(edit.get('audio') or [])
+        if voice:
+            guide = lane_guide(job, cfg, voice, full, fps, out)
+        else:
+            guide = prepare_music(job, cfg, edit['music'], full, fps, out, guide=True)
+        if not voice and edit['music']['isolate_vocals']:
             job.say('Isolating vocals for the edited timeline')
             uploaded = client.upload(str(guide), out.name + '_guide.wav')
             result = client.run(workflows.separate_vocals(uploaded), cancel=lambda: job.cancel_flag)
@@ -606,7 +633,7 @@ def render(job, sid, eid, edit, video, window=None):
         # start_time=0 keeps the first frame when a trim lands between the source's own frames
         # (e.g. a 24 fps take on a 30 fps timeline); otherwise the clip comes out one frame short.
         command += ['-map', '0:v:0', '-map', '0:a:0' if info['has_audio'] else '1:a:0',
-                    '-vf', reframe_filter(info['width'], info['height'], width, height, c.get('reframe') or DEFAULT_REFRAME) + (f',setpts=PTS/{speed:.8f}' if speed != 1 else '') + f',{media.to_frame_rate(fps, info["fps"] * speed)},tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                    '-vf', reframe_filter(info['width'], info['height'], width, height, c.get('reframe') or DEFAULT_REFRAME) + (f',setpts=PTS/{speed:.8f}' if speed != 1 else '') + f',{media.to_frame_rate(fps, info["fps"] * speed)},tpad=stop_mode=clone:stop_duration=1,fps={fps},format=yuv420p',
                     '-af', (atempo(speed) + ',' if speed != 1 else '') + f'aresample=48000,apad,atrim=end_sample={round(duration*48000)}',
                     '-frames:v', str(c['frames']), '-t', str(duration), '-c:v', 'libx264', '-crf', '16',
                     '-c:a', 'aac', '-b:a', '256k', str(base)]
@@ -706,7 +733,8 @@ def render(job, sid, eid, edit, video, window=None):
     count = json.loads(media._run([cfg['ffprobe'], '-v', 'error', '-count_frames', '-select_streams', 'v:0',
         '-show_entries', 'stream=nb_read_frames', '-of', 'json', str(final)]))['streams'][0]['nb_read_frames']
     if int(count) != total or abs(probe['video_duration'] - total/fps) > 1/fps:
-        raise RuntimeError('Timeline export failed its frame-count check; previous final retained')
+        raise RuntimeError(f"Timeline export failed its frame-count check ({count} frames, {probe['video_duration']:.3f} s; "
+                           f"expected {total} frames, {total/fps:.3f} s); previous final retained")
     job.check()
     (out / 'timeline.edl').write_text(media.edl(episode.get('title', eid), events, fps))
     version = {'file': store.rel(str(final)), 'created': store.now(), 'runtime': total/fps,

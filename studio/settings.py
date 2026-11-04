@@ -18,7 +18,15 @@ DEFAULTS = {
     "ollama_host": "http://localhost:11434",
     "planner_model": "bonsai-2",
     "vision_model": "bonsai-2",
-    "vision_check": True,
+    # Default models for writing (bible draft, scenes, shots) and frame checks, as "<connection>:<model>"
+    # ("ollama:<model>" = this PC). Empty: the Ollama planner/vision model above. See studio/cloud.py.
+    "planner": "",
+    "vision": "",
+    # Dialogue voices: VoiceStudio running headless (service reelwright-voice). engine voices each line with an
+    # acting direction; design_engine creates a character's reference voice from its description.
+    "voices": {"host": "http://127.0.0.1:3900", "engine": "indextts2", "design_engine": "omnivoice",
+               "language": "en", "emo_alpha": 0.75, "emotion": True, "min_match": 0.75, "tries": 3},
+    # "ai_connections": the AI models page writes the list here (default: OpenAI and Gemini in cloud.py)
     "ffmpeg": "",
     "ffprobe": "",
     "candidates_per_shot": 4,
@@ -182,8 +190,14 @@ def save(user_values: dict) -> dict:
     """Persist only what the user set (the defaults stay in code)."""
     with _lock:
         os.makedirs(DATA_ROOT, exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        # may hold cloud API keys: owner-only
+        fd = os.open(SETTINGS_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(user_values, f, indent=2)
+        try:
+            os.chmod(SETTINGS_PATH, 0o600)
+        except OSError:
+            pass
     return load()
 
 

@@ -42,8 +42,8 @@ BIBLE_SCHEMA = {
 def draft_bible(s: dict, sid: str, story: str) -> dict:
     existing_c = {c["name"].lower() for c in store.list_characters(sid)}
     existing_l = {l["name"].lower() for l in store.list_locations(sid)}
-    data = llm.chat_json(
-        s["ollama_host"], s["planner_model"],
+    data = llm.chat(
+        s, "planner",
         "You are a film pre-production assistant. Extract every recurring character and every location "
         "from the story. Write concrete visual descriptions a concept artist could draw from. "
         "Do not invent characters or places that are not in the story.",
@@ -106,8 +106,8 @@ def _scene_schema(b: dict) -> dict:
 def plan_scenes(s: dict, b: dict, story: str) -> list[dict]:
     if not b["locations"]:
         raise ValueError("Add at least one location to the bible first (or use 'Draft bible from story').")
-    data = llm.chat_json(
-        s["ollama_host"], s["planner_model"],
+    data = llm.chat(
+        s, "planner",
         "You break stories into film scenes. A new scene starts when the location or time changes. "
         "Copy dialogue word for word from the story. Use only the given character and location ids. "
         "Beats are short visual actions in story order; include every visual moment of the story "
@@ -116,6 +116,7 @@ def plan_scenes(s: dict, b: dict, story: str) -> list[dict]:
     scenes = []
     for i, sc in enumerate(data.get("scenes", []), 1):
         sc["id"] = f"S{i:02d}"
+        store.normalize_cast(b["characters"], sc)
         scenes.append(sc)
     if not scenes:
         raise ValueError("The planner returned no scenes. Try a longer story or another model.")
@@ -136,7 +137,8 @@ def _shot_schema(b: dict, scene: dict) -> dict:
                 "required": ["id", "position"]}},
             "action": {"type": "string", "description": "one main visible action"},
             "dialogue": {"type": "array", "items": {"type": "object", "properties": {
-                "speaker": _ids_schema(cids), "line": {"type": "string"}}, "required": ["speaker", "line"]}},
+                "speaker": _ids_schema(cids), "line": {"type": "string"},
+                "emotion": {"type": "string", "description": "acting direction for the voice, 3-8 words, e.g. thrilled, shouting with joy"}}, "required": ["speaker", "line"]}},
             "sound": {"type": "string"},
             "action_seconds": {"type": "number", "description": "seconds of action besides speech, 1-6"},
             "continuous_with_previous": {"type": "boolean"},
@@ -155,11 +157,12 @@ def plan_shots(s: dict, b: dict, scene: dict) -> list[dict]:
         "and must sit in the shot that shows the moment it is spoken: a line said in reaction to something "
         "goes in the shot AFTER that something is visible (e.g. a greeting to an animal only after the animal "
         "has arrived on screen). Cover every beat with at least one shot, in story order, including visual "
-        "moments without dialogue (weather changes, a reveal, a wide establishing view). Name concrete props "
+        "moments without dialogue (weather changes, a reveal, a wide establishing view). Give every line an acting "
+        "direction in 'emotion' (how it is said: e.g. 'frightened, calling from far away', 'shy but proud'). Name concrete props "
         "consistently with the story (a paper boat stays a paper boat)."
     )
-    data = llm.chat_json(
-        s["ollama_host"], s["planner_model"],
+    data = llm.chat(
+        s, "planner",
         "You are a film director writing a shot list. " + rules,
         f"{_bible_brief(b)}\n\nSCENE {scene['id']} at {scene.get('location_id')} ({scene.get('time_of_day', '')}):\n"
         f"Summary: {scene.get('summary', '')}\nCharacters: {scene.get('characters')}\n"
@@ -168,6 +171,7 @@ def plan_shots(s: dict, b: dict, scene: dict) -> list[dict]:
     outfits = {c["id"]: c.get("outfit") for c in scene.get("characters", [])}
     shots = []
     for i, sh in enumerate(data.get("shots", []), 1):
+        store.normalize_cast(b["characters"], sh)
         for ch in sh.get("characters", []):
             ch["outfit"] = _match_outfit(b, ch["id"], outfits.get(ch["id"]))
         shots.append(new_shot(
@@ -182,7 +186,7 @@ def plan_shots(s: dict, b: dict, scene: dict) -> list[dict]:
 
 
 def _match_outfit(b, cid, outfit_text):
-    c = b["characters"].get(cid)
+    c = store.find_character(b["characters"], cid)
     if not c:
         return "default"
     keys = list((c.get("outfits") or {"default": ""}).keys())
@@ -227,7 +231,7 @@ def compute_duration(shot: dict, b: dict, max_seconds: float) -> float:
         return float(shot["duration_s"])
     speech = 0.0
     for d in shot.get("dialogue", []) or []:
-        c = b["characters"].get(d.get("speaker"))
+        c = store.find_character(b["characters"], d.get("speaker"))
         wpm = float(((c or {}).get("voice") or {}).get("wpm") or 140)
         words = len(re.findall(r"\w+", d.get("line", "")))
         speech += words / wpm * 60.0 + 0.3
@@ -286,7 +290,8 @@ def assign_continuity(shots: list[dict]) -> list[dict]:
         master = master_of.get(scene)
         if master is None:
             sh["start_mode"] = "new"
-            master_of[scene] = sh
+            if has_chars:                       # an establishing shot without people can't be a master to
+                master_of[scene] = sh           # punch in on: the first shot WITH characters is (as frames expect)
             continue
         if sh.get("start_mode") == "chain":
             continue

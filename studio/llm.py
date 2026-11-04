@@ -89,3 +89,55 @@ def ensure_model(host: str, model: str, log=print) -> None:
                 log(f"  {model}: {pct}% of {total / 1e9:.1f} GB")
                 last = pct
     log(f"  {model} ready.")
+
+
+# ── model routing (Ollama on this PC, or an AI connection) ─────────────
+
+def ref(s: dict, role: str) -> str:
+    """The model reference used for 'planner' (writing) or 'vision' (frame checks)."""
+    from . import cloud
+    return cloud.role_ref(s, role)
+
+
+def provider(s: dict, role: str) -> str:
+    from . import cloud
+    return cloud.parse_ref(ref(s, role))[0]
+
+
+def describe(s: dict, role: str) -> str:
+    from . import cloud
+    return cloud.label(s, ref(s, role))
+
+
+def chat(s: dict, role: str, system: str, user: str, schema: dict, images: list[str] | None = None,
+         temperature: float = 0.6, **ollama_opts) -> dict:
+    """Structured JSON from the model chosen for this role (settings, or a per-job choice in s[role])."""
+    from . import cloud
+    try:
+        conn, model = cloud.resolve_text(s, ref(s, role))
+        if conn == "ollama":
+            return chat_json(s["ollama_host"], ollama_model(s, role), system, user, schema, images=images,
+                             temperature=temperature, **ollama_opts)
+        return cloud.chat_json(s, conn, system, user, schema, images=images, temperature=temperature, model=model)
+    except cloud.CloudError as exc:
+        raise LLMError(str(exc)) from exc
+
+
+def ollama_model(s: dict, role: str) -> str:
+    from . import cloud
+    conn, model = cloud.parse_ref(ref(s, role))
+    return (model or s[f"{role}_model"]) if conn == "ollama" else ""
+
+
+def prepare(s: dict, role: str, log=print) -> None:
+    """Make sure the role's model can run: pull a missing Ollama model; cloud models need nothing."""
+    m = ollama_model(s, role)
+    if m:
+        ensure_model(s["ollama_host"], m, log)
+    else:
+        log(f"Using {describe(s, role)}.")
+
+
+def with_choice(s: dict, role: str, choice: str) -> dict:
+    """Settings copy that uses `choice` (a model reference) for this job only."""
+    return {**s, role: choice} if choice else s

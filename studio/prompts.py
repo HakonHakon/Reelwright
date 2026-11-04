@@ -3,6 +3,8 @@
 The LLM never writes final prompts. Editing a bible entry changes every prompt that uses it.
 """
 
+from . import store
+
 CLOSE_FRAMINGS = {"medium close-up", "close-up", "extreme close-up", "insert"}
 
 POSITION_WORDS = {"left": "on the left of the frame", "right": "on the right of the frame",
@@ -34,7 +36,7 @@ def _location_text(loc: dict | None, tod: str | None) -> str:
 def characters_in(shot: dict, bible: dict) -> list[tuple[dict, dict]]:
     out = []
     for ch in shot.get("characters", []):
-        c = bible["characters"].get(ch.get("id"))
+        c = store.find_character(bible["characters"], ch.get("id"))
         if c:
             out.append((c, ch))
     return out
@@ -80,6 +82,9 @@ def motion_prompt(shot: dict, bible: dict, engine: str = "ltx") -> str:
     loc = bible["locations"].get(shot.get("location_id") or "")
     chars = [_char_text(c, ch.get("outfit"), False) for c, ch in characters_in(shot, bible)]
     if engine == "wan":
+        # a character's video LoRA (applied to Wan renders) answers to its trigger word, e.g. "s4m"
+        chars = [f"{_video_trigger(c)}, {t}" if _video_trigger(c) else t
+                 for (c, _), t in zip(characters_in(shot, bible), chars)]
         lines = [style.get("look", ""), "; ".join(chars), shot.get("action", ""),
                  f"Camera: {shot.get('camera', '')}" if shot.get("camera") else "",
                  shot.get("motion_prompt_extra", "")]
@@ -108,7 +113,7 @@ def motion_prompt(shot: dict, bible: dict, engine: str = "ltx") -> str:
         style.get("look", ""),
     ]
     for d in shot.get("dialogue", []) or []:
-        c = bible["characters"].get(d.get("speaker"))
+        c = store.find_character(bible["characters"], d.get("speaker"))
         who = c["name"] if c else d.get("speaker", "")
         voice = f" ({c['voice'].get('description')})" if c and (c.get("voice") or {}).get("description") else ""
         lines.append(f'{who} says{voice}: "{d.get("line", "").strip()}"')
@@ -128,6 +133,11 @@ def image_loras(shot: dict, bible: dict, second_scale: float) -> list[dict]:
             strength = float(lora.get("strength", 0.9)) * (1.0 if i == 0 else second_scale)
             loras.append({"name": lora["name"], "strength": round(strength, 3)})
     return loras
+
+
+def _video_trigger(c: dict) -> str:
+    lora = c.get("video_lora") or {}
+    return (lora.get("trigger") or "").strip() if lora.get("name") else ""
 
 
 def video_loras(shot: dict, bible: dict) -> list[dict]:
@@ -156,7 +166,7 @@ def frame_source(shot: dict, bible: dict) -> str:
 def speaker_voice(shot: dict, bible: dict) -> str | None:
     """Voice sample of the first speaker in the shot (LTX reference audio)."""
     for d in shot.get("dialogue", []) or []:
-        c = bible["characters"].get(d.get("speaker"))
+        c = store.find_character(bible["characters"], d.get("speaker"))
         if c and (c.get("voice") or {}).get("file"):
             return c["voice"]["file"]
     return None

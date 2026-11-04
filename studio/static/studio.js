@@ -163,8 +163,23 @@ function crumbs(parts) {
   document.title = `${all[all.length - 1][0]} · ${APP_NAME}`;
 }
 
+// ── AI models: connections, defaults and the per-job pickers ──────────────
+async function loadAI() { try { App.ai = await GET("/api/ai"); } catch { /* keep the last copy */ } return App.ai; }
+const aiImageLabel = (src) => (App.ai?.choices.image || []).find((c) => c.source === src)?.label;
+/** A model picker for one job. role: "planner" (writing) or "vision" (frame checks). */
+function textPicker(id, role, title) {
+  const ai = App.ai; if (!ai) return "";
+  const def = ai.defaults[role], opts = ai.choices.text.slice();
+  if (def && !opts.some((o) => o.ref === def)) opts.unshift({ ref: def, label: ai.labels[role] });
+  return `<select id="${id}" class="model-pick" aria-label="${esc(title)}" title="${esc(title)} (default set on the AI models page)">${opts.map((o) =>
+    `<option value="${esc(o.ref)}" ${o.ref === def ? "selected" : ""}>${esc(o.label)}${o.ref === def ? " · default" : ""}${o.ready === false ? " · no key yet" : ""}</option>`).join("")}</select>`;
+}
+const imageOptions = (prefix = "") => (App.ai?.choices.image || []).map((c) =>
+  `<option value="${esc(c.source)}">${esc(prefix + c.label)}${c.ready === false ? " · no key yet" : ""}</option>`).join("");
+
 function sourceLabel(s) {
-  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Reference photos (Qwen Edit)", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master" }[s] || s || "inherit";
+  if (s && s.startsWith("img:")) return aiImageLabel(s) || s.slice(4).replace(":", " · ");
+  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Reference photos (Qwen Edit)", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master", openai_image: "ChatGPT image (OpenAI)", gemini_image: "Gemini image (Google)" }[s] || s || "inherit";
 }
 
 // ── sidebar ──────────────────────────────────────────────────────────────
@@ -184,7 +199,7 @@ function renderNav() {
       `<div class="nav-sec">Characters</div>` + chars.slice(0, 10).map((c) => item(`#/s/${sid}/c/${c.id}`, "user", c.name, c.draft ? `<span class="count">draft</span>` : "")).join("") +
       `<div class="nav-sec">Locations</div>` + locs.slice(0, 10).map((l) => item(`#/s/${sid}/l/${l.id}`, "pin", l.name, l.draft ? `<span class="count">draft</span>` : "")).join("");
   }
-  html += `<div class="nav-sec">Studio</div>` + item("#/models", "settings", "Models", "", "top") + item("#/settings", "settings", "Settings", "", "top");
+  html += `<div class="nav-sec">Studio</div>` + item("#/ai", "settings", "AI models", "", "top") + item("#/models", "settings", "Video models", "", "top") + item("#/settings", "settings", "Settings", "", "top");
   $("#nav").innerHTML = html;
 }
 async function getSeries(sid) {
@@ -218,7 +233,8 @@ async function refreshStatus() {
     App.status = s; App.loras = s.loras || [];
     const line = (ok, text, title) => `<div class="line" title="${esc(title || text)}"><span class="dot ${ok ? "ok" : "bad"}"></span><span class="lbl">${esc(text)}</span></div>`;
     $("#status").innerHTML = line(s.comfy, s.comfy ? "ComfyUI online" : "ComfyUI offline", s.comfy_host) +
-      line(s.ollama_models.length > 0, s.ollama_models.length ? "Ollama · " + s.planner_model : "Ollama offline", s.planner_model) +
+      (s.planner_provider && s.planner_provider !== "ollama" ? line(!s.missing.includes(s.planner_provider + ":api_key"), "Shots · " + s.planner, s.planner) : line(s.ollama_models.length > 0, s.ollama_models.length ? "Ollama · " + s.planner_model : "Ollama offline", s.planner_model)) +
+      (s.voices ? line(s.voices.ok, s.voices.ok ? "Voices · VoiceStudio" : "VoiceStudio offline", s.voices.device || "systemctl --user start reelwright-voice") : "") +
       (s.missing.length ? `<div class="line"><span class="chip warn" title="${esc(s.missing.join("\n"))}">${s.missing.length} missing models</span></div>` : "");
   } catch { $("#status").innerHTML = `<div class="line"><span class="dot bad"></span><span class="lbl">Server unreachable</span></div>`; }
 }
@@ -397,6 +413,7 @@ async function route() {
   const dispatch = async () => {
     if (!parts.length) return await viewHome(view);
     if (parts[0] === "models") return await viewModels(view);
+    if (parts[0] === "ai") return await viewAI(view);
     if (parts[0] === "settings") return await viewSettings(view);
     if (parts[0] === "s") {
       const sid = parts[1];
@@ -516,8 +533,11 @@ function loraSelect(id, value) {
   if (value && !opts.includes(value)) opts.push(value);
   return `<select id="${id}">${opts.map((o) => `<option value="${esc(o)}" ${o === value ? "selected" : ""}>${o ? esc(o) : "- none -"}</option>`).join("")}</select>`;
 }
-const sourceSelect = (id, value, allowInherit = true) =>
-  `<select id="${id}">${(allowInherit ? [""] : []).concat(["flux_lora", "zimage", "qwen_refs", "auto", "upload"]).map((o) => `<option value="${o}" ${o === (value || "") ? "selected" : ""}>${o ? sourceLabel(o) : "inherit"}</option>`).join("")}</select>`;
+const sourceSelect = (id, value, allowInherit = true) => {
+  const opts = (allowInherit ? [""] : []).concat(["flux_lora", "zimage", "qwen_refs"], (App.ai?.choices.image || []).map((c) => c.source), ["auto", "upload"]);
+  if (value && !opts.includes(value)) opts.push(value);
+  return `<select id="${id}">${opts.map((o) => `<option value="${esc(o)}" ${o === (value || "") ? "selected" : ""}>${o ? esc(sourceLabel(o)) : "inherit"}</option>`).join("")}</select>`;
+};
 
 // ── character ───────────────────────────────────────────────────────────
 async function viewCharacter(view, sid, cid) {
@@ -547,17 +567,18 @@ async function viewCharacter(view, sid, cid) {
       <div><label>First-frame source</label>${sourceSelect("f-src", c.frame_source)}</div>
       <h3 class="form-sec full">Voice</h3>
       <div><label>Speaking rate (words per minute)</label><input id="f-wpm" type="number" value="${c.voice?.wpm ?? 140}"></div>
-      <div class="full"><label>Voice description (goes into the video prompt)</label><input id="f-voice" value="${esc(c.voice?.description)}"></div>
+      <div class="full"><label>Voice description (how the character sounds, e.g. "a cheerful four-year-old boy, high-pitched child voice"; also goes into the video prompt)</label><input id="f-voice" value="${esc(c.voice?.description)}"></div>
       <div class="full row save-bar"><button class="primary" id="save">Save character</button><span class="grow"></span><button class="danger" id="del">Delete character…</button></div>
     </div>
-    <h2>Voice sample (5 s .wav for LTX voice identity)</h2>
-    <div class="card row">${c.voice?.file ? `<audio controls src="${media(c.voice.file)}"></audio>` : `<span class="muted">none</span>`}
-      <input type="file" id="voice-file" accept="audio/*"><button id="voice-up">Upload voice</button></div>
+    <h2>Voice <span class="muted small">(the reference every dialogue line is cloned from)</span></h2>
+    <div class="card row">${c.voice?.file ? `<audio controls src="${media(c.voice.file)}"></audio><span class="chip">${c.voice.designed ? "designed" : "recorded"}</span>` : `<span class="muted">none yet</span>`}
+      <input type="file" id="voice-file" accept="audio/*"><button id="voice-up">Upload a recording (5-20 s)</button>
+      <button id="voice-design" title="Uses the voice description above">Design voice from description</button></div>
     <h2>References <span class="muted small">(approved identity images)</span></h2>
     <div class="cards">${(c.refs || []).map((r) => `<div class="card"><img class="thumb square" src="${media(r)}" data-zoom="${media(r)}"><button class="link danger" data-unref="${esc(r)}">remove</button></div>`).join("") || `<p class="muted">None yet. Render a character sheet below and approve the best images, or upload your own.</p>`}</div>
     <div class="row" style="margin-top:8px"><input type="file" id="ref-file" accept="image/*"><button id="ref-up">Upload reference</button></div>
     <h2>Character sheet</h2>
-    <div class="row"><button class="primary" id="sheet-flux">Render sheet with Flux + LoRA</button><button id="sheet-z">Render with Z-Image</button>
+    <div class="row"><button class="primary" id="sheet-flux">Render sheet with Flux + LoRA</button><button id="sheet-z">Render with Z-Image</button>${imageOptions() ? `<span class="row"><select id="sheet-cloud" aria-label="Cloud image model">${imageOptions()}</select><button id="sheet-cloud-go" title="Keeps the face of the first reference photo">Render with this model</button></span>` : ""}
       <span class="muted small">Front, three-quarter, full body, profile. Save first if you changed the description.</span></div>
     <div class="cards" style="margin-top:12px">${(c.sheet || []).slice().reverse().map((s) => `<div class="card"><img class="thumb square" src="${media(s.file)}" data-zoom="${media(s.file)}">
       <div class="row small muted" style="margin-top:6px"><span class="grow">${esc(s.view)} · ${sourceLabel(s.source)}</span>
@@ -576,12 +597,19 @@ async function viewCharacter(view, sid, cid) {
   $("#del").onclick = async () => { if (await ask(`Delete ${c.name}? Files are kept in a .deleted folder.`, "Delete", true)) { await api("DELETE", `/api/s/${sid}/characters/${cid}`); location.hash = `#/s/${sid}`; } };
   $("#sheet-flux").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: "flux_lora" });
   $("#sheet-z").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: "zimage" });
+  if ($("#sheet-cloud-go")) $("#sheet-cloud-go").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: $("#sheet-cloud").value });
   const upload = async (kind, input) => {
     const f = $(input).files[0]; if (!f) return toast("Choose a file first", true);
     const fd = new FormData(); fd.append("kind", kind); fd.append("file", f);
     await FORM(`/api/s/${sid}/characters/${cid}/upload`, fd); route();
   };
   $("#voice-up").onclick = () => upload("voice", "#voice-file");
+  $("#voice-design").onclick = async () => {
+    const description = $("#f-voice").value.trim();
+    if (!description) return toast("Write a voice description first.", true);
+    await PUT(`/api/s/${sid}/characters/${cid}`, collect()); App.dirty = false;
+    startJob(`/api/s/${sid}/characters/${cid}/voice`, { description });
+  };
   $("#ref-up").onclick = () => upload("ref", "#ref-file");
   view.onclick = async (e) => {
     const t = e.target;
@@ -614,7 +642,7 @@ async function viewLocation(view, sid, lid) {
     </div>
     <h2>Establishing plates</h2>
     <div class="row"><select id="p-var">${variants.map((v) => `<option>${esc(v)}</option>`).join("")}</select>
-      <button class="primary" id="gen-z">Render 4 with Z-Image</button><button id="gen-f">Render 4 with Flux</button>
+      <button class="primary" id="gen-z">Render 4 with Z-Image</button><button id="gen-f">Render 4 with Flux</button>${imageOptions() ? `<select id="gen-cloud" aria-label="Cloud image model">${imageOptions()}</select><button id="gen-cloud-go">Render 4 with this model</button>` : ""}
       <input type="file" id="p-file" accept="image/*"><button id="p-up">Upload</button></div>
     <h3>Approved</h3>
     <div class="cards">${Object.entries(l.plates || {}).map(([v, f]) => `<div class="card"><img class="thumb" src="${media(f)}" data-zoom="${media(f)}"><div class="small muted">${esc(v)}</div></div>`).join("") || `<p class="muted">none</p>`}</div>
@@ -628,6 +656,7 @@ async function viewLocation(view, sid, lid) {
   $("#del").onclick = async () => { if (await ask(`Delete ${l.name}?`, "Delete", true)) { await api("DELETE", `/api/s/${sid}/locations/${lid}`); location.hash = `#/s/${sid}`; } };
   $("#gen-z").onclick = () => startJob(`/api/s/${sid}/locations/${lid}/plates`, { variant: $("#p-var").value, source: "zimage" });
   $("#gen-f").onclick = () => startJob(`/api/s/${sid}/locations/${lid}/plates`, { variant: $("#p-var").value, source: "flux_lora" });
+  if ($("#gen-cloud-go")) $("#gen-cloud-go").onclick = () => startJob(`/api/s/${sid}/locations/${lid}/plates`, { variant: $("#p-var").value, source: $("#gen-cloud").value });
   $("#p-up").onclick = async () => {
     const f = $("#p-file").files[0]; if (!f) return toast("Choose a file first", true);
     const fd = new FormData(); fd.append("variant", $("#p-var").value); fd.append("file", f);
@@ -674,9 +703,9 @@ const SETTING_FIELDS = [
     ["ollama_host", "Ollama address", "text", "http://localhost:11434"],
     ["ffmpeg", "ffmpeg path", "text", "Leave blank to auto-detect"],
     ["ffprobe", "ffprobe path", "text", "Leave blank to auto-detect"]]],
-  ["Planning models", "Ollama models used to plan shots and check frames.", [
-    ["planner_model", "Planner model", "model"],
-    ["vision_model", "Vision model", "model"],
+  ["Ollama models (this PC)", "Local models used when Ollama is chosen. Choose ChatGPT, Gemini and other cloud models, API keys and the defaults on the AI models page.", [
+    ["planner_model", "Ollama planner model", "model"],
+    ["vision_model", "Ollama vision model", "model"],
     ["vision_check", "Check frames with the vision model after rendering", "bool"]]],
   ["Rendering", "How many candidates to make, and at what size.", [
     ["candidates_per_shot", "First-frame candidates per render", "int", "", 1, 12],
@@ -703,6 +732,7 @@ async function viewSettings(view) {
   const models = (App.status && App.status.ollama_models) || [];
   const field = ([path, label, type, hint, min, max]) => {
     const id = "set-" + path.replace(/\./g, "-"), v = getPath(d.effective, path);
+    if (type === "select") return `<div><label for="${id}">${esc(label)}</label><select id="${id}">${hint.map(([o, t]) => `<option value="${esc(o)}" ${o === (v ?? "") ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></div>`;
     if (type === "bool") return `<label class="row check full"><input type="checkbox" id="${id}" ${v ? "checked" : ""}> ${esc(label)}</label>`;
     const attrs = type === "model" ? `list="set-models" autocomplete="off"` : type === "text" ? "" : `type="number" ${type === "int" ? 'step="1"' : 'step="any"'} min="${min}" max="${max}"`;
     return `<div><label for="${id}">${esc(label)}</label><input id="${id}" ${attrs} value="${esc(v ?? "")}" placeholder="${esc(hint || "")}"></div>`;
@@ -719,7 +749,7 @@ async function viewSettings(view) {
   $("#save").onclick = async () => {
     let obj; try { obj = JSON.parse($("#user").value || "{}"); } catch (e) { return toast("Advanced JSON is invalid: " + e.message, true); }
     const bad = [];
-    for (const [, , fields] of SETTING_FIELDS) for (const [path, label, type, , min, max] of fields) {
+    for (const [, , fields] of SETTING_FIELDS) for (const [path, label, type, hint, min, max] of fields) {
       const el = $("#set-" + path.replace(/\./g, "-")); let v;
       if (type === "bool") v = el.checked;
       else if (type === "int" || type === "num") {
@@ -732,6 +762,117 @@ async function viewSettings(view) {
     if (bad.length) return toast(bad.join("\n"), true);
     await PUT("/api/settings", obj); App.dirty = false; toast("Settings saved."); refreshStatus(); route();
   };
+}
+
+// ── AI models page: connections (keys, models) and default choices ─────────
+async function viewAI(view) {
+  crumbs([["AI models", null]]);
+  const ai = await loadAI();
+  if (!ai) { view.innerHTML = `<p class="muted">Could not load the AI settings.</p>`; return; }
+  let conns = ai.connections.map((c) => ({ ...c }));
+  const keys = {};                 // typed, not yet saved keys (never echoed back by the server)
+  const listed = {};               // model lists from "List models"
+  const opt = (v, t, cur) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(t)}</option>`;
+  const textChoices = (role) => {
+    const opts = ai.choices.text.slice(), def = ai.defaults[role];
+    if (def && !opts.some((o) => o.ref === def)) opts.unshift({ ref: def, label: ai.labels[role] });
+    return opts.map((o) => opt(o.ref, o.label + (o.ready === false ? " · no key yet" : ""), def)).join("");
+  };
+  const keyChip = (c) => c.key === "env" ? `<span class="chip good">key from ${esc(c.api_key_env)}</span>`
+    : c.key === "saved" ? `<span class="chip good">key saved</span>` : `<span class="chip warn">no key</span>`;
+  const card = (c, i) => {
+    const f = (k, label, extra = "") => `<div><label for="c${i}-${k}">${label}</label><input id="c${i}-${k}" data-i="${i}" data-k="${k}" value="${esc(c[k] ?? "")}" ${extra}></div>`;
+    return `<div class="card form-grid" data-conn="${i}">
+      <h3 class="form-sec full row" style="gap:8px">${esc(c.name || c.id)} <span class="chip">${esc(ai.types[c.type] || c.type)}</span> ${c._new ? `<span class="chip warn">not saved yet</span>` : keyChip(c)}
+        <span class="grow"></span><label class="row check" style="margin:0"><input type="checkbox" data-i="${i}" data-k="enabled" ${c.enabled !== false ? "checked" : ""}> Show in pickers</label></h3>
+      ${f("name", "Name")}
+      <div><label for="c${i}-id">ID <span class="muted small">(used in model choices)</span></label><input id="c${i}-id" data-i="${i}" data-k="id" value="${esc(c.id)}" ${c._new ? "" : "readonly"}></div>
+      <div><label for="c${i}-type">Type</label><select id="c${i}-type" data-i="${i}" data-k="type" ${c._new ? "" : "disabled"}>${Object.entries(ai.types).map(([v, t]) => opt(v, t, c.type)).join("")}</select></div>
+      ${f("base_url", "Address (API base URL)")}
+      <div class="full"><label for="c${i}-key">API key</label><div class="row"><input id="c${i}-key" class="grow" type="password" autocomplete="off" data-key="${i}"
+        placeholder="${c.key === "env" ? "Set by " + esc(c.api_key_env) + " on the server (that wins)" : c.key === "saved" ? "Saved. Paste a new key to replace it" : "Paste your API key"}" value="${esc(keys[i] || "")}">
+        ${c.key === "saved" && !c._new ? `<button type="button" class="danger" data-delkey="${i}">Remove key</button>` : ""}</div>
+        <p class="muted small" style="margin:4px 0 0">Stored in studio_data/secrets.json (owner-only), never shown again. Or set the environment variable below on the server.</p></div>
+      ${f("api_key_env", "Environment variable (optional)", 'placeholder="e.g. OPENROUTER_API_KEY"')}
+      ${f("max_refs", "Max reference photos sent", 'type="number" min="0" max="16"')}
+      ${f("text_model", "Default text model (writing, checks)", `list="ml-${i}" autocomplete="off"`)}
+      ${f("image_model", "Default image model (blank: none)", `list="ml-${i}" autocomplete="off"`)}
+      <div class="full"><label for="c${i}-extra_models">More models to offer in the pickers <span class="muted small">(comma separated; names containing "image" go to image pickers)</span></label>
+        <input id="c${i}-extra_models" data-i="${i}" data-k="extra_models" value="${esc(c.extra_models || "")}"></div>
+      ${c.type === "openai" ? `<div><label for="c${i}-q">Image quality</label><select id="c${i}-q" data-i="${i}" data-k="image_quality">${[["", "Default"], ["low", "Low"], ["medium", "Medium"], ["high", "High"]].map(([v, t]) => opt(v, t, c.image_quality || "")).join("")}</select></div>` : ""}
+      <datalist id="ml-${i}">${(listed[i] || []).map((m) => `<option value="${esc(m)}">`).join("")}</datalist>
+      <div class="full row">
+        <button type="button" data-list="${i}" ${c._new ? "disabled title=\"Save first\"" : ""}>List models</button>
+        <button type="button" data-test="${i}" ${c._new ? "disabled title=\"Save first\"" : ""}>Test connection</button>
+        <span class="muted small grow" id="c${i}-msg" role="status">${listed[i] ? listed[i].length + " models found: pick one in the model fields" : ""}</span>
+        <button type="button" class="link danger" data-remove="${i}">Remove connection</button></div>
+    </div>`;
+  };
+  const render = () => {
+    view.innerHTML = `
+      <div class="page-head"><div><h1>AI models</h1><p class="sub">Connect ChatGPT, Gemini or any OpenAI-compatible service with an API key. Choose the defaults here; every Plan, Render and Check button also lets you pick a model for that run.</p></div></div>
+      <div class="card form-grid"><h3 class="form-sec full">Defaults</h3>
+        <div><label for="def-planner">Write the bible draft, scenes and shots with</label><select id="def-planner">${textChoices("planner")}</select></div>
+        <div><label for="def-vision">Check rendered frames with</label><select id="def-vision">${textChoices("vision")}</select></div>
+        <p class="muted small full" style="margin:0">Images: pick a cloud image model as a shot's frame source, in "Force…" when rendering frames, or on a character's or location's page. Cloud models receive your prompts and reference photos and bill your account with that provider. A ChatGPT or Gemini app subscription does not include API use.</p></div>
+      <h2>Connections</h2>
+      ${conns.map(card).join("")}
+      <div class="card row"><label for="preset" style="margin:0">Add a connection</label><select id="preset">${ai.presets.map((p, k) => `<option value="${k}">${esc(p.label)}</option>`).join("")}</select><button id="add">Add</button></div>
+      <div class="row save-bar page-save"><button class="primary" id="save-ai">Save</button><span class="muted small" id="ai-note"></span></div>`;
+    bind();
+  };
+  const collect = () => {
+    view.querySelectorAll("[data-k]").forEach((el) => {
+      const c = conns[+el.dataset.i]; if (!c) return;
+      c[el.dataset.k] = el.type === "checkbox" ? el.checked : el.dataset.k === "max_refs" ? Number(el.value) : el.value.trim();
+    });
+    view.querySelectorAll("[data-key]").forEach((el) => { keys[+el.dataset.key] = el.value.trim(); });
+  };
+  const save = async () => {
+    collect();
+    const body = { connections: conns.map(({ key, _new, ...c }) => c), defaults: { planner: $("#def-planner").value, vision: $("#def-vision").value } };
+    let next = await PUT("/api/ai", body);
+    for (const [i, k] of Object.entries(keys)) if (k && conns[i]) next = await PUT(`/api/ai/${encodeURIComponent(conns[i].id)}/key`, { key: k });
+    for (const k of Object.keys(keys)) delete keys[k];
+    App.ai = next; App.dirty = false; toast("AI models saved."); refreshStatus(); return viewAI(view);
+  };
+  function bind() {
+    view.querySelectorAll("input,select").forEach((el) => el.addEventListener("input", () => { App.dirty = true; }));
+    $("#add").onclick = () => {
+      collect();
+      const p = { ...ai.presets[+$("#preset").value] }, ids = new Set(conns.map((c) => c.id));
+      let id = p.id, n = 2; while (ids.has(id)) id = `${p.id}${n++}`;
+      conns.push({ id, name: p.name, type: p.type, base_url: p.base_url, api_key_env: p.api_key_env || "", text_model: "", image_model: "",
+        image_quality: "", max_refs: 6, extra_models: "", enabled: true, key: "", _new: true });
+      App.dirty = true; render(); view.querySelector(`[data-conn="${conns.length - 1}"]`)?.scrollIntoView({ behavior: "smooth" });
+    };
+    view.querySelectorAll("[data-remove]").forEach((b) => b.onclick = async () => {
+      const c = conns[+b.dataset.remove];
+      if (!(await ask(`Remove ${c.name}? Its saved key is deleted when you save.`, "Remove", true))) return;
+      collect(); conns.splice(+b.dataset.remove, 1); App.dirty = true; render();
+    });
+    view.querySelectorAll("[data-delkey]").forEach((b) => b.onclick = async () => {
+      const c = conns[+b.dataset.delkey];
+      if (!(await ask(`Delete the saved API key for ${c.name}?`, "Delete key", true))) return;
+      App.ai = await PUT(`/api/ai/${encodeURIComponent(c.id)}/key`, { key: "" }); toast("Key deleted."); viewAI(view);
+    });
+    view.querySelectorAll("[data-list]").forEach((b) => b.onclick = async () => {
+      const i = +b.dataset.list; collect();
+      if (keys[i]) return toast("Save first to use the new key.", true);
+      try { listed[i] = (await GET(`/api/ai/${encodeURIComponent(conns[i].id)}/models`)).models; render(); }
+      catch (e) { $(`#c${i}-msg`).textContent = String(e.message || e); }
+    });
+    view.querySelectorAll("[data-test]").forEach((b) => b.onclick = async () => {
+      const i = +b.dataset.test; collect();
+      if (keys[i]) return toast("Save first to use the new key.", true);
+      const msg = $(`#c${i}-msg`); msg.textContent = "Testing…"; b.disabled = true;
+      try { const r = await POST(`/api/ai/${encodeURIComponent(conns[i].id)}/test`, { model: conns[i].text_model }); msg.textContent = (r.ok ? "✓ " : "✗ ") + r.message; }
+      catch (e) { msg.textContent = "✗ " + String(e.message || e); }
+      b.disabled = false;
+    });
+    $("#save-ai").onclick = () => save().catch((e) => toast(String(e.message || e), true));
+  }
+  render();
 }
 
 async function viewModels(view) {
@@ -773,7 +914,8 @@ refreshStatus();
 setInterval(refreshStatus, 15000);
 pollJobs();
 setInterval(pollJobs, 2000);
-window.addEventListener("load", route);
+// The model pickers need /api/ai; wait for it briefly before the first render (never re-render afterwards).
+window.addEventListener("load", () => Promise.race([loadAI(), new Promise((r) => setTimeout(r, 1500))]).finally(route));
 
 // Visible "unsaved changes" state (App.dirty is set by edits and cleared on save).
 (() => {

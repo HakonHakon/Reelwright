@@ -225,6 +225,72 @@ def save_location(sid: str, loc: dict, bump: bool = True) -> dict:
         return loc
 
 
+def resolve_character_id(chars: dict, key) -> str | None:
+    """Map a shot/scene character reference to a live bible id.
+
+    Exact id first, then a case-insensitive id, then the one character whose name (or its slug)
+    matches. So 'Sam' from the planner, or a 'sam' left behind after that character was deleted and
+    another one renamed to Sam, still finds the character now called Sam."""
+    if not key:
+        return None
+    if key in chars:
+        return key
+    k = str(key).strip().lower()
+    for cid in chars:
+        if cid.lower() == k:
+            return cid
+    ks = slug(k, "")
+    hits = [cid for cid, c in chars.items()
+            if (c.get("name") or "").strip().lower() == k or (ks and slug(c.get("name"), "") == ks)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def find_character(chars: dict, key) -> dict | None:
+    cid = resolve_character_id(chars, key)
+    return chars.get(cid) if cid else None
+
+
+def normalize_cast(chars: dict, item: dict) -> bool:
+    """Rewrite a scene's or shot's character ids and dialogue speakers to live bible ids and drop
+    duplicate cast entries. Unknown ids are kept so a character re-created later can still match.
+    Returns True when anything changed."""
+    changed = False
+    if isinstance(item.get("characters"), list):
+        seen, cast = set(), []
+        for ch in item["characters"]:
+            cid = resolve_character_id(chars, ch.get("id")) or ch.get("id")
+            if cid != ch.get("id"):
+                ch["id"], changed = cid, True
+            if cid in seen:
+                changed = True
+                continue
+            seen.add(cid)
+            cast.append(ch)
+        item["characters"] = cast
+    for d in item.get("dialogue") or []:
+        cid = resolve_character_id(chars, d.get("speaker")) if isinstance(d, dict) else None
+        if cid and cid != d.get("speaker"):
+            d["speaker"], changed = cid, True
+    return changed
+
+
+def relink_characters(sid: str) -> int:
+    """After characters are created, renamed or deleted, point every episode's scenes and shots at
+    the live bible ids. Returns the number of scenes/shots that changed."""
+    chars = {c["id"]: c for c in list_characters(sid)}
+    total = 0
+    for ep in list_episodes(sid):
+        with _lock:
+            e = get_episode(sid, ep["id"])
+            if e is None:
+                continue
+            n = sum(normalize_cast(chars, item) for item in (e.get("scenes") or []) + (e.get("shots") or []))
+            if n:
+                _write(os.path.join(ep_dir(sid, ep["id"]), "episode.json"), e)
+        total += n
+    return total
+
+
 def bible(sid: str) -> dict:
     return {
         "style": get_style(sid),
@@ -241,7 +307,7 @@ def bible_signature(b: dict, shot: dict) -> str:
     if loc:
         parts.append(f"loc:{loc['id']}:{loc.get('version', 1)}")
     for ch in shot.get("characters", []):
-        c = b["characters"].get(ch.get("id"))
+        c = find_character(b["characters"], ch.get("id"))
         if c:
             parts.append(f"char:{c['id']}:{c.get('version', 1)}")
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]

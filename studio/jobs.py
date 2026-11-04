@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 
 from . import comfy as comfy_mod
-from . import llm, media, planner, prompts, store, workflows, providers
+from . import cloud, llm, media, planner, prompts, store, workflows, providers
 from . import settings as settings_mod
 
 
@@ -114,8 +114,10 @@ def _ctx():
 def _gpu_prepare(job: Job, s: dict, c: comfy_mod.Comfy):
     if not c.alive():
         raise RuntimeError(f"ComfyUI is not running at {s['comfy_host']}. Start Comfy Desktop first.")
-    job.say("Unloading Ollama models to free VRAM...")
+    job.say("Unloading Ollama and VoiceStudio models to free VRAM...")
     llm.unload(s["ollama_host"], [s["planner_model"], s["vision_model"]])
+    from . import voices
+    voices.unload(s)
 
 
 def _seed() -> int:
@@ -127,6 +129,12 @@ def _save_outputs(c, items, dest_dir, stem):
     os.makedirs(dest_dir, exist_ok=True)
     existing = len([f for f in os.listdir(dest_dir) if f.startswith(stem)])
     for i, item in enumerate(items):
+        if "data" in item:          # cloud image bytes
+            dest = os.path.join(dest_dir, f"{stem}{existing + i + 1:03d}.png")
+            with open(dest, "wb") as f:
+                f.write(item["data"])
+            paths.append(dest)
+            continue
         ext = os.path.splitext(item["filename"])[1] or ".png"
         dest = os.path.join(dest_dir, f"{stem}{existing + i + 1:03d}{ext}")
         c.download(item, dest)
@@ -169,8 +177,18 @@ def _refs_prompt(base: str, names: list[str], has_plate: bool) -> str:
 
 
 def _render_images(job, s, c, source, prompt, seed, n, loras, prefix, init_image=None, denoise=1.0,
-                   ref_images=None):
+                   ref_images=None, ref_files=None):
+    """ComfyUI output items, or {"data": png bytes} items for the cloud sources (ref_files: local paths)."""
     w, h = s["image"]["width"], s["image"]["height"]
+    if cloud.is_image_source(source):
+        neg = (s.get("_negative") or "").strip()
+        full = prompt + (f" Avoid: {neg}." if neg else "")
+        try:
+            data = cloud.generate_images(s, source, full, n, w, h,
+                                         [store.abs_media(r) for r in (ref_files or [])], log=job.say)
+        except cloud.CloudError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return [{"data": d} for d in data]
     if source == "qwen_refs":
         wf = workflows.qwen_edit_image(s, prompt, seed, w, h, n, ref_images or [], prefix)
     elif source == "flux_lora":
@@ -197,7 +215,7 @@ def _vision_check(s, image_path, shot, bible) -> dict:
          "Check: are exactly the expected characters visible, roughly matching their descriptions and positions? "
          "Is there any text, watermark or extra limb? Score 0-10 for how well it fits.")
     try:
-        return llm.chat_json(s["ollama_host"], s["vision_model"], "You are a strict film continuity checker.",
+        return llm.chat(s, "vision", "You are a strict film continuity checker.",
                              q, VISION_SCHEMA, images=[image_path], temperature=0.1, num_predict=512)
     except Exception as exc:
         return {"matches": None, "score": None, "issues": [f"check failed: {exc}"]}
@@ -205,9 +223,10 @@ def _vision_check(s, image_path, shot, bible) -> dict:
 
 # ── Bible jobs ──────────────────────────────────────────────────────────
 
-def job_draft_bible(job, sid, story):
+def job_draft_bible(job, sid, story, model=""):
     s, _ = _ctx()
-    llm.ensure_model(s["ollama_host"], s["planner_model"], job.say)
+    s = llm.with_choice(s, "planner", model)
+    llm.prepare(s, "planner", job.say)
     job.say("Extracting characters and locations from the story...")
     added = planner.draft_bible(s, sid, story)
     job.say(f"Added {len(added['characters'])} characters, {len(added['locations'])} locations (marked draft).")
@@ -215,9 +234,13 @@ def job_draft_bible(job, sid, story):
 
 def job_character_sheet(job, sid, cid, source="flux_lora"):
     s, c = _ctx()
-    _gpu_prepare(job, s, c)
+    if not cloud.is_image_source(source):
+        _gpu_prepare(job, s, c)
     b = store.bible(sid)
     ch = b["characters"][cid]
+    # Cloud models keep the face of the character's first uploaded photo.
+    refs = [r for r in (ch.get("refs") or [])[:1] if os.path.exists(store.abs_media(r))] \
+        if cloud.is_image_source(source) else []
     loras = []
     if source == "flux_lora" and (ch.get("image_lora") or {}).get("name"):
         loras = [{"name": ch["image_lora"]["name"], "strength": float(ch["image_lora"].get("strength", 0.9))}]
@@ -229,7 +252,10 @@ def job_character_sheet(job, sid, cid, source="flux_lora"):
         job.check()
         seed = _seed()
         job.say(f"Rendering {view} ({source})...")
-        items = _render_images(job, s, c, source, prompt, seed, 1, loras, f"studio/{sid}/{cid}_{view}")
+        if refs:
+            prompt = f"Image 1 is {ch.get('name')}; keep exactly this person's face, hair, skin tone and age. " + prompt
+        items = _render_images(job, s, c, source, prompt, seed, 1, loras, f"studio/{sid}/{cid}_{view}",
+                               ref_files=refs)
         for p in _save_outputs(c, items, out_dir, f"{view}_"):
             new.append({"file": store.rel(p), "view": view, "seed": seed, "source": source})
         job.progress = [i + 1, len(views)]
@@ -241,7 +267,8 @@ def job_character_sheet(job, sid, cid, source="flux_lora"):
 
 def job_location_plate(job, sid, lid, variant, source="zimage", count=4):
     s, c = _ctx()
-    _gpu_prepare(job, s, c)
+    if not cloud.is_image_source(source):
+        _gpu_prepare(job, s, c)
     b = store.bible(sid)
     loc = b["locations"][lid]
     prompt = prompts.location_plate_prompt(loc, variant, b)
@@ -258,12 +285,13 @@ def job_location_plate(job, sid, lid, variant, source="zimage", count=4):
 
 # ── Episode planning ────────────────────────────────────────────────────
 
-def job_plan(job, sid, eid):
+def job_plan(job, sid, eid, model=""):
     s, _ = _ctx()
+    s = llm.with_choice(s, "planner", model)
     e = store.get_episode(sid, eid)
     if not (e.get("story") or "").strip():
         raise ValueError("Paste a story first.")
-    llm.ensure_model(s["ollama_host"], s["planner_model"], job.say)
+    llm.prepare(s, "planner", job.say)
     scenes, shots = planner.plan_episode(s, sid, e["story"], log=job.say)
 
     def apply(ep):
@@ -275,11 +303,12 @@ def job_plan(job, sid, eid):
     job.say(f"Planned {len(shots)} shots, runtime {planner.runtime_seconds(shots)} s.")
 
 
-def job_replan_scene(job, sid, eid, scene_id):
+def job_replan_scene(job, sid, eid, scene_id, model=""):
     s, _ = _ctx()
+    s = llm.with_choice(s, "planner", model)
     e = store.get_episode(sid, eid)
     scene = next(sc for sc in e["scenes"] if sc["id"] == scene_id)
-    llm.ensure_model(s["ollama_host"], s["planner_model"], job.say)
+    llm.prepare(s, "planner", job.say)
     job.say(f"Re-planning shots for {scene_id}...")
     new = planner.replan_scene(s, sid, scene)
 
@@ -299,8 +328,9 @@ def _ep_path(sid, eid, *parts):
     return os.path.join(store.ep_dir(sid, eid), *parts)
 
 
-def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
+def job_frames(job, sid, eid, shot_ids=None, force=False, source_override="", check_model=""):
     s, c = _ctx()
+    s = llm.with_choice(s, "vision", check_model)
     e = store.get_episode(sid, eid)
     s = settings_mod.for_episode(s, e)
     b = store.bible(sid)
@@ -318,7 +348,6 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
     if not todo:
         job.say("Nothing to render.")
         return
-    _gpu_prepare(job, s, c)
     # Batch by source to keep one model family loaded.
     order = {"flux_lora": 0, "zimage": 1, "qwen_refs": 2, "reuse": 3, "punch_in": 4}
     plan = []
@@ -329,15 +358,18 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
         if src == "upload":
             job.say(f"{sh['id']}: source is 'upload' - upload an image on the Frames page.")
             continue
-        plan.append((order.get(src, 2), sh["order"], sh, src))
+        plan.append((order.get(src, 5), sh["order"], sh, src))
     plan.sort(key=lambda x: (x[0], x[1]))
+    if any(not cloud.is_image_source(p[3]) for p in plan):
+        _gpu_prepare(job, s, c)
+    s = {**s, "_negative": b["style"].get("negative", "")}
     n = int(s["candidates_per_shot"])
     job.progress = [0, len(plan)]
     last_src = None
     plate_uploads = {}
     for i, (_, _, sh, src) in enumerate(plan):
         job.check()
-        if last_src and src != last_src and src != "reuse":
+        if last_src and src != last_src and src != "reuse" and not cloud.is_image_source(src):
             c.free()
         last_src = src
         sig = store.bible_signature(b, sh)
@@ -379,22 +411,26 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
             seed = _seed()
             plate, init_name, denoise = _location_plate(s, b, sh), None, 1.0
             ref_names, ref_files = [], []
-            if src == "qwen_refs":
-                max_refs = int(s["qwen_edit"].get("max_refs", 3))
+            is_cloud = cloud.is_image_source(src)
+            if src == "qwen_refs" or is_cloud:
+                max_refs = cloud.max_refs(s, src) if is_cloud else int(s["qwen_edit"].get("max_refs", 3))
                 found = _character_refs(sh, b)[:max_refs]
-                if not found:
+                if not found and not is_cloud:
                     job.say(f"{sh['id']}: no reference photo on its characters - add one on the Characters page "
                             f"or pick another source.")
                     continue
                 for ch, rel in found:
                     ref_files.append(rel)
-                    ref_names.append(c.upload(store.abs_media(rel), f"studio_ref_{os.path.basename(rel)}"))
+                    if not is_cloud:
+                        ref_names.append(c.upload(store.abs_media(rel), f"studio_ref_{os.path.basename(rel)}"))
                 names = [ch.get("name") or ch.get("id") for ch, _ in found]
-                use_plate = bool(plate) and len(ref_names) < max_refs
+                use_plate = bool(plate) and len(ref_files) < max_refs
                 if use_plate:
-                    ref_names.append(c.upload(store.abs_media(plate), f"studio_plate_{os.path.basename(plate)}"))
+                    if not is_cloud:
+                        ref_names.append(c.upload(store.abs_media(plate), f"studio_plate_{os.path.basename(plate)}"))
                     ref_files.append(plate)
-                prompt = _refs_prompt(prompt, names, use_plate)
+                if found or use_plate:
+                    prompt = _refs_prompt(prompt, names, use_plate)
                 plate = plate if use_plate else None
             elif plate:
                 if plate not in plate_uploads:
@@ -405,7 +441,8 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
                     f"{f' on location plate (denoise {denoise})' if plate else ''}...")
             t0 = time.time()
             items = _render_images(job, s, c, src, prompt, seed, n, loras, f"studio/{eid}/{sh['id']}",
-                                   init_image=init_name, denoise=denoise, ref_images=ref_names)
+                                   init_image=init_name, denoise=denoise, ref_images=ref_names,
+                                   ref_files=ref_files)
             paths = _save_outputs(c, items, out_dir, "c")
             job.say(f"  {len(paths)} images in {time.time() - t0:.0f}s")
             cands = [{"file": store.rel(p), "source": src, "seed": seed, "batch_index": k, "sig": sig,
@@ -414,7 +451,7 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
         _add_candidates(sid, eid, sh["id"], cands)
         job.progress = [i + 1, len(plan)]
     if s.get("vision_check"):
-        job_vision(job, sid, eid, [p[2]["id"] for p in plan], comfy=c)
+        job_vision(job, sid, eid, [p[2]["id"] for p in plan], comfy=c, model=check_model)
 
 
 def _scene_master(e, sh):
@@ -449,8 +486,10 @@ def _add_candidates(sid, eid, shot_id, cands):
     store.update_episode(sid, eid, apply)
 
 
-def job_vision(job, sid, eid, shot_ids, comfy=None):
+def job_vision(job, sid, eid, shot_ids, comfy=None, model=""):
     s, c = _ctx()
+    s = llm.with_choice(s, "vision", model)
+    job.say(f"Checking frames with {llm.describe(s, 'vision')}.")
     (comfy or c).free()
     b = store.bible(sid)
     e = store.get_episode(sid, eid)
@@ -467,7 +506,7 @@ def job_vision(job, sid, eid, shot_ids, comfy=None):
             def apply(ep, sid_=sh["id"], k_=k, res_=res):
                 store.find_shot(ep, sid_)["frame"]["candidates"][k_]["check"] = res_
             store.update_episode(sid, eid, apply)
-    llm.unload(s["ollama_host"], [s["vision_model"]])
+    llm.unload(s["ollama_host"], [llm.ollama_model(s, "vision")])
     job.say("Vision check done.")
 
 
@@ -705,7 +744,7 @@ def job_cut(job, sid, eid):
         dur = media.normalize_clip(s["ffmpeg"], s["ffprobe"], src, out, tin, tout,
                                    v["width"], v["height"], v["fps"], float(s["loudness_lufs"]))
         clips.append(out)
-        lines = [f"{(b['characters'].get(d.get('speaker')) or {}).get('name', d.get('speaker'))}: {d.get('line', '')}"
+        lines = [f"{(store.find_character(b['characters'], d.get('speaker')) or {}).get('name', d.get('speaker'))}: {d.get('line', '')}"
                  for d in sh.get("dialogue", []) or [] if d.get("line")]
         if lines:
             subs.append((t + 0.1, t + max(0.5, dur - 0.1), "\n".join(lines)))
@@ -744,7 +783,7 @@ def job_frame_correction(job, sid, eid, shot_id, source_file):
         raise ValueError("Source frame was removed")
     if len(sh.get("characters", [])) != 1:
         raise ValueError("Character reference correction needs a single-character shot")
-    character = store.get_character(sid, sh["characters"][0]["id"])
+    character = store.find_character(store.bible(sid)["characters"], sh["characters"][0]["id"])
     if not character:
         raise ValueError("The shot's character was removed")
     _gpu_prepare(job, s, c)
@@ -777,7 +816,7 @@ def job_face_correction(job, sid, eid, shot_id, source_file, model="keep"):
     if model in ("minimax_identity", "qwen_identity"):
         if len(sh.get("characters", [])) != 1:
             raise ValueError("Character reference correction needs a single-character shot")
-        character = store.get_character(sid, sh["characters"][0]["id"])
+        character = store.find_character(store.bible(sid)["characters"], sh["characters"][0]["id"])
         if not character:
             raise ValueError("The shot's character was removed")
         correct = face_correction.qwen_correct_take if model == "qwen_identity" else face_correction.match_identity

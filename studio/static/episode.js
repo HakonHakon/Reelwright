@@ -66,7 +66,13 @@ async function viewEpisode(view, sid, eid, tab) {
 
 const reload = () => (App.soft ? App.soft() : route());
 async function setGate(ctx, gate, value) { await POST(`${ctx.base}/gate`, { gate, value }); toast(value ? "Approved." : "Gate reopened."); reload(); }
-const charName = (ctx, id) => ctx.chars[id]?.name || id;
+/** Frame-source values for the shot editor: local sources, the cloud image models, and the current value. */
+function frameSourceValues(cur) {
+  const v = ["", "flux_lora", "zimage", "qwen_refs", ...(App.ai?.choices.image || []).map((c) => c.source), "auto", "upload"];
+  if (cur && !v.includes(cur)) v.push(cur);
+  return v;
+}
+const charName = (ctx, id) => ctx.chars[id]?.name || `${id} (missing from bible)`;
 const selFrame = (sh) => (sh.frame.selected != null ? sh.frame.candidates[sh.frame.selected] : null);
 const gateBtn = (ctx, gate, label) => ctx.e.gates[gate]
   ? `<button data-gate="${gate}" data-label="${esc(label)}" data-val="0">Reopen ${label}</button>`
@@ -94,6 +100,7 @@ async function tabStory(el, ctx) {
         <button id="save">Save</button>
         <button id="draft">Draft bible from story</button>
         <button class="primary" id="plan">${e.shots.length ? "Re-plan all shots" : "Plan scenes and shots"}</button>
+        <label class="row small" style="margin:0;gap:6px">Write with ${textPicker("plan-model", "planner", "Model that writes the bible draft, scenes and shots")}</label>
         <span class="muted small grow">Bible: ${nChars} characters, ${nLocs} locations. The planner may only use bible ids.</span>
       </div>
     </div>
@@ -102,10 +109,11 @@ async function tabStory(el, ctx) {
       <div class="muted">${esc(s.summary)}</div><div class="small muted">${(s.characters || []).map((c) => esc(charName(ctx, c.id) + (c.outfit ? ` (${c.outfit})` : ""))).join(", ")}</div></div>`).join("")}` : ""}`;
   const save = () => PUT(`${ctx.base}/story`, { title: $("#title").value, story: $("#story").value });
   $("#save").onclick = async () => { await save(); App.dirty = false; toast("Saved."); };
-  $("#draft").onclick = async () => { await save(); App.dirty = false; await startJob(`${ctx.base}/draft_bible`); };
+  const writer = () => ({ model: $("#plan-model")?.value || "" });
+  $("#draft").onclick = async () => { await save(); App.dirty = false; await startJob(`${ctx.base}/draft_bible`, writer()); };
   $("#plan").onclick = async () => {
     if (e.shots.length && !(await ask("Replace the whole shot list? Existing frames and takes stay on disk but are detached.", "Replace", true))) return;
-    await save(); App.dirty = false; await startJob(`${ctx.base}/plan`);
+    await save(); App.dirty = false; await startJob(`${ctx.base}/plan`, writer());
   };
   App.refreshers.push(reload);
 }
@@ -115,9 +123,16 @@ function charsToText(list) { return (list || []).map((c) => [c.id, c.position, c
 function textToChars(t) {
   return t.split(",").map((x) => x.trim()).filter(Boolean).map((x) => { const [id, position, outfit] = x.split(":").map((y) => (y || "").trim()); return { id, position: position || "", outfit: outfit || "" }; });
 }
-function dlgToText(list) { return (list || []).map((d) => `${d.speaker}: ${d.line}`).join("\n"); }
+// Dialogue lines: "speaker [acting direction]: line" (the direction is optional)
+function dlgToText(list) { return (list || []).map((d) => `${d.speaker}${d.emotion ? ` [${d.emotion}]` : ""}: ${d.line}`).join("\n"); }
 function textToDlg(t) {
-  return t.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => { const i = l.indexOf(":"); return i < 0 ? { speaker: "", line: l } : { speaker: l.slice(0, i).trim(), line: l.slice(i + 1).trim() }; });
+  return t.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+    const i = l.indexOf(":"); if (i < 0) return { speaker: "", line: l };
+    const head = l.slice(0, i).trim(), m = head.match(/^(.*?)\s*\[([^\]]*)\]$/);
+    const d = { speaker: (m ? m[1] : head).trim(), line: l.slice(i + 1).trim() };
+    if (m && m[2].trim()) d.emotion = m[2].trim();
+    return d;
+  });
 }
 
 async function tabShots(el, ctx) {
@@ -130,8 +145,9 @@ async function tabShots(el, ctx) {
     el.innerHTML = `
       <div class="toolbar"><div class="tb-group"><button class="primary" id="save">Save shot list</button><button id="add">Add shot</button></div>
         <div class="tb-group"><button id="cont" title="master per scene, punch-ins for closer shots, reuse for returns to wide">Auto continuity</button></div>
+        <div class="tb-group"><label class="row small" style="margin:0;gap:6px">Re-plan scenes with ${textPicker("replan-model", "planner", "Model used by re-plan this scene")}</label></div>
         <span class="grow"></span>${gateBtn(ctx, "shots", "shot list")}</div>
-      <p class="muted small" style="margin:0 0 16px">Characters: <code>id:position:outfit</code>, comma separated. Dialogue: one <code>id: line</code> per line. Editing a duration locks it.</p>
+      <p class="muted small" style="margin:0 0 16px">Characters: <code>id:position:outfit</code>, comma separated. Dialogue: one <code>id [acting direction]: line</code> per line (the direction is optional). Editing a duration locks it.</p>
       <div class="shot-rows">
       ${shots.map((sh, i) => {
         let head = "";
@@ -159,7 +175,7 @@ async function tabShots(el, ctx) {
             ${f("Sound", `<input data-i="${i}" data-f="sound" value="${esc(sh.sound)}" placeholder="sound">`, "span2")}
             ${f(`Duration ${sh.duration_locked ? `<button class="link" data-unlock="${i}" title="Locked - click to auto-compute">🔒 locked</button>` : ""}`, `<input data-i="${i}" data-f="duration_s" type="number" step="0.1" value="${Math.round((+sh.duration_s || 0) * 100) / 100}" aria-label="Duration in seconds">`)}
             ${f("Start", sel("start_mode", i, sh.start_mode, ["new", "punch_in", "reuse", "chain"], ["New frame (master)", "Punch-in from scene master", "Reuse master angle", "Chain: last frame of prev take"]))}
-            ${f("Frame source", sel("frame_source", i, sh.frame_source, ["", "flux_lora", "zimage", "qwen_refs", "auto", "upload"], ["Inherit (" + sourceLabel(sh._source) + ")", "Flux + LoRA", "Z-Image", "Reference photos (Qwen Edit)", "Auto (LoRA > photos > Z-Image)", "Upload"]))}
+            ${f("Frame source", sel("frame_source", i, sh.frame_source, frameSourceValues(sh.frame_source), frameSourceValues(sh.frame_source).map((v) => v ? sourceLabel(v) : "Inherit (" + sourceLabel(sh._source) + ")")))}
             ${f("Video engine", sel("engine", i, sh.engine, ["", "minimax_local", "ltx", "wan", "minimax"], ["Series default", "MiniMax H3 (local)", "LTX-2.3", "Wan 2.2", "MiniMax (cloud)"]))}
           </div>
           <details class="sr-prompts"><summary>Prompts${sh.image_prompt_override || sh.motion_prompt_override ? " (overridden)" : ""}</summary>
@@ -201,7 +217,7 @@ async function tabShots(el, ctx) {
     }
     if (ds.del) { if (await ask(`Delete ${shots[+ds.del].id || "this shot"}?`, "Delete", true)) { shots.splice(+ds.del, 1); App.dirty = true; render(); } }
     if (ds.unlock) { shots[+ds.unlock].duration_locked = false; App.dirty = true; render(); }
-    if (ds.replan) { if (await ask(`Re-plan all shots of ${ds.replan}? Its current shots are replaced.`, "Re-plan", true)) startJob(`${ctx.base}/replan/${ds.replan}`); }
+    if (ds.replan) { if (await ask(`Re-plan all shots of ${ds.replan}? Its current shots are replaced.`, "Re-plan", true)) startJob(`${ctx.base}/replan/${ds.replan}`, { model: $("#replan-model")?.value || "" }); }
     if (t.id === "add") { shots.push({ id: "", scene_id: shots.at(-1)?.scene_id || "S01", location_id: shots.at(-1)?.location_id || locIds[0] || "", framing: "medium", camera: "", characters: [], action: "", dialogue: [], sound: "", action_seconds: 3, start_mode: "new", frame_source: "", engine: "" }); App.dirty = true; render(); }
     if (t.id === "cont") { await PUT(`${ctx.base}/shots`, payload()); await POST(`${ctx.base}/continuity`); App.dirty = false; toast("Continuity assigned: masters, punch-ins, reuses."); return reload(); }
     if (t.id === "save" || ds.gate) {
@@ -356,7 +372,8 @@ async function tabFrames(el, ctx) {
     <div class="toolbar">
       <div class="tb-group">
         <button class="${needs ? "primary" : ""}" id="render-missing" ${needs ? "" : "disabled title=\"Every shot already has a frame\""}>Render missing frames</button>
-        <select id="src-override" aria-label="Frame source"><option value="">Per-shot source</option><option value="flux_lora">Force Flux + LoRA</option><option value="zimage">Force Z-Image</option><option value="qwen_refs">Force reference photos</option></select>
+        <select id="src-override" aria-label="Frame source"><option value="">Per-shot source</option><option value="flux_lora">Force Flux + LoRA</option><option value="zimage">Force Z-Image</option><option value="qwen_refs">Force reference photos</option>${imageOptions("Force ")}</select>
+        <label class="row small" style="margin:0;gap:6px">Check with ${textPicker("check-model", "vision", "Model that checks rendered frames")}</label>
       </div>
       <div class="tb-group">
         <button id="render-all">Re-render unlocked</button><button id="vision">Vision check</button>
@@ -372,9 +389,10 @@ async function tabFrames(el, ctx) {
     const s = framesStatus(ctx), b = $("#render-missing", el);
     $(".status-line", el).innerHTML = s.html; b.disabled = !s.needs; b.className = s.needs ? "primary" : ""; b.title = s.needs ? "" : "Every shot already has a frame";
   };
-  $("#render-missing").onclick = () => startJob(`${ctx.base}/frames`, { source: $("#src-override").value });
-  $("#render-all").onclick = async () => { if (await ask("Render new candidates for every unlocked shot?", "Render")) startJob(`${ctx.base}/frames`, { force: true, source: $("#src-override").value, shot_ids: shots.filter((s) => !s.frame.locked).map((s) => s.id) }); };
-  $("#vision").onclick = () => startJob(`${ctx.base}/vision`, {});
+  const checker = () => $("#check-model")?.value || "";
+  $("#render-missing").onclick = () => startJob(`${ctx.base}/frames`, { source: $("#src-override").value, check_model: checker() });
+  $("#render-all").onclick = async () => { if (await ask("Render new candidates for every unlocked shot?", "Render")) startJob(`${ctx.base}/frames`, { force: true, source: $("#src-override").value, check_model: checker(), shot_ids: shots.filter((s) => !s.frame.locked).map((s) => s.id) }); };
+  $("#vision").onclick = () => startJob(`${ctx.base}/vision`, { model: checker() });
   $("#bulk").onchange = async () => {
     const files = $("#bulk").files; if (!files.length) return;
     const fd = new FormData(); [...files].forEach((f) => fd.append("files", f));
@@ -390,7 +408,7 @@ async function tabFrames(el, ctx) {
     if (ds.qwenface != null && ds.shot) startJob(`${ctx.base}/shots/${ds.shot}/frame_correction`, { index: +ds.qwenface });
     if (ds.refine && ds.shot) startJob(`${ctx.base}/shots/${ds.shot}/refine`, { index: +ds.idx, engine: ds.refine, denoise: parseFloat($(`#dn-${ds.shot}`)?.value || "0.3") });
     if (ds.lock && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { lock: ds.lock === "1" }); reload(); }
-    if (ds.render && ds.shot) startJob(`${ctx.base}/frames`, { shot_ids: [ds.shot], force: true, source: $(`#src-${ds.shot}`).value });
+    if (ds.render && ds.shot) startJob(`${ctx.base}/frames`, { shot_ids: [ds.shot], force: true, source: $(`#src-${ds.shot}`).value, check_model: checker() });
     if (ds.clearend && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { clear_end: true }); reload(); }
     if (ds.asend && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { set_end: ds.asend }); toast("Set as end frame."); reload(); }
   };
@@ -411,7 +429,7 @@ function frameCard(ctx, sh) {
       <span class="chip accent">${sourceLabel(sh._source)}</span>${sh._loras.length ? `<span class="chip" title="${esc(sh._loras.map((l) => l.name + " @" + l.strength).join("\n"))}">${sh._loras.length} LoRA</span>` : ""}
       ${sh._stale ? `<span class="chip warn" title="bible changed since these frames were made">stale</span>` : ""}
       ${sh.frame.locked ? `<span class="chip good">locked</span>` : ""}<span class="grow"></span>
-      ${chained ? "" : `<select id="src-${sh.id}"><option value="">${sourceLabel(sh._source)}</option><option value="flux_lora">Flux + LoRA</option><option value="zimage">Z-Image</option><option value="qwen_refs">Reference photos</option></select>
+      ${chained ? "" : `<select id="src-${sh.id}"><option value="">${sourceLabel(sh._source)}</option><option value="flux_lora">Flux + LoRA</option><option value="zimage">Z-Image</option><option value="qwen_refs">Reference photos</option>${imageOptions()}</select>
       <button data-render="1" data-shot="${sh.id}">Render ${ctx.e._settings.candidates_per_shot} more</button>
       <label class="btn file-pick" style="margin:0;color:var(--ink)">Upload photo<input type="file" accept="image/*,.heic,.heif" data-upframe="${sh.id}" aria-label="Upload photo for ${esc(sh.id)}"></label>`}
       <button data-lock="${sh.frame.locked ? 0 : 1}" data-shot="${sh.id}">${sh.frame.locked ? "Unlock" : "Lock"}</button></div>
@@ -606,6 +624,7 @@ async function tabCut(el, ctx) {
         <button id="lip-setup" ${m.file ? "" : "disabled"}>Lip-sync to uploaded audio</button><span class="grow"></span>
         <button class="primary" id="cut">Render final cut</button></div>
     </div>
+    <div class="card row"><button id="voice-dialogue">Voice all dialogue</button><span class="muted small grow">Voices every line with its acting direction (VoiceStudio), checks the words, and puts each line on the timeline as its own lip-sync-guide clip. Unchanged lines are reused.</span></div>
     ${e.timeline ? `<button class="primary" id="render-edit">Render saved timeline</button><p class="muted small">Uses the clip order, trims, mute settings, music placement and lip-sync choices saved in Takes.</p>` : `<p class="muted small">Each selected take is trimmed, scaled to ${e._settings.video.width}x${e._settings.video.height} @ ${e._settings.video.fps} fps and loudness-normalised, then joined. Wan takes (silent) get a silent track.</p>`}
     ${o.final ? `<h2>Final film ${o.runtime ? "· " + fmtSec(o.runtime) : ""}</h2>
       <video playsinline preload="metadata" controls src="${media(o.final)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
@@ -643,6 +662,7 @@ async function tabCut(el, ctx) {
     await POST(`${ctx.base}/lipsync/select`, {index: +button.dataset.useLipsync}); reload();
   });
   $("#cut").onclick = () => startJob(`${ctx.base}/cut`);
+  if ($("#voice-dialogue")) $("#voice-dialogue").onclick = () => startJob(`${ctx.base}/dialogue`, {});
   if ($('#render-edit')) $('#render-edit').onclick = () => startJob(`${ctx.base}/cut`);
   App.refreshers.push(reload);
 }

@@ -517,3 +517,74 @@ def test_reference_identity_edit_preserves_source_soundtrack(client, monkeypatch
         return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-map', '0:a:0',
                                        '-c:a', 'copy', '-f', 'hash', '-hash', 'sha256', '-'])
     assert audio_hash(source) == audio_hash(destination)
+
+
+def test_shots_follow_a_replaced_character(client):
+    """Delete 'Sam', rename another character to Sam: shots that said 'sam'/'Sam' must use the new
+    one (its refs), not silently drop the character from the frame."""
+    sid, eid, _ = project(client)
+    base = f"/api/s/{sid}"
+    old = client.post(f"{base}/characters", json={"name": "Sam"}).json()
+    new = client.post(f"{base}/characters", json={"name": "Spider Man"}).json()
+    assert (old["id"], new["id"]) == ("sam", "spider_man")
+
+    def cast(e):
+        sh = e["shots"][0]
+        sh["characters"] = [{"id": "Sam", "position": "center"}, {"id": "sam", "position": "right"}]
+        sh["dialogue"] = [{"speaker": "sam", "line": "I can help!"}, {"speaker": "Voice", "line": "Help!"}]
+        e["scenes"] = [{"id": "S01", "characters": [{"id": "sam", "outfit": "default"}]}]
+    store.update_episode(sid, eid, cast)
+
+    assert client.delete(f"{base}/characters/sam").status_code == 200
+    assert client.put(f"{base}/characters/spider_man", json={**new, "name": "Sam"}).status_code == 200
+
+    e = store.get_episode(sid, eid)
+    sh = e["shots"][0]
+    assert sh["characters"] == [{"id": "spider_man", "position": "center"}]
+    assert [d["speaker"] for d in sh["dialogue"]] == ["spider_man", "Voice"]
+    assert e["scenes"][0]["characters"][0]["id"] == "spider_man"
+    b = store.bible(sid)
+    assert [c["id"] for c, _ in jobs.prompts.characters_in(sh, b)] == ["spider_man"]
+
+
+def test_character_lookup_tolerates_case_and_names():
+    chars = {"spider_man": {"id": "spider_man", "name": "Sam"}, "mia": {"id": "mia", "name": "Mia Lee"}}
+    assert store.resolve_character_id(chars, "spider_man") == "spider_man"
+    assert store.resolve_character_id(chars, "Spider_Man") == "spider_man"
+    assert store.resolve_character_id(chars, "Sam") == "spider_man"
+    assert store.resolve_character_id(chars, "mia_lee") == "mia"
+    assert store.resolve_character_id(chars, "the_child") is None
+    twins = {"a": {"id": "a", "name": "Sam"}, "b": {"id": "b", "name": "Sam"}}
+    assert store.resolve_character_id(twins, "sam") is None      # ambiguous: don't guess
+
+
+def test_wan_character_lora_pair_and_trigger():
+    from studio import prompts, workflows
+    b = {"style": {"look": "film"}, "locations": {}, "characters": {
+        "sam": {"id": "sam", "name": "Sam", "appearance": "a boy", "outfits": {"default": "red suit"},
+                "video_lora": {"name": "sam_s4m_wan22_high_noise.safetensors", "strength": 1.0, "trigger": "s4m"}}}}
+    sh = {"characters": [{"id": "sam", "position": "center"}], "action": "waves"}
+    assert prompts.motion_prompt(sh, b, "wan").startswith("film. s4m, Sam (")
+    assert "s4m" not in prompts.motion_prompt(sh, b, "ltx")
+    s = settings.load()
+    wf = workflows.wan_i2v(s, "p", "first.png", 81, 1, prompts.video_loras(sh, b))
+    names = {n["inputs"]["lora_name"] for n in wf.values() if n["class_type"] == "LoraLoaderModelOnly"}
+    assert {"sam_s4m_wan22_high_noise.safetensors", "sam_s4m_wan22_low_noise.safetensors"} <= names
+    # each half of Wan gets its own file
+    high_chain = [n for k, n in wf.items() if n["class_type"] == "LoraLoaderModelOnly" and 30 <= int(k) < 50]
+    low_chain = [n for k, n in wf.items() if n["class_type"] == "LoraLoaderModelOnly" and int(k) >= 50]
+    assert any("high_noise" in n["inputs"]["lora_name"] and "sam" in n["inputs"]["lora_name"] for n in high_chain)
+    assert any("low_noise" in n["inputs"]["lora_name"] and "sam" in n["inputs"]["lora_name"] for n in low_chain)
+
+
+def test_continuity_master_is_the_first_shot_with_characters():
+    """An empty establishing shot opening a scene must not become the master the close-ups punch in on
+    (the frame renderer only accepts a master with characters, so every punch-in failed)."""
+    shot = lambda i, framing, chars: planner.new_shot(id=f"S01_SH0{i}", scene_id="S01", order=i, framing=framing,
+                                                      characters=[{"id": c} for c in chars])
+    shots = [shot(1, "wide", []), shot(2, "medium", ["hakon2"]), shot(3, "close-up", ["hakon2"]),
+             shot(4, "wide", ["hakon2"]), shot(5, "insert", [])]
+    planner.assign_continuity(shots)
+    assert [s["start_mode"] for s in shots] == ["new", "new", "punch_in", "reuse", "new"]
+    e = {"shots": shots}
+    assert jobs._scene_master(e, shots[2])["id"] == "S01_SH02" and jobs._scene_master(e, shots[3])["id"] == "S01_SH02"

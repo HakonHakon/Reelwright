@@ -151,6 +151,46 @@ def test_lipsync_uses_edit_positions_and_reuses_completed_clips(film, monkeypatc
     assert len(calls)==1
 
 
+def test_lipsync_without_music_is_guided_by_voice_clips_on_audio_lanes(film, monkeypatch, tmp_path):
+    """Dialogue as separate lane clips: moving a line moves what the lip-sync model hears."""
+    client, sid, eid, shots, music = film
+    voice = tmp_path / 'line.wav'
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.5', str(voice)], check=True)
+    store.update_episode(sid, eid, lambda e: e.setdefault('audio_assets', []).append(store.rel(str(voice))))  # as an upload does
+    edit = timeline.default_edit(store.get_episode(sid, eid), settings.load())
+    edit['music'] = None
+    edit['clips'][1]['lipsync'] = True                      # second clip: timeline frames 30-59 (1 s at 30 fps)
+    line = {'id': 'sam01', 'file': store.rel(str(voice)), 'lane': 0, 'source_in': 0, 'start_frame': 36, 'frames': 15,
+            'loop': False, 'volume': 1, 'muted': False, 'fade_in': 0, 'fade_out': 0, 'guide': True}
+    # neither a muted dialogue clip nor an unmarked clip (music, effects) can guide lip-sync
+    for bad in ({**line, 'muted': True}, {**line, 'guide': False}):
+        with pytest.raises(ValueError, match='lip-sync guide'):
+            timeline.validate(store.get_episode(sid, eid), {**edit, 'audio': [bad]}, settings.load())
+    edit = timeline.validate(store.get_episode(sid, eid), {**edit, 'audio': [line]}, settings.load())
+    monkeypatch.setattr(jobs, '_gpu_prepare', lambda *a: None)
+    heard = []
+    def correct(job, cfg, client, source, voice_path, dest, *args):
+        import shutil, wave
+        with wave.open(voice_path) as w:
+            pcm = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+        heard.append(float(np.abs(pcm).max()))
+        shutil.copyfile(source, dest)
+    monkeypatch.setattr(lipsync, 'correct_clip', correct)
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, edit, settings.load()['video'])
+    moved = copy.deepcopy(edit); moved['audio'][0]['start_frame'] = 2      # the line now plays over the first clip
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, moved, settings.load()['video'])
+    assert heard[0] > 1000, 'the voice inside clip 2 must reach the lip-sync model'
+    assert heard[1] < 50, 'after moving the line out of clip 2, its guide must be silent'
+    # with a music track on the timeline too, the dialogue clip (not the music) still guides lip-sync
+    with_music = copy.deepcopy(moved)
+    with_music['music'] = {'file': store.rel(str(music)), 'source_in': 0, 'start_frame': 0, 'frames': 60, 'loop': False,
+                           'volume': 1, 'muted': False, 'isolate_vocals': True}
+    with_music = timeline.validate(store.get_episode(sid, eid), with_music, settings.load())
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, with_music, settings.load()['video'])
+    # the guide for clip 2 is unchanged (still silent), so the completed lip-sync is reused: music did not leak in
+    assert len(heard) == 2, 'music must not reach the guide while dialogue clips are marked'
+
+
 def test_cancelled_timeline_does_not_publish_partial_export(film):
     client,sid,eid,shots,music = film
     before = copy.deepcopy(store.get_episode(sid,eid))
@@ -211,6 +251,28 @@ def test_export_is_frame_exact_when_a_trim_falls_between_source_frames(film, off
     assert len(actual) == 30
     expected = np.array([min(47, round((offset + k) / 30 * 24)) * 5 for k in range(30)])
     assert np.max(np.abs(actual[:, 48, 32, 0].astype(float) - expected)) <= 8, 'wrong footage or a shifted start'
+
+
+def test_export_keeps_every_frame_of_a_silent_16fps_take(film):
+    """Wan 2.2 takes are silent 16 fps clips of 4n+1 frames. Interpolated to 24 fps and padded, their
+    timestamps came out uneven, so the clip-length cut dropped ~3 frames per clip and the export failed
+    its frame-count check."""
+    client, sid, eid, shots, music = film
+    source = store.abs_media(shots[0]['takes']['items'][0]['file'])
+    frames = np.zeros((65, 96, 64, 3), dtype=np.uint8)
+    for n in range(65):
+        frames[n, :, :, 0] = n * 3
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', '64x96', '-r', '16',
+                    '-i', 'pipe:0', '-c:v', 'libx264', '-crf', '0', source], input=frames.tobytes(), check=True)
+    edit = timeline.default_edit(store.get_episode(sid, eid), settings.load())
+    clip = edit['clips'][0]
+    fps = edit['fps']
+    assert clip['frames'] == round(65 / 16 * fps)
+    edit['clips'] = [clip, dict(clip, id='clip_again')]; edit['music'] = None
+    timeline.render(jobs.Job('timeline', 'test', None, {}), sid, eid, edit, settings.load()['video'])
+    path = store.abs_media(store.get_episode(sid, eid)['outputs']['final'])
+    raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', path, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
+    assert len(np.frombuffer(raw, dtype=np.uint8).reshape(-1, 96, 64, 3)) == 2 * clip['frames']
 
 
 # ── markers, render range and range previews ─────────────────────────────
@@ -779,7 +841,7 @@ def test_audio_lanes_default_empty_and_are_validated_saved_and_rejected_atomical
     rejected(lambda e: e['audio'][0].update(lane=8))
     rejected(lambda e: e['audio'][0].update(fade_in=15, fade_out=15))
     rejected(lambda e: e['audio'][1].update(id='a'))
-    rejected(lambda e: e.update(audio=[{**e['audio'][0], 'id': str(i)} for i in range(9)]))
+    rejected(lambda e: e.update(audio=[{**e['audio'][0], 'id': str(i)} for i in range(65)]))   # more than 64 clips
     rejected(lambda e: e.update(audio='nope'))
     body['edit']['audio'][0].update(frames=90, loop=True)                         # looping may exceed the recording
     assert client.put(url, json=body['edit']).status_code == 200

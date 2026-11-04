@@ -806,7 +806,7 @@ def test_audio_lanes_add_drag_mute_inspector_remove_and_persist(edit_server):
         page.keyboard.press('Control+Shift+z'); assert lanes()[1][0] == 30
 
         # Mute from the label; the clip dims.
-        page.locator('[data-edit="lane-mute"]').first.click()
+        page.locator('[data-edit="lane-row-mute"]').first.click()
         assert lanes()[0][2] is True and 'muted' in page.locator('.edit-lane-clip').first.get_attribute('class')
 
         # The inspector edits the second lane: start, fades (clamped to the length), then loop off/on.

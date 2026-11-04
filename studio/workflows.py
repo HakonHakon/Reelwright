@@ -239,8 +239,10 @@ def wan_i2v(s: dict, prompt: str, first_frame: str, frames: int, seed: int,
             "width": int(w["width"]), "height": int(w["height"]), "length": int(frames), "batch_size": 1}},
     }
     extra = character_loras or []
+    # Wan 2.2 LoRAs come as a pair: "..._high_noise" for the high-noise model, "..._low_noise" for the low one.
+    extra_low = [{**l, "name": l["name"].replace("high_noise", "low_noise")} if l.get("name") else l for l in extra]
     high = _loras(wf, ["1", 0], [{"name": w["high_lightning"], "strength": 1.0}] + extra, 30)
-    low = _loras(wf, ["2", 0], [{"name": w["low_lightning"], "strength": 1.0}] + extra, 50)
+    low = _loras(wf, ["2", 0], [{"name": w["low_lightning"], "strength": 1.0}] + extra_low, 50)
     wf["5"] = {"class_type": "ModelSamplingSD3", "inputs": {"shift": float(w["shift"]), "model": high}}
     wf["6"] = {"class_type": "ModelSamplingSD3", "inputs": {"shift": float(w["shift"]), "model": low}}
     common = {"cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "steps": steps,

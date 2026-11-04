@@ -326,13 +326,19 @@ class TakeTimelineEditor {
       if (this.playing && el.paused) el.play().catch(() => {}); else if (!this.playing && !el.paused) el.pause();
     }
   }
+  /** Lane numbers in use, in order: each is one row; a row can hold several clips (e.g. one per dialogue line). */
+  laneRows() { return [...new Set((this.edit.audio || []).map(t => t.lane))].sort((a, b) => a - b); }
   laneTracks() {
-    const lanes = this.edit.audio || [], labels = $('.edit-labels', this.root);
+    const lanes = this.edit.audio || [], labels = $('.edit-labels', this.root), rows = this.laneRows();
     $$('.lbl-lane', labels).forEach(el => el.remove());
     const before = $('.lbl-titles', labels);
-    lanes.forEach((t, i) => before.insertAdjacentHTML('beforebegin', `<div class="lbl-lane"><span>A${i + 1}</span><button class="trk-btn" data-edit="lane-mute" data-lane="${esc(t.id)}" aria-pressed="${!!t.muted}" aria-label="Mute audio lane ${i + 1}" title="Mute / unmute this lane">M</button></div>`));
-    $('.edit-audio-track', this.root).style.height = lanes.length * LANE_HEIGHT + 'px';
-    $('.edit-audio-track', this.root).innerHTML = lanes.map((t, i) => {
+    rows.forEach(n => {
+      const clips = lanes.filter(t => t.lane === n), muted = clips.every(t => t.muted);
+      before.insertAdjacentHTML('beforebegin', `<div class="lbl-lane"><span>A${n + 1}</span><button class="trk-btn" data-edit="lane-row-mute" data-lane-row="${n}" aria-pressed="${muted}" aria-label="Mute audio lane ${n + 1}" title="Mute / unmute this lane">M</button></div>`);
+    });
+    $('.edit-audio-track', this.root).style.height = rows.length * LANE_HEIGHT + 'px';
+    $('.edit-audio-track', this.root).innerHTML = lanes.map((t) => {
+      const i = rows.indexOf(t.lane);
       const wave = this.laneWaves[t.file], name = t.file.split('/').pop();
       const fadeW = f => Math.min(t.frames, f) / this.fps * this.zoom;
       return `<div class="edit-lane" style="top:${i * LANE_HEIGHT}px"><button type="button" class="edit-lane-clip ${t.muted ? 'muted' : ''}" data-lane-move="${esc(t.id)}" style="left:${t.start_frame / this.fps * this.zoom}px;width:${Math.max(8, t.frames / this.fps * this.zoom)}px" title="${esc(name)} · ${this.seconds(t.frames)}s" aria-label="Audio lane ${i + 1} clip ${esc(name)}">${wave ? this.waveSvg(t, wave) : ''}<span>${esc(name)}${t.muted ? ' · muted' : ''}</span>${t.fade_in ? `<i class="edit-fade in" style="width:${fadeW(t.fade_in)}px" aria-hidden="true"></i>` : ''}${t.fade_out ? `<i class="edit-fade out" style="width:${fadeW(t.fade_out)}px" aria-hidden="true"></i>` : ''}</button></div>`;
@@ -417,7 +423,7 @@ class TakeTimelineEditor {
   }
   laneInspector() {
     const lanes = this.edit.audio || [], sec = f => (f / this.fps).toFixed(2);
-    return `<h3>Audio lanes (${lanes.length}/${MAX_LANES})</h3>` + (lanes.length ? lanes.map((t, i) => `<fieldset class="edit-lane-box" data-lane-box="${esc(t.id)}"><legend>A${i + 1} · ${esc(t.file.split('/').pop())}</legend>
+    return `<h3>Audio lanes (${this.laneRows().length}/${MAX_LANES}) · ${lanes.length} clip${lanes.length === 1 ? '' : 's'}</h3>` + (lanes.length ? lanes.map((t) => { const i = t.lane; return `<fieldset class="edit-lane-box" data-lane-box="${esc(t.id)}"><legend>A${i + 1} · ${esc(t.file.split('/').pop())}</legend>
       <div class="edit-field-pair"><label>Source in (s)<input data-lane-field="in" data-lane="${esc(t.id)}" type="number" min="0" step=".1" value="${t.source_in}" aria-label="Lane ${i + 1} source in"></label>
       <label>Timeline start (s)<input data-lane-field="start" data-lane="${esc(t.id)}" type="number" min="0" step=".1" value="${this.seconds(t.start_frame)}" aria-label="Lane ${i + 1} timeline start"></label></div>
       <label>Length (s)<input data-lane-field="length" data-lane="${esc(t.id)}" type="number" min="${1/this.fps}" step=".1" value="${this.seconds(t.frames)}" aria-label="Lane ${i + 1} length"></label>
@@ -426,7 +432,8 @@ class TakeTimelineEditor {
       <label>Volume<input data-lane-field="volume" data-lane="${esc(t.id)}" type="range" min="0" max="1" step=".05" value="${t.volume}" aria-label="Lane ${i + 1} volume"></label>
       <label class="row"><input data-lane-field="muted" data-lane="${esc(t.id)}" type="checkbox" ${t.muted ? 'checked' : ''}>Mute</label>
       <label class="row"><input data-lane-field="loop" data-lane="${esc(t.id)}" type="checkbox" ${t.loop ? 'checked' : ''}>Loop</label>
-      <button data-edit="lane-remove" data-lane="${esc(t.id)}" class="danger">Remove this lane</button></fieldset>`).join('') : '<p class="muted small">Use "Add audio lane" for voice-over or sound effects. Music stays the lip-sync guide.</p>');
+      <label class="row" title="Dialogue: lip-synced shots follow this clip (music and effects should stay unticked)"><input data-lane-field="guide" data-lane="${esc(t.id)}" type="checkbox" ${t.guide ? 'checked' : ''}>Lip-sync guide (dialogue)</label>
+      <button data-edit="lane-remove" data-lane="${esc(t.id)}" class="danger">Remove this clip</button></fieldset>`; }).join('') : '<p class="muted small">Use "Add audio lane" for dialogue, voice-over or sound effects. Tick "Lip-sync guide" on dialogue clips; otherwise music guides lip-sync.</p>');
   }
   laneChange(t) {
     const lane = (this.edit.audio || []).find(x => x.id === t.dataset.lane); if (!lane) return;
@@ -445,12 +452,13 @@ class TakeTimelineEditor {
     }
     if (field === 'volume') return this.changeEdit(() => { lane.volume = +t.value; });
     if (field === 'muted') return this.changeEdit(() => { lane.muted = t.checked; });
+    if (field === 'guide') return this.changeEdit(() => { lane.guide = t.checked; });
     if (field === 'loop') return this.changeEdit(() => { lane.loop = t.checked; if (!lane.loop) lane.frames = Math.max(1, Math.min(lane.frames, Math.round((duration - lane.source_in) * this.fps))); this.clampLane(lane); });
   }
   clampLane(t) { t.fade_in = Math.max(0, Math.min(t.frames, Math.round(t.fade_in || 0))); t.fade_out = Math.max(0, Math.min(t.frames - t.fade_in, Math.round(t.fade_out || 0))); }
   async uploadLane(input) {
     const file = input.files[0]; if (!file) return;
-    if ((this.edit.audio || []).length >= MAX_LANES) { input.value = ''; return toast(`At most ${MAX_LANES} audio lanes.`, true); }
+    if (this.laneRows().length >= MAX_LANES) { input.value = ''; return toast(`At most ${MAX_LANES} audio lanes.`, true); }
     App.interactionBusy = true;
     try {
       const fd = new FormData(); fd.append('file', file);
@@ -461,7 +469,8 @@ class TakeTimelineEditor {
       this.sources[saved.file] = info;
       this.changeEdit(() => {
         this.edit.audio = this.edit.audio || [];
-        this.edit.audio.push({id: editId(), file: saved.file, lane: this.edit.audio.length, source_in: 0, start_frame: this.frame, frames: Math.max(1, Math.round(info.duration * this.fps)), volume: 1, muted: false, loop: false, fade_in: 0, fade_out: 0});
+        const rows = this.laneRows();
+        this.edit.audio.push({id: editId(), file: saved.file, lane: rows.length ? rows[rows.length - 1] + 1 : 0, source_in: 0, start_frame: this.frame, frames: Math.max(1, Math.round(info.duration * this.fps)), volume: 1, muted: false, loop: false, fade_in: 0, fade_out: 0});
       });
     } catch (error) { toast(error.message || 'Could not add that audio file.', true); } finally { input.value = ''; App.interactionBusy = false; }
   }
@@ -1076,11 +1085,20 @@ class TakeTimelineEditor {
     if (action === 'zoom-fit') return this.fit();
     if (action === 'track-video-mute') return this.changeEdit(() => { const muted = !this.edit.clips.every(c => c.muted); this.edit.clips.forEach(c => { c.muted = muted; }); });
     if (action === 'track-music-mute' && this.edit.music) return this.changeEdit(() => { this.edit.music.muted = !this.edit.music.muted; });
+    if (action === 'lane-row-mute') {
+      const n = Number(event.target.closest('[data-lane-row]')?.dataset.laneRow), clips = (this.edit.audio || []).filter(x => x.lane === n);
+      if (!clips.length) return;
+      const mute = !clips.every(x => x.muted);
+      return this.changeEdit(() => { clips.forEach(x => { x.muted = mute; }); });
+    }
     if (action === 'lane-mute' || action === 'lane-remove') {
       const id = event.target.closest('[data-lane]')?.dataset.lane, lane = (this.edit.audio || []).find(x => x.id === id); if (!lane) return;
       return this.changeEdit(() => {
         if (action === 'lane-mute') lane.muted = !lane.muted;
-        else { this.edit.audio = this.edit.audio.filter(x => x !== lane); this.edit.audio.forEach((x, i) => { x.lane = i; }); }
+        else {
+          this.edit.audio = this.edit.audio.filter(x => x !== lane);
+          const rows = this.laneRows(); this.edit.audio.forEach(x => { x.lane = rows.indexOf(x.lane); });  // close gaps, keep grouping
+        }
       });
     }
     if (action === 'reframe-reset' && c) return this.changeEdit(() => { c.reframe = {...DEFAULT_REFRAME}; });

@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
-from . import beats, jobs, llm, media, planner, prompts, store, providers, timeline
+from . import beats, cloud, dialogue, jobs, llm, media, planner, prompts, store, providers, timeline, voices
 from . import settings as settings_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -150,7 +150,15 @@ def status():
                 out["missing"] += sorted(n for n in names if n not in opts and n not in out["missing"])
         except Exception as exc:
             out["error"] = str(exc)
-    for m in {s["planner_model"], s["vision_model"]}:
+    vh = voices.health(s)
+    out["voices"] = {"ok": bool(vh), "device": (vh or {}).get("device"), "engine": voices.cfg(s)["engine"]}
+    out["planner_provider"], out["vision_provider"] = llm.provider(s, "planner"), llm.provider(s, "vision")
+    out["planner"], out["vision"] = llm.describe(s, "planner"), llm.describe(s, "vision")
+    for role in ("planner", "vision"):
+        p = llm.provider(s, role)
+        if p != "ollama" and not cloud.key_source(s, p):
+            out["missing"].append(f"{p}:api_key")
+    for m in {llm.ollama_model(s, r) for r in ("planner", "vision")} - {""}:
         names = out["ollama_models"]
         if m not in names and f"{m}:latest" not in names:
             out["missing"].append(f"ollama:{m}")
@@ -159,12 +167,111 @@ def status():
 
 @app.get("/api/settings")
 def get_settings():
-    return {"effective": _s(), "user": settings_mod.raw_user()}
+    return {"effective": cloud.mask_keys(_s()), "user": cloud.mask_keys(settings_mod.raw_user())}
 
 
 @app.put("/api/settings")
 def put_settings(user: dict = Body(...)):
-    return settings_mod.save(user)
+    if "ai_connections" in user:
+        try:
+            user["ai_connections"] = cloud.validate_connections(user["ai_connections"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    user = cloud.keep_masked_keys(user, settings_mod.raw_user())
+    return cloud.mask_keys(settings_mod.save(user))
+
+
+# ── AI models page ──────────────────────────────────────────────────────
+
+def _full_ref(s, ref):
+    try:
+        conn, model = cloud.resolve_text(s, ref)
+        if conn == "ollama" and not cloud.parse_ref(ref)[1]:
+            return ref
+        return f"{conn}:{model}"
+    except cloud.CloudError:
+        return ref
+
+
+def _ai_view():
+    s = _s()
+    conns = [{**c, "key": cloud.key_source(s, c["id"])} for c in cloud.connections(s)]
+    return {"connections": conns, "types": cloud.TYPES, "presets": cloud.PRESETS,
+            "defaults": {r: _full_ref(s, llm.ref(s, r)) for r in ("planner", "vision")},
+            "labels": {"planner": llm.describe(s, "planner"), "vision": llm.describe(s, "vision")},
+            "choices": cloud.choices(s, llm.installed(s["ollama_host"]))}
+
+
+@app.get("/api/ai")
+def ai_get():
+    return _ai_view()
+
+
+@app.put("/api/ai")
+def ai_put(body: dict = Body(...)):
+    """{connections: [...], defaults: {planner, vision}} - keys are set separately."""
+    user = settings_mod.raw_user()
+    try:
+        if "connections" in body:
+            user["ai_connections"] = cloud.validate_connections(body["connections"])
+        for role in ("planner", "vision"):
+            ref = (body.get("defaults") or {}).get(role)
+            if ref is not None:
+                conn = cloud.parse_ref(ref)[0]
+                ids = {c["id"] for c in (user.get("ai_connections") or cloud.connections(_s()))}
+                if ref and conn != "ollama" and conn not in ids:
+                    raise ValueError(f"Unknown connection '{conn}' for {role}")
+                user[role] = ref
+                user.pop(f"{role}_provider", None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    settings_mod.save(user)
+    known = {c["id"] for c in cloud.connections(_s())}
+    for cid in list(cloud._read_secrets()):
+        if cid not in known:
+            cloud.set_key(cid, None)          # a deleted connection takes its key with it
+    return _ai_view()
+
+
+@app.put("/api/ai/{conn_id}/key")
+def ai_key(conn_id: str, body: dict = Body(...)):
+    """{key: "..."} stores the key; {key: ""} removes it. The key is never returned."""
+    try:
+        cloud.get_conn(_s(), conn_id)
+    except cloud.CloudError:
+        _404("connection")
+    key = str(body.get("key") or "").strip()
+    if len(key) > 4096 or any(ch.isspace() for ch in key):
+        raise HTTPException(400, "That does not look like an API key")
+    cloud.set_key(conn_id, key or None)
+    return _ai_view()
+
+
+@app.get("/api/ai/{conn_id}/models")
+def ai_models(conn_id: str):
+    try:
+        return {"models": cloud.list_models(_s(), conn_id)}
+    except cloud.CloudError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/ai/{conn_id}/test")
+def ai_test(conn_id: str, body: dict = Body(default={})):
+    """Checks the key (model list) and, with {model}, writes one tiny JSON reply."""
+    s = _s()
+    try:
+        c = cloud.get_conn(s, conn_id)
+        models = cloud.list_models(s, conn_id)
+        out = {"ok": True, "models": len(models), "message": f"Connected: {len(models)} models available."}
+        model = body.get("model") or c.get("text_model")
+        if model:
+            reply = cloud.chat_json(s, conn_id, "Reply in JSON.", "Say hello in three words.",
+                                    {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+                                    temperature=0.2, model=model)
+            out["message"] += f" {model} replied: {str(reply.get('text', ''))[:80]}"
+        return out
+    except cloud.CloudError as exc:
+        return {"ok": False, "message": str(exc)}
 
 
 @app.get("/api/jobs")
@@ -175,6 +282,27 @@ def list_jobs():
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     return {"ok": jobs.QUEUE.cancel(job_id)}
+
+
+def _text_choice(body, key="model") -> str:
+    """A per-job text model choice ("<connection>:<model>"), checked before the job starts."""
+    ref = str((body or {}).get(key) or "").strip()
+    if ref:
+        try:
+            cloud.resolve_text(_s(), ref)
+        except cloud.CloudError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return ref
+
+
+def _image_choice(source) -> str:
+    source = str(source or "").strip()
+    if cloud.is_image_source(source):
+        try:
+            cloud.resolve_image(_s(), source)
+        except cloud.CloudError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return source
 
 
 def _submit(kind, title, fn, **params):
@@ -218,7 +346,9 @@ def props_put(sid: str, body: list = Body(...)):
 def char_create(sid: str, body: dict = Body(...)):
     c = store.new_character(body.get("name", "New character"))
     c["id"] = ""
-    return store.save_character(sid, c, bump=False)
+    c = store.save_character(sid, c, bump=False)
+    store.relink_characters(sid)
+    return c
 
 
 @app.put("/api/s/{sid}/characters/{cid}")
@@ -226,7 +356,10 @@ def char_put(sid: str, cid: str, body: dict = Body(...)):
     cur = store.get_character(sid, cid) or _404("character")
     keep = {k: cur.get(k) for k in ("id", "refs", "sheet", "version")}
     merged = {**cur, **body, **keep, "draft": False}
-    return store.save_character(sid, merged, bump=True)
+    c = store.save_character(sid, merged, bump=True)
+    if (cur.get("name") or "") != (c.get("name") or ""):
+        store.relink_characters(sid)     # shots that still name a deleted id may now mean this character
+    return c
 
 
 @app.delete("/api/s/{sid}/characters/{cid}")
@@ -234,6 +367,7 @@ def char_delete(sid: str, cid: str):
     _ensure_idle(sid)
     store.get_character(sid, cid) or _404("character")
     store.archive_dir(store.char_dir(sid, cid))
+    store.relink_characters(sid)
     return {"ok": True}
 
 
@@ -243,6 +377,8 @@ async def char_upload(sid: str, cid: str, kind: str = Form("ref"), file: UploadF
     if kind == "voice":
         p = await _save_upload(file, store.char_dir(sid, cid), "voice" + os.path.splitext(file.filename or ".wav")[1])
         c["voice"]["file"] = store.rel(p)
+        c["voice"].pop("ref_text", None)          # transcribed again for dialogue cloning
+        c["voice"]["designed"] = False
         return store.save_character(sid, c, bump=True)
     p = await _save_upload(file, os.path.join(store.char_dir(sid, cid), "refs"))
     c["refs"] = (c.get("refs") or []) + [store.rel(p)]
@@ -262,9 +398,21 @@ def char_refs(sid: str, cid: str, body: dict = Body(...)):
     return store.save_character(sid, c, bump=False)
 
 
+@app.post("/api/s/{sid}/characters/{cid}/voice")
+def char_voice(sid: str, cid: str, body: dict = Body(default={})):
+    """Design the character's reference voice from {description} (or its saved voice description)."""
+    c = store.get_character(sid, cid) or _404("character")
+    desc = str(body.get("description") or (c.get("voice") or {}).get("description") or "").strip()
+    if not desc:
+        raise HTTPException(400, "Write a voice description first, e.g. 'a cheerful four-year-old boy, high-pitched child voice'")
+    if not voices.health(_s()):
+        raise HTTPException(400, "VoiceStudio is not running (systemctl --user start reelwright-voice)")
+    return _submit("voice", f"Voice: {c['name']}", dialogue.job_design_voice, sid=sid, cid=cid, description=desc)
+
+
 @app.post("/api/s/{sid}/characters/{cid}/sheet")
 def char_sheet(sid: str, cid: str, body: dict = Body(default={})):
-    src = body.get("source") or "flux_lora"
+    src = _image_choice(body.get("source")) or "flux_lora"
     return _submit("sheet", f"Character sheet: {cid}", jobs.job_character_sheet, sid=sid, cid=cid, source=src)
 
 
@@ -293,7 +441,7 @@ def loc_delete(sid: str, lid: str):
 @app.post("/api/s/{sid}/locations/{lid}/plates")
 def loc_plates(sid: str, lid: str, body: dict = Body(...)):
     return _submit("plates", f"Plates: {lid}/{body.get('variant')}", jobs.job_location_plate, sid=sid, lid=lid,
-                   variant=body.get("variant") or "day", source=body.get("source") or "zimage")
+                   variant=body.get("variant") or "day", source=_image_choice(body.get("source")) or "zimage")
 
 
 @app.post("/api/s/{sid}/locations/{lid}/upload")
@@ -355,19 +503,31 @@ def ep_story(sid: str, eid: str, body: dict = Body(...)):
 
 
 @app.post("/api/s/{sid}/e/{eid}/draft_bible")
-def ep_draft_bible(sid: str, eid: str):
+def ep_draft_bible(sid: str, eid: str, body: dict = Body(default={})):
     e = _ep(sid, eid)
-    return _submit("draft_bible", "Draft bible from story", jobs.job_draft_bible, sid=sid, story=e.get("story", ""))
+    return _submit("draft_bible", "Draft bible from story", jobs.job_draft_bible, sid=sid, story=e.get("story", ""),
+                   model=_text_choice(body))
+
+
+@app.post("/api/s/{sid}/e/{eid}/dialogue")
+def ep_dialogue(sid: str, eid: str, body: dict = Body(default={})):
+    """Voice every dialogue line (VoiceStudio) and place each as a lip-sync-guide clip on the Cut timeline."""
+    _ep(sid, eid)
+    if not voices.health(_s()):
+        raise HTTPException(400, "VoiceStudio is not running (systemctl --user start reelwright-voice)")
+    return _submit("dialogue", f"Dialogue {eid}", dialogue.job_dialogue, sid=sid, eid=eid,
+                   shot_ids=body.get("shot_ids") or None)
 
 
 @app.post("/api/s/{sid}/e/{eid}/plan")
-def ep_plan(sid: str, eid: str):
-    return _submit("plan", f"Plan {eid}", jobs.job_plan, sid=sid, eid=eid)
+def ep_plan(sid: str, eid: str, body: dict = Body(default={})):
+    return _submit("plan", f"Plan {eid}", jobs.job_plan, sid=sid, eid=eid, model=_text_choice(body))
 
 
 @app.post("/api/s/{sid}/e/{eid}/replan/{scene_id}")
-def ep_replan(sid: str, eid: str, scene_id: str):
-    return _submit("replan", f"Re-plan {scene_id}", jobs.job_replan_scene, sid=sid, eid=eid, scene_id=scene_id)
+def ep_replan(sid: str, eid: str, scene_id: str, body: dict = Body(default={})):
+    return _submit("replan", f"Re-plan {scene_id}", jobs.job_replan_scene, sid=sid, eid=eid, scene_id=scene_id,
+                   model=_text_choice(body))
 
 
 @app.put("/api/s/{sid}/e/{eid}/shots")
@@ -391,6 +551,7 @@ def ep_shots(sid: str, eid: str, body: list = Body(...)):
             for k in EDITABLE_SHOT_FIELDS:
                 if k in inc:
                     base[k] = inc[k]
+            store.normalize_cast(b["characters"], base)
             if not inc.get("duration_locked"):
                 eng = base.get("engine") or b["style"].get("default_engine") or "ltx"
                 cap = s[eng]["max_seconds"]
@@ -422,14 +583,15 @@ def ep_gate(sid: str, eid: str, body: dict = Body(...)):
 def ep_frames(sid: str, eid: str, body: dict = Body(default={})):
     return _submit("frames", f"First frames {eid}", jobs.job_frames, sid=sid, eid=eid,
                    shot_ids=body.get("shot_ids") or [], force=bool(body.get("force")),
-                   source_override=body.get("source") or "")
+                   source_override=_image_choice(body.get("source")), check_model=_text_choice(body, "check_model"))
 
 
 @app.post("/api/s/{sid}/e/{eid}/vision")
 def ep_vision(sid: str, eid: str, body: dict = Body(default={})):
     e = _ep(sid, eid)
     ids = body.get("shot_ids") or [sh["id"] for sh in e["shots"]]
-    return _submit("vision", f"Vision check {eid}", jobs.job_vision, sid=sid, eid=eid, shot_ids=ids)
+    return _submit("vision", f"Vision check {eid}", jobs.job_vision, sid=sid, eid=eid, shot_ids=ids,
+                   model=_text_choice(body))
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/upload_frame")
@@ -536,7 +698,7 @@ def frame_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default
 def _correction_character(sid, sh):
     if len(sh.get("characters", [])) != 1:
         raise HTTPException(400, "Character reference correction needs a single-character shot")
-    character = store.get_character(sid, sh["characters"][0]["id"])
+    character = store.find_character(store.bible(sid)["characters"], sh["characters"][0]["id"])
     if not character or not any(os.path.isfile(store.abs_media(p)) for p in character.get("refs", []) if p):
         raise HTTPException(400, "Upload a reference photo for this character in Characters first")
     return character

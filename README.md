@@ -15,9 +15,10 @@
 | **First frames** | Generate or upload candidates, crop photos on desktop or mobile, compare results and correct a face with Qwen Image Edit. |
 | **Animatic** | Preview selected frames at shot length before generating video. |
 | **Takes editor** | Generate takes, preview, reorder, trim, split, duplicate, delete, mute, mix music and choose lip-sync clips. |
+| **Dialogue voices** | Give each character a recorded or designed voice and voice every line locally with VoiceStudio, placed on the timeline. |
 | **Render & download** | Queue the saved timeline, follow progress in Activity, then watch or download versioned MP4 exports and an EDL. |
 
-Local generation uses ComfyUI; story planning uses Ollama. The optional MiniMax Hailuo cloud provider requires a separate paid API account. Model weights and custom nodes must be installed for the workflows you select.
+Local generation uses ComfyUI; story planning uses Ollama (or a connection on the **AI models** page); dialogue voices use VoiceStudio. The optional MiniMax Hailuo cloud provider requires a separate paid API account. Model weights and custom nodes must be installed for the workflows you select.
 
 ## Edit your film in Takes
 
@@ -49,6 +50,21 @@ python scripts/install_lipsync.py --python /path/to/python3.10 --comfy /path/to/
 ```
 
 Restart ComfyUI and Studio after installation. The installer creates an isolated runtime and downloads the lip-sync weights. See the [Studio guide on the timeline branch](https://github.com/HakonHakon/Reelwright/blob/feat/takes-face-correction-and-models/STUDIO.md) for configuration and the older Cut workflow.
+
+### Voice the dialogue (VoiceStudio)
+
+Studio can voice a film's written dialogue locally through a headless VoiceStudio engine on the same PC (default `http://127.0.0.1:3900`, setting `voices.host`).
+
+1. **Give each speaking character a voice.** On the character page, set the **Voice description** (for example "a cheerful four-year-old boy, high-pitched child voice") and a speaking rate. Then either **Upload a recording (5-20 s)** or choose **Design voice from description**. Every line of that character is cloned from this reference, so the character always sounds like the same person.
+2. **Write the lines.** In the shot list, the **Dialogue** field takes one `id: line` per row. A line's emotion is used as its acting direction.
+3. **Voice all dialogue.** In **Cut**, choose **Voice all dialogue**. Studio frees ComfyUI and Ollama models from the GPU, voices each line with the configured engine (default `indextts2`), checks the words with speech recognition and retries with a new seed when they don't match (`voices.min_match`, `voices.tries`). The best take is kept.
+4. **Edit the result.** Each line lands on the timeline as its own audio-lane clip, one lane per character, placed inside its shot and marked as the lip-sync guide. Voicing again replaces earlier generated dialogue clips (`dlg_…`) and keeps other lane clips. Unchanged lines are reused from the cache.
+
+The Studio status panel shows whether VoiceStudio is reachable. On Linux the engine can run as a user service (`systemctl --user start reelwright-voice`). `services-start.sh` and `services-stop.sh` start and stop Ollama, VoiceStudio, ComfyUI and Studio together, for example around a training run.
+
+## AI connections
+
+**AI models** in the sidebar connects OpenAI, Google Gemini or any OpenAI-compatible service (OpenRouter, Groq, DeepSeek, Mistral, xAI, Together, LM Studio …). A connection can write the bible draft, scenes and shots, check frames, and render first frames, character sheets and location plates from reference photos. Local Ollama remains the default. API keys come from the connection's environment variable, else `secrets.json` in the Studio data folder (owner-only); keys never appear in errors, logs or API responses.
 
 ## Characters, frames and face correction
 
@@ -129,7 +145,7 @@ Activity shows queued/running jobs, logs and cancellation controls. Editing char
 With pytest installed and ffmpeg/ffprobe on `PATH`:
 
 ```sh
-python -m pytest tests/test_studio_features.py tests/test_lipsync.py tests/test_comfy_outputs.py tests/test_timeline.py -q
+python -m pytest tests/test_studio_features.py tests/test_lipsync.py tests/test_comfy_outputs.py tests/test_timeline.py tests/test_dialogue.py tests/test_cloud.py -q
 ```
 
 Browser checks additionally require Playwright, Chromium and WebKit:

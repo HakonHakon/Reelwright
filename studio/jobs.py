@@ -177,13 +177,100 @@ def _resolve_source(sh, b) -> str:
     return src
 
 
-def _refs_prompt(base: str, names: list[str], has_plate: bool) -> str:
-    """Map cloud reference images to characters, followed by the shot's normal prompt."""
-    parts = [f"Image {i + 1} is {n}." for i, n in enumerate(names)]
+CLOSE_VIEWS = ("front", "three_quarter", "photo", "profile", "full_body")
+WIDE_VIEWS = ("full_body", "three_quarter", "front", "photo", "profile")
+TURNAROUND_HEIGHT, TURNAROUND_GAP = 768, 24
+
+
+def _character_views(c: dict, ch: dict, close: bool) -> list[str]:
+    """Every usable reference of one character, best first for this framing: the outfit reference (or else the first
+    approved photo) leads, then approved sheet views in the order the framing needs them. Unapproved sheet images are
+    only a fallback when nothing is approved. With an outfit reference, full-body views are left out: they would
+    show the default clothes."""
+    outfit = (ch or {}).get("outfit") or c.get("default_outfit") or ""
+    outfit_ref = (c.get("outfit_refs") or {}).get(outfit)
+    outfit_ref = outfit_ref if outfit_ref and os.path.exists(store.abs_media(outfit_ref)) else None
+    view_of = {x.get("file"): x.get("view") or "photo" for x in (c.get("sheet") or []) if x.get("file")}
+    pool = [r for r in (c.get("refs") or []) if r and os.path.exists(store.abs_media(r))]
+    if not pool and not outfit_ref:
+        pool = [r for r in view_of if os.path.exists(store.abs_media(r))]
+    order = CLOSE_VIEWS if close else WIDE_VIEWS
+    rank = {v: i for i, v in enumerate(order)}
+    lead = outfit_ref or (pool[0] if pool else None)
+    rest = [r for r in pool if r != lead and not (outfit_ref and view_of.get(r) == "full_body")]
+    rest.sort(key=lambda r: rank.get(view_of.get(r, "photo"), len(order)))     # stable: upload order within a view
+    return ([lead] if lead else []) + rest
+
+
+def _turnaround(sid: str, c: dict, rels: list[str]) -> str:
+    """The views side by side in one image (cached by file and modification time); media path."""
+    import hashlib
+    from PIL import Image, ImageOps
+    key = "|".join(f"{r}:{os.path.getmtime(store.abs_media(r))}" for r in rels)
+    out = os.path.join(store.char_dir(sid, c["id"]), "turnaround",
+                       hashlib.sha1(key.encode()).hexdigest()[:16] + ".png")
+    if not os.path.exists(out):
+        tiles = []
+        for r in rels:
+            with Image.open(store.abs_media(r)) as im:
+                im = ImageOps.exif_transpose(im).convert("RGB")
+                w = max(1, round(im.width * TURNAROUND_HEIGHT / im.height))
+                tiles.append(im.resize((w, TURNAROUND_HEIGHT), Image.LANCZOS))
+        width = sum(t.width for t in tiles) + TURNAROUND_GAP * (len(tiles) - 1)
+        sheet = Image.new("RGB", (width, TURNAROUND_HEIGHT), "white")
+        x = 0
+        for t in tiles:
+            sheet.paste(t, (x, 0))
+            x += t.width + TURNAROUND_GAP
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        sheet.save(out)
+    return store.rel(out)
+
+
+def _cloud_refs(s, sid, sh, b, max_refs: int, want_plate: bool):
+    """Reference images for a cloud first frame: ([(character, [media paths], kind)], use_plate).
+    kind is "views" (separate images of one person) or "turnaround" (one stitched image).
+    The model's image limit is shared: every person gets at least one image before anyone gets a second,
+    and the location plate only goes in if a slot is left."""
+    cfg = s.get("cloud_refs") or {}
+    mode = cfg.get("mode", "views")
+    cap = max(1, int(cfg.get("per_character", 3)))
+    close = (sh.get("framing") or "").lower() in prompts.CLOSE_FRAMINGS
+    people = [(c, v) for c, ch in prompts.characters_in(sh, b) if (v := _character_views(c, ch, close))]
+    people = people[:max_refs]
+    if mode == "single" or not people:
+        groups = [(c, v[:1], "views") for c, v in people]
+    elif mode == "turnaround":
+        groups = [(c, [_turnaround(sid, c, v[:cap])] if len(v) > 1 else v[:1],
+                   "turnaround" if len(v) > 1 else "views") for c, v in people]
+    else:
+        slots = max_refs - (1 if want_plate and max_refs > len(people) else 0)
+        per = max(1, min(cap, slots // len(people)))
+        groups = [(c, v[:per], "views") for c, v in people]
+    used = sum(len(rels) for _, rels, _ in groups)
+    return groups, bool(want_plate) and used < max_refs
+
+
+def _refs_prompt(base: str, groups, has_plate: bool) -> str:
+    """Map cloud reference images to characters, followed by the shot's normal prompt.
+    groups: [(name, image count, kind)] in upload order (a bare list of names means one image each)."""
+    groups = [g if isinstance(g, tuple) else (g, 1, "views") for g in groups]
+    parts, i = [], 1
+    for name, count, kind in groups:
+        if kind == "turnaround":
+            parts.append(f"Image {i} is a reference sheet of {name}: several views of this one person side by side.")
+        elif count == 1:
+            parts.append(f"Image {i} is {name}.")
+        else:
+            parts.append(f"Images {i}-{i + count - 1} are {name}, the same person from different angles.")
+        i += count
     if has_plate:
-        parts.append(f"Image {len(names) + 1} is the room; keep this location.")
+        parts.append(f"Image {i} is the room; keep this location.")
     parts.append("Create a new picture of the following scene. Each person keeps the exact face, hair, skin tone "
-                 "and age of their reference image.")
+                 "and age of their reference images.")
+    if any(count > 1 or kind == "turnaround" for _, count, kind in groups):
+        parts.append("Draw each person exactly once, in the pose the scene describes; never copy a reference "
+                     "image's pose, layout or background.")
     return " ".join(parts) + " " + base
 
 
@@ -767,14 +854,13 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override="", ch
             is_cloud = cloud.is_image_source(src)
             if is_cloud:
                 max_refs = cloud.max_refs(s, src)
-                found = _character_refs(sh, b)[:max_refs]
-                ref_files = [rel for _, rel in found]
-                names = [ch.get("name") or ch.get("id") for ch, _ in found]
-                use_plate = bool(plate) and len(ref_files) < max_refs
+                found, use_plate = _cloud_refs(s, sid, sh, b, max_refs, bool(plate))
+                ref_files = [rel for _, rels, _ in found for rel in rels]
+                groups = [(ch.get("name") or ch.get("id"), len(rels), kind) for ch, rels, kind in found]
                 if use_plate:
                     ref_files.append(plate)
                 if found or use_plate:
-                    prompt = _refs_prompt(prompt, names, use_plate)
+                    prompt = _refs_prompt(prompt, groups, use_plate)
                 plate = plate if use_plate else None
             elif plate:
                 if plate not in plate_uploads:

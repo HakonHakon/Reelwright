@@ -216,6 +216,70 @@ def test_cloud_frames_render_without_comfyui_and_send_character_refs(client, mon
 
 
 
+def _sheet_character(sid, name, views):
+    """A character with one uploaded photo plus approved sheet views (view -> file)."""
+    c = store.save_character(sid, {**store.new_character(name), "id": ""}, bump=False)
+    folder = store.char_dir(sid, c["id"])
+    def put(sub, fname, w=40, h=60):
+        p = os.path.join(folder, sub, fname)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "wb").write(png(w, h))
+        return store.rel(p)
+    photo = put("refs", "photo.png")
+    sheet = [{"file": put("sheet", f"{v}.png"), "view": v} for v in views]
+    store.save_character(sid, {**store.get_character(sid, c["id"]), "refs": [photo] + [x["file"] for x in sheet],
+                               "sheet": sheet}, bump=False)
+    return store.get_character(sid, c["id"]), photo, {x["view"]: x["file"] for x in sheet}
+
+
+def test_cloud_refs_pick_views_by_framing_and_share_the_image_limit(client):
+    sid = client.post("/api/series", json={"name": "Film"}).json()["id"]
+    views = ["front", "three_quarter", "full_body", "profile"]
+    hakon, photo, v = _sheet_character(sid, "Hakon", views)
+    maryam, mphoto, _ = _sheet_character(sid, "Maryam", views)
+    b, s = store.bible(sid), settings.load()
+    one = {"framing": "close-up", "characters": [{"id": hakon["id"]}]}
+    groups, plate = jobs._cloud_refs(s, sid, one, b, 6, True)
+    assert groups[0][1] == [photo, v["front"], v["three_quarter"]] and plate      # face views for a close-up
+    wide = {**one, "framing": "wide"}
+    assert jobs._cloud_refs(s, sid, wide, b, 6, False)[0][0][1] == [photo, v["full_body"], v["three_quarter"]]
+    two = {"framing": "wide", "characters": [{"id": hakon["id"]}, {"id": maryam["id"]}]}
+    groups, plate = jobs._cloud_refs(s, sid, two, b, 6, True)
+    assert [len(r) for _, r, _ in groups] == [2, 2] and plate                     # 2 + 2 + room plate <= 6
+    groups, plate = jobs._cloud_refs(s, sid, two, b, 2, True)
+    assert [len(r) for _, r, _ in groups] == [1, 1] and not plate                 # everyone first, plate last
+    single = {**s, "cloud_refs": {"mode": "single"}}
+    assert jobs._cloud_refs(single, sid, one, b, 6, False)[0][0][1] == [photo]
+    prompt = jobs._refs_prompt("SCENE", [("Hakon", 2, "views"), ("Maryam", 1, "views")], True)
+    assert prompt.startswith("Images 1-2 are Hakon, the same person from different angles. Image 3 is Maryam. "
+                             "Image 4 is the room") and "exactly once" in prompt and prompt.endswith("SCENE")
+
+
+def test_cloud_refs_turnaround_stitches_one_image_per_person(client):
+    sid = client.post("/api/series", json={"name": "Film"}).json()["id"]
+    hakon, photo, v = _sheet_character(sid, "Hakon", ["front", "profile"])
+    s = {**settings.load(), "cloud_refs": {"mode": "turnaround", "per_character": 3}}
+    shot = {"framing": "medium", "characters": [{"id": hakon["id"]}]}
+    groups, _ = jobs._cloud_refs(s, sid, shot, store.bible(sid), 6, False)
+    (_, rels, kind), = groups
+    assert kind == "turnaround" and len(rels) == 1
+    with Image.open(store.abs_media(rels[0])) as im:
+        assert im.height == jobs.TURNAROUND_HEIGHT and im.width == 3 * 512 + 2 * jobs.TURNAROUND_GAP
+    assert jobs._cloud_refs(s, sid, shot, store.bible(sid), 6, False)[0][0][1] == rels       # cached
+    assert "reference sheet of Hakon" in jobs._refs_prompt("x", [("Hakon", 1, "turnaround")], False)
+
+
+def test_outfit_reference_leads_and_drops_full_body_views(client):
+    sid = client.post("/api/series", json={"name": "Film"}).json()["id"]
+    hakon, photo, v = _sheet_character(sid, "Hakon", ["front", "full_body"])
+    suit = os.path.join(store.char_dir(sid, hakon["id"]), "refs", "suit.png")
+    open(suit, "wb").write(png())
+    store.save_character(sid, {**hakon, "outfit_refs": {"suit": store.rel(suit)}}, bump=False)
+    shot = {"framing": "wide", "characters": [{"id": hakon["id"], "outfit": "suit"}]}
+    rels = jobs._cloud_refs(settings.load(), sid, shot, store.bible(sid), 6, False)[0][0][1]
+    assert rels == [store.rel(suit), v["front"], photo]
+
+
 # ── AI models page ──────────────────────────────────────────────────────
 
 def test_ai_page_adds_a_connection_and_stores_its_key_privately(client):

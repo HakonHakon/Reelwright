@@ -138,6 +138,10 @@ DEFAULTS = {
         "crop": {"medium": 0.62, "medium close-up": 0.46, "close-up": 0.34, "extreme close-up": 0.22,
                  "over-the-shoulder": 0.55, "two-shot": 0.7},
     },
+    # Cloud first frames (Gemini/OpenAI accept several reference images). "views": up to per_character approved views
+    # of each person as separate images, picked by framing; "turnaround": those views stitched into ONE image per
+    # person (saves slots in crowded shots); "single": the old behaviour, one photo per person.
+    "cloud_refs": {"mode": "views", "per_character": 3},
     "location_ref": {
         "enabled": True,
         "denoise": 0.82,

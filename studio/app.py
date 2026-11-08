@@ -115,6 +115,13 @@ def _required_model_options(s):
         require("CLIPLoader", "clip_name", s["qwen_edit"]["clip"])
         require("VAELoader", "vae_name", s["qwen_edit"]["vae"])
         require("LoraLoaderModelOnly", "lora_name", s["qwen_edit"]["lora"])
+    if "qwen_2511" in sources:
+        q = s["qwen_2511"]
+        require("UNETLoader", "unet_name", q["unet"])
+        require("CLIPLoader", "clip_name", q["clip"])
+        require("VAELoader", "vae_name", q["vae"])
+        if q.get("lora"):
+            require("LoraLoaderModelOnly", "lora_name", q["lora"])
     if "wan" in engines:
         require("UNETLoader", "unet_name", s["wan"]["high"], s["wan"]["low"])
         require("CLIPLoader", "clip_name", s["wan"]["text_encoder"])
@@ -512,7 +519,10 @@ def _decorate(sid: str, e: dict) -> dict:
         engine = sh.get("engine") or b["style"].get("default_engine") or "ltx"
         sh["_engine"] = engine
         sh["_source"] = prompts.frame_source(sh, b) if sh.get("start_mode") == "new" else sh.get("start_mode")
-        sh["_image_prompt"] = prompts.image_prompt(sh, b, composition=jobs._resolve_source(sh, b) == "qwen_refs")
+        src = jobs._resolve_source(sh, b)
+        refs_2511 = jobs._qwen2511_refs(sh, b) if src == "qwen_2511" else []
+        sh["_image_prompt"] = jobs.qwen2511_prompt(sh, b, refs_2511) if refs_2511 else \
+            prompts.image_prompt(sh, b, composition=src == "qwen_refs")
         sh["_motion_prompt"] = prompts.motion_prompt(sh, b, engine)
         sig = store.bible_signature(b, sh)
         sh["_stale"] = bool(sh["frame"].get("candidates")) and sh["frame"].get("bible_sig") not in ("", sig)

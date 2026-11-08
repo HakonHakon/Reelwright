@@ -396,3 +396,34 @@ def test_claude_code_connection_runs_the_cli_without_tools(monkeypatch, tmp_path
     cmd = seen["cmd"]
     assert cmd[:2] == [str(exe), "-p"] and cmd[cmd.index("--tools") + 1] == "" and cmd[cmd.index("--system-prompt") + 1] == "SYS"
     assert json.loads(cmd[cmd.index("--json-schema") + 1])["additionalProperties"] is False
+
+
+def test_qwen2511_refs_pick_face_photos_and_share_three_slots(client, monkeypatch):
+    from studio import workflows
+    sid = client.post("/api/series", json={"name": "Film"}).json()["id"]
+    hirad, photo, v = _sheet_character(sid, "Hirad", ["front", "profile"])
+    kasra, kphoto, _ = _sheet_character(sid, "Kasra", ["front"])
+    faces = {photo: 140, v["front"]: 0, v["profile"]: 100, kphoto: 90}     # front sheet image: from behind, no face
+    monkeypatch.setattr(jobs, "_face_size", lambda rel: faces.get(rel, 50))
+    b = store.bible(sid)
+    one = {"framing": "medium", "action": "Hirad smiles.", "characters": [{"id": hirad["id"]}]}
+    refs = jobs._qwen2511_refs(one, b)
+    assert [r for _, r in refs] == [photo, v["profile"]]                  # largest faces first, faceless skipped
+    two = {**one, "characters": [{"id": hirad["id"]}, {"id": kasra["id"]}]}
+    assert [r for _, r in jobs._qwen2511_refs(two, b)] == [photo, kphoto]  # one each before anyone gets two
+    insert = {**one, "framing": "close-up", "action": "Only the shoes and lower legs are in frame."}
+    assert jobs._qwen2511_refs(insert, b) == []
+    prompt = jobs.qwen2511_prompt(one, b, refs)
+    assert prompt.startswith("Image 1 is a photo of Hirad. Image 2 is another photo of Hirad.") and "not a collage" in prompt
+    wf = workflows.qwen2511_image(settings.load(), prompt, 1, 768, 1344, 2, ["a.png", "b.png"])
+    kinds = {n["class_type"] for n in wf.values()}
+    assert {"FluxKontextMultiReferenceLatentMethod", "CFGNorm", "TextEncodeQwenImageEditPlus"} <= kinds
+    assert "LoraLoaderModelOnly" not in kinds and wf["9"]["inputs"]["steps"] == 4 and wf["8"]["inputs"]["batch_size"] == 2
+
+
+def test_pasted_threshold_is_higher_for_sources_that_draw_from_the_photo():
+    from studio import detect
+    shot = {"first_frame": {"subjects": [{"id": "h", "visibility": "upper_body"}]}}
+    measured = {"people": 1, "faces": [{"sims": {"h": 0.9}, "in_body": True}]}
+    assert any("pasted" in x for x in detect.compare(shot, {}, measured)[0])
+    assert not any("pasted" in x for x in detect.compare(shot, {}, measured, pasted=detect.PASTED_FROM_PHOTO)[0])

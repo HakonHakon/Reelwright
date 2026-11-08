@@ -63,6 +63,18 @@ DEFAULTS = {
         "shift": 3.0,
         "max_refs": 3,
     },
+    "qwen_2511": {
+        # First frames drawn straight from the characters' photos (source "qwen_2511"). Settings from ComfyUI's
+        # official Qwen-Image-Edit-2511 template; the default model has the 4-step Lightning LoRA fused in, so
+        # lora stays empty. With the plain bf16/fp8 model set lora to the 2511 Lightning LoRA (or steps 40, cfg 4).
+        "unet": "qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_comfyui_4steps_v1.0.safetensors",
+        "clip": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "vae": "qwen_image_vae.safetensors",
+        "lora": "",
+        "steps": 4, "cfg": 1.0, "shift": 3.1,
+        "reference_method": "index_timestep_zero",
+        "max_refs": 3,              # Qwen Edit reads at most three input images
+    },
     "ltx": {
         "template": "video_director_agent/i2v_template.json",
         "max_seconds": 10,

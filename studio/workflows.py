@@ -104,6 +104,45 @@ def qwen_edit_image(s: dict, prompt: str, seed: int, width: int, height: int, ba
     return wf
 
 
+def qwen2511_image(s: dict, prompt: str, seed: int, width: int, height: int, batch: int,
+                   ref_images: list[str], prefix: str = "studio/frame") -> dict:
+    """Qwen Image Edit 2511 drawing a NEW picture from up to three reference photos (ComfyUI's 2511 template:
+    reference latents via FluxKontextMultiReferenceLatentMethod, AuraFlow shift 3.1, CFGNorm)."""
+    q = s["qwen_2511"]
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": q["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": q["clip"], "type": "qwen_image", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": q["vae"]}},
+    }
+    model = ["1", 0]
+    if q.get("lora"):
+        wf["10"] = {"class_type": "LoraLoaderModelOnly",
+                    "inputs": {"lora_name": q["lora"], "strength_model": 1.0, "model": model}}
+        model = ["10", 0]
+    wf["11"] = {"class_type": "ModelSamplingAuraFlow", "inputs": {"shift": float(q["shift"]), "model": model}}
+    wf["12"] = {"class_type": "CFGNorm", "inputs": {"strength": 1.0, "model": ["11", 0]}}
+    te = {"clip": ["2", 0], "vae": ["3", 0]}
+    for i, name in enumerate(ref_images[:3]):
+        wf[str(50 + i)] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        te[f"image{i + 1}"] = [str(50 + i), 0]
+    wf["4"] = {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {**te, "prompt": prompt}}
+    wf["5"] = {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {**te, "prompt": ""}}
+    method = q.get("reference_method") or "index_timestep_zero"
+    wf["6"] = {"class_type": "FluxKontextMultiReferenceLatentMethod",
+               "inputs": {"conditioning": ["4", 0], "reference_latents_method": method}}
+    wf["7"] = {"class_type": "FluxKontextMultiReferenceLatentMethod",
+               "inputs": {"conditioning": ["5", 0], "reference_latents_method": method}}
+    wf["8"] = {"class_type": "EmptySD3LatentImage", "inputs": {"width": int(width), "height": int(height),
+                                                               "batch_size": int(batch)}}
+    wf["9"] = {"class_type": "KSampler", "inputs": {
+        "seed": int(seed), "steps": int(q["steps"]), "cfg": float(q["cfg"]), "sampler_name": "euler",
+        "scheduler": "simple", "denoise": 1.0, "model": ["12", 0], "positive": ["6", 0], "negative": ["7", 0],
+        "latent_image": ["8", 0]}}
+    wf["13"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["3", 0]}}
+    wf["20"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": prefix, "images": ["13", 0]}}
+    return wf
+
+
 def qwen_correct_face(s: dict, source_image: str, ref_images: list[str], character: dict,
                       width: int, height: int, seed: int, prefix: str = "studio/face") -> dict:
     """Edit the source frame in place, with separate portrait identity conditioning."""

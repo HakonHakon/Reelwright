@@ -166,6 +166,70 @@ def _character_refs(sh, b) -> list[tuple[dict, str]]:
     return out
 
 
+_FACE_SIZE: dict = {}
+
+
+def _face_size(rel: str) -> int:
+    """Width in px of the largest face in a reference photo (0: none, e.g. a photo from behind). Cached."""
+    from . import detect
+    path = store.abs_media(rel)
+    key = (path, os.path.getmtime(path))
+    if key not in _FACE_SIZE:
+        try:
+            import cv2
+            img = cv2.imread(path)
+            found = detect.faces(img) if img is not None else []
+            _FACE_SIZE[key] = int(max((f[2] for f in found), default=0))
+        except Exception:                       # detector models unavailable offline: keep upload order
+            _FACE_SIZE[key] = 1
+    return _FACE_SIZE[key]
+
+
+def _qwen2511_refs(sh, b, max_refs: int = 3) -> list[tuple[dict, str]]:
+    """(character, photo) pairs for a Qwen 2511 frame, at most max_refs images in total.
+    Only people whose face the shot shows get photos (an insert of shoes, a back-of-head or offscreen person would
+    be drawn whole from a face photo). Per person: the outfit reference first, then approved photos with the
+    largest face; photos without a face are skipped. Everyone gets one photo before anyone gets a second."""
+    people = []
+    parts_only = (sh.get("framing") or "").lower() in prompts.CLOSE_FRAMINGS and \
+        prompts.body_parts_only(sh.get("action", ""))
+    if parts_only:
+        return []
+    for c, ch in prompts.characters_in(sh, b):
+        subject = blocking.subject_for(sh, c["id"]) if sh.get("first_frame") is not None else None
+        if subject and subject["visibility"] in ("offscreen", "partial", *blocking.FACELESS):
+            continue
+        outfit = (ch or {}).get("outfit") or c.get("default_outfit") or ""
+        outfit_ref = (c.get("outfit_refs") or {}).get(outfit)
+        photos = [r for r in (c.get("refs") or []) if r and os.path.exists(store.abs_media(r))]
+        if not photos:
+            photos = [x["file"] for x in (c.get("sheet") or []) if os.path.exists(store.abs_media(x.get("file", "")))]
+        photos = sorted((r for r in photos if _face_size(r) > 0), key=lambda r: -_face_size(r))
+        if outfit_ref and os.path.exists(store.abs_media(outfit_ref)):
+            photos = [outfit_ref] + [r for r in photos if r != outfit_ref]
+        if photos:
+            people.append((c, photos))
+    people = people[:max_refs]
+    if not people:
+        return []
+    per = max(1, min(2, max_refs // len(people)))
+    return [(c, rel) for c, photos in people for rel in photos[:per]]
+
+
+def qwen2511_prompt(sh, b, refs) -> str:
+    """Image-to-person mapping, the 'new picture, not a copy' rules, then the shot's normal prompt."""
+    lines, seen = [], set()
+    for i, (c, _) in enumerate(refs):
+        name = c.get("name") or c["id"]
+        lines.append(f"Image {i + 1} is {'another photo of ' if c['id'] in seen else 'a photo of '}{name}.")
+        seen.add(c["id"])
+    lines.append("Create a brand-new cinematic film still: one single continuous photograph, not a collage, not a "
+                 "split screen. Each person keeps the exact face, facial features, ears, hair, skin tone and age from "
+                 "their photos and appears exactly once, in a new pose that fits the scene; do not copy a photo's pose, "
+                 "framing or white background. Follow the scene's framing, lighting and clothes exactly. Scene:")
+    return " ".join(lines) + " " + prompts.image_prompt(sh, b)
+
+
 def _resolve_source(sh, b) -> str:
     """prompts.frame_source plus the 'auto' choice: LoRA characters -> Flux, else reference photos
     -> Z-Image composition + Qwen identity, else Z-Image."""
@@ -305,7 +369,7 @@ VISION_SCHEMA = {"type": "object", "properties": {
     "issues": {"type": "array", "items": {"type": "string"}}}, "required": ["matches", "score", "looks_at_camera", "issues"]}
 
 
-def _with_detector(result, image_path, shot, bible):
+def _with_detector(result, image_path, shot, bible, source=""):
     """Add the deterministic detector findings (people count, pasted portraits, duplicates, resemblance) to a
     vision-model check. If the detector cannot run, the vision-model result stands and says so."""
     from . import detect
@@ -314,7 +378,10 @@ def _with_detector(result, image_path, shot, bible):
         refs = {c["id"]: [store.abs_media(p) for p in c.get("refs") or []] for c, _ in prompts.characters_in(shot, bible)}
         measured = detect.analyze(image_path, refs)
         names = {cid: c.get("name") or cid for cid, c in bible["characters"].items()}
-        critical, soft = detect.compare(shot, names, measured)
+        # Qwen 2511 draws the person FROM the photo: 0.8-0.92 is a faithful likeness there, not a pasted portrait
+        # (measured on Hirad S02_SH02, new pose and scene at 0.89-0.92). Only a near-identical face counts as pasted.
+        critical, soft = detect.compare(shot, names, measured,
+                                        pasted=detect.PASTED_FROM_PHOTO if source == "qwen_2511" else detect.PASTED)
     except Exception as exc:                                  # never block a render on the detector itself
         result.setdefault("issues", []).append(f"(minor) detector unavailable: {exc}")
         return result
@@ -328,7 +395,7 @@ def _with_detector(result, image_path, shot, bible):
     return result
 
 
-def _vision_check(s, image_path, shot, bible) -> dict:
+def _vision_check(s, image_path, shot, bible, source="") -> dict:
     if shot.get("first_frame") is not None:
         identities = []
         for c, ch in prompts.characters_in(shot, bible):
@@ -357,7 +424,7 @@ def _vision_check(s, image_path, shot, bible) -> dict:
             result = blocking.compare_observations(shot, observed)
         except Exception as exc:
             return {"matches": None, "score": None, "looks_at_camera": False, "issues": [f"check failed: {exc}"]}
-        return _with_detector(result, image_path, shot, bible)
+        return _with_detector(result, image_path, shot, bible, source)
     who = []
     for c, ch in prompts.characters_in(shot, bible):
         who.append(f"{c['name']} ({c.get('appearance', '')[:120]}) {ch.get('position', '')}")
@@ -817,7 +884,7 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override="", ch
         job.say("Nothing to render.")
         return
     # Batch by source to keep one model family loaded.
-    order = {"flux_lora": 0, "zimage": 1, "qwen_refs": 2, "reuse": 3, "punch_in": 4}
+    order = {"flux_lora": 0, "zimage": 1, "qwen_refs": 2, "qwen_2511": 2.5, "reuse": 3, "punch_in": 4}
     plan = []
     for sh in todo:
         src = source_override or _resolve_source(sh, b)
@@ -877,6 +944,29 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override="", ch
                 paths = _save_outputs(c, items, out_dir, "p")
                 cands = [{"file": store.rel(p), "source": "punch_in", "from": sel["file"], "seed": seed,
                           "sig": sig, "prompt": prompt, "loras": loras, "check": None} for p in paths]
+        elif src == "qwen_2511":
+            found = _qwen2511_refs(sh, b, int(s["qwen_2511"].get("max_refs", 3)))
+            seed = _seed()
+            w, h = s["image"]["width"], s["image"]["height"]
+            t0 = time.time()
+            if found:
+                prompt = qwen2511_prompt(sh, b, found)
+                names = [c.upload(store.abs_media(rel), f"studio_2511_{uuid.uuid4().hex[:8]}{os.path.splitext(rel)[1]}")
+                         for _, rel in found]
+                job.say(f"{sh['id']}: {n} candidates via Qwen 2511 from {len(found)} photo(s) "
+                        f"({', '.join(ch['name'] for ch, _ in found)})...")
+                wf = workflows.qwen2511_image(s, prompt, seed, w, h, n, names, f"studio/{eid}/{sh['id']}")
+                items = c.run(wf, cancel=lambda: job.cancel_flag)["images"]
+                c.free()                        # the next shot may need Z-Image; Qwen 2511 fills the 3090
+            else:                               # nobody's face is in the shot (insert, back of head): text is enough
+                prompt = prompts.image_prompt(sh, b)
+                job.say(f"{sh['id']}: no visible face with a photo - {n} candidates via Z-Image (text)...")
+                items = _render_images(job, s, c, "zimage", prompt, seed, n, [], f"studio/{eid}/{sh['id']}")
+            paths = _save_outputs(c, items, out_dir, "c")
+            job.say(f"  {len(paths)} images in {time.time() - t0:.0f}s")
+            cands = [{"file": store.rel(p), "source": "qwen_2511" if found else "zimage", "seed": seed,
+                      "batch_index": k, "sig": sig, "prompt": prompt, "loras": [], "plate": None,
+                      "refs": [rel for _, rel in found], "check": None} for k, p in enumerate(paths)]
         elif src == "qwen_refs" or (src == "zimage" and sh.get("first_frame") is not None):
             # A planned frame always goes compose -> check -> retry, even with nobody's face in it.
             try:
@@ -986,7 +1076,7 @@ def job_vision(job, sid, eid, shot_ids, comfy=None, model="", force=False):
             job.check()
             if (cand.get("check") is not None and not force) or cand.get("source") in ("upload", "reuse", "chain"):
                 continue
-            res = _vision_check(s, store.abs_media(cand["file"]), sh, b)
+            res = _vision_check(s, store.abs_media(cand["file"]), sh, b, cand.get("source") or "")
 
             def apply(ep, sid_=sh["id"], k_=k, res_=res):
                 store.find_shot(ep, sid_)["frame"]["candidates"][k_]["check"] = res_

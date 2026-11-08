@@ -24,6 +24,7 @@ MODELS = {
     "yolox": "https://github.com/opencv/opencv_zoo/raw/main/models/object_detection_yolox/object_detection_yolox_2022nov.onnx",
 }
 PASTED = 0.8           # renders described like their cast portrait reach ~0.6; a pasted portrait is near-identical
+PASTED_FROM_PHOTO = 0.97  # sources that draw the person from the photo (Qwen 2511) legitimately reach ~0.9
 SAME = 0.4             # two faces this close to one reference are the same person twice
 RESEMBLES = 0.3        # below this a face does not read as its character
 MIN_FACE = 32          # px: smaller faces (photos on a wall, crowds far away) are not judged
@@ -171,7 +172,7 @@ def resemblance(shot, measured):
     return round(sum(vals) / len(vals), 3) if vals else None
 
 
-def compare(shot, names, measured):
+def compare(shot, names, measured, pasted=PASTED):
     """Critical and soft issues from detector measurements against the shot's first-frame plan."""
     subjects = [s for s in shot["first_frame"]["subjects"] if s["visibility"] != "offscreen"]
     critical, soft = [], []
@@ -181,7 +182,7 @@ def compare(shot, names, measured):
                         f"({', '.join(names.get(c, c) for c in need)})")
     for cid in {cid for f in measured["faces"] for cid in f["sims"]}:
         sims = sorted((f["sims"].get(cid, -1) for f in measured["faces"]), reverse=True)
-        if sims[0] >= PASTED:
+        if sims[0] >= pasted:
             critical.append(f"detector: {names.get(cid, cid)}'s reference portrait appears pasted into the frame "
                             f"(similarity {sims[0]:.2f})")
         if len(sims) > 1 and sims[1] >= SAME:

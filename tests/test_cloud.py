@@ -414,7 +414,11 @@ def test_qwen2511_refs_pick_face_photos_and_share_three_slots(client, monkeypatc
     insert = {**one, "framing": "close-up", "action": "Only the shoes and lower legs are in frame."}
     assert jobs._qwen2511_refs(insert, b) == []
     prompt = jobs.qwen2511_prompt(one, b, refs)
-    assert prompt.startswith("Image 1 is a photo of Hirad. Image 2 is another photo of Hirad.") and "not a collage" in prompt
+    assert prompt.startswith("Medium shot: framed from the waist up. Image 1 is a photo of Hirad. "
+                             "Image 2 is another photo of Hirad.") and "not a collage" in prompt
+    assert jobs._visible_outfit("navy hoodie, dark trousers, white sneakers", "close-up") == "navy hoodie"
+    assert jobs._visible_outfit("navy hoodie, dark trousers, white sneakers", "medium") == "navy hoodie, dark trousers"
+    assert jobs._visible_outfit("navy hoodie, dark trousers, white sneakers", "wide").endswith("white sneakers")
     wf = workflows.qwen2511_image(settings.load(), prompt, 1, 768, 1344, 2, ["a.png", "b.png"])
     kinds = {n["class_type"] for n in wf.values()}
     assert {"FluxKontextMultiReferenceLatentMethod", "CFGNorm", "TextEncodeQwenImageEditPlus"} <= kinds

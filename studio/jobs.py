@@ -4,6 +4,7 @@ import copy
 import math
 import os
 import random
+import re
 import shutil
 import threading
 import time
@@ -185,6 +186,57 @@ def _face_size(rel: str) -> int:
     return _FACE_SIZE[key]
 
 
+# Reference crops per framing, as multiples of the face box (width, height, space above the face). Full-body photos
+# made Qwen 2511 draw every close-up as a full-body copy of the photo's pose (Broken Angel S01_SH02); a photo cropped
+# to the shot's framing makes it frame the person the same way.
+_REF_CROP = {"extreme close-up": (2.4, 2.6, 0.7), "close-up": (3.2, 3.6, 0.9), "medium close-up": (4.2, 5.2, 1.1),
+             "medium": (5.5, 7.5, 1.3), "two-shot": (5.5, 7.5, 1.3), "over-the-shoulder": (5.5, 7.5, 1.3)}
+FRAMING_TEXT = {
+    "extreme close-up": "Extreme close-up: only the face fills the frame",
+    "close-up": "Close-up: the head and shoulders fill the frame, the face large and sharp",
+    "medium close-up": "Medium close-up: framed from the chest up, the face large in the frame",
+    "medium": "Medium shot: framed from the waist up",
+    "two-shot": "Two-shot: both people framed from the waist up, close together",
+    "medium wide": "Medium wide shot: framed from the knees up with the surroundings visible",
+    "wide": "Wide shot: the whole body small in the frame, the location fills most of the picture",
+    "extreme wide": "Extreme wide shot: tiny figures in a vast landscape",
+}
+
+
+def _framed_ref(rel: str, framing: str) -> str:
+    """The photo cropped around the face to the shot's framing (cached); the photo itself for wide shots."""
+    box = _REF_CROP.get((framing or "").lower())
+    if not box:
+        return rel
+    from . import detect
+    import cv2
+    import hashlib
+    from PIL import Image, ImageOps
+    path = store.abs_media(rel)
+    key = hashlib.sha1(f"{rel}|{os.path.getmtime(path)}|{box}".encode()).hexdigest()[:16]
+    out = os.path.join(os.path.dirname(os.path.dirname(path)), "crops", f"{key}.png")
+    if os.path.exists(out):
+        return store.rel(out)
+    try:
+        found = detect.faces(cv2.imread(path))
+    except Exception:
+        return rel
+    if not len(found):
+        return rel
+    x, y, w, h = [float(v) for v in max(found, key=lambda f: f[2])[:4]]
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        cw, ch, above = w * box[0], h * box[1], h * box[2]
+        left = max(0, x + w / 2 - cw / 2)
+        top = max(0, y - above)
+        crop = im.crop((int(left), int(top), int(min(im.width, left + cw)), int(min(im.height, top + ch))))
+        if crop.width < 64 or crop.height < 64:
+            return rel
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        crop.save(out)
+    return store.rel(out)
+
+
 def _qwen2511_refs(sh, b, max_refs: int = 3) -> list[tuple[dict, str]]:
     """(character, photo) pairs for a Qwen 2511 frame, at most max_refs images in total.
     Only people whose face the shot shows get photos (an insert of shoes, a back-of-head or offscreen person would
@@ -213,12 +265,63 @@ def _qwen2511_refs(sh, b, max_refs: int = 3) -> list[tuple[dict, str]]:
     if not people:
         return []
     per = max(1, min(2, max_refs // len(people)))
-    return [(c, rel) for c, photos in people for rel in photos[:per]]
+    framing = sh.get("framing") or ""
+    return [(c, _framed_ref(rel, framing)) for c, photos in people for rel in photos[:per]]
+
+
+_LOWER = re.compile(r"\b(trousers|pants|jeans|cargo|shorts|skirt|leggings|belt|shoes?|sneakers?|trainers|boots?|heels|"
+                    r"sandals|socks)\b", re.I)
+_FEET = re.compile(r"\b(shoes?|sneakers?|trainers|boots?|heels|sandals|socks)\b", re.I)
+
+
+def _visible_outfit(outfit: str, framing: str) -> str:
+    """Only the clothes the framing shows: naming trousers and sneakers made Qwen 2511 draw close-ups full length."""
+    f = (framing or "").lower()
+    cut = _LOWER if f in ("extreme close-up", "close-up", "medium close-up") else \
+        _FEET if f in ("medium", "two-shot", "over-the-shoulder") else None
+    if not cut:
+        return outfit
+    parts = [p for p in re.split(r",\s*", outfit) if p and not cut.search(p)]
+    return ", ".join(parts)
+
+
+def _identity_check(path: str, sh, b) -> dict:
+    """Detector check of a frame drawn from photos: the same person twice (two photos of one person sometimes give
+    a second, smaller copy) or more faces than the cast is a fail; ranks the rest by likeness to the photos."""
+    from . import detect
+    cast = [c for c, _ in prompts.characters_in(sh, b)]
+    refs = {c["id"]: [store.abs_media(r) for r in c.get("refs") or []] for c in cast}
+    try:
+        measured = detect.analyze(path, refs)
+    except Exception as exc:
+        return {"matches": None, "score": None, "issues": [f"(minor) detector unavailable: {exc}"]}
+    names = {c["id"]: c.get("name") or c["id"] for c in cast}
+    critical, best = [], {}
+    owners = []
+    for f in measured["faces"]:
+        if f["sims"]:
+            cid, sim = max(f["sims"].items(), key=lambda kv: kv[1])
+            owners.append(cid if sim >= detect.SAME else None)
+            best[cid] = max(best.get(cid, -1), sim)
+    for cid in set(o for o in owners if o):
+        if owners.count(cid) > 1:
+            critical.append(f"detector: {names[cid]} appears {owners.count(cid)} times")
+    if len(measured["faces"]) > len(cast):
+        critical.append(f"detector: {len(measured['faces'])} faces, the shot has {len(cast)} people")
+    vals = [v for v in best.values() if v > 0]
+    return {"matches": not critical, "score": max(0, 10 - 4 * len(critical)), "looks_at_camera": False,
+            "camera_gaze_allowed": True, "issues": critical, "critical": critical,
+            "resemblance": round(sum(vals) / len(vals), 3) if vals else None, "detector": measured}
 
 
 def qwen2511_prompt(sh, b, refs) -> str:
-    """Image-to-person mapping, the 'new picture, not a copy' rules, then the shot's normal prompt."""
+    """Framing first, image-to-person mapping, the 'new picture, not a copy' rules, then the shot's prompt with only
+    the clothes the framing shows (measured on Broken Angel S03_SH02: with trousers and sneakers named, every
+    close-up came out full length)."""
     lines, seen = [], set()
+    framing = FRAMING_TEXT.get((sh.get("framing") or "").lower())
+    if framing:
+        lines.append(framing + ".")
     for i, (c, _) in enumerate(refs):
         name = c.get("name") or c["id"]
         lines.append(f"Image {i + 1} is {'another photo of ' if c['id'] in seen else 'a photo of '}{name}.")
@@ -226,8 +329,15 @@ def qwen2511_prompt(sh, b, refs) -> str:
     lines.append("Create a brand-new cinematic film still: one single continuous photograph, not a collage, not a "
                  "split screen. Each person keeps the exact face, facial features, ears, hair, skin tone and age from "
                  "their photos and appears exactly once, in a new pose that fits the scene; do not copy a photo's pose, "
-                 "framing or white background. Follow the scene's framing, lighting and clothes exactly. Scene:")
-    return " ".join(lines) + " " + prompts.image_prompt(sh, b)
+                 "framing or white background. Follow the scene's framing, lighting and clothes exactly. No "
+                 "microphone unless the scene names one.")
+    lines.append("Scene:")
+    scene = prompts.image_prompt(sh, b)
+    for c, ch in prompts.characters_in(sh, b):
+        outfit = (c.get("outfits") or {}).get(ch.get("outfit") or c.get("default_outfit") or "default", "")
+        if outfit:
+            scene = scene.replace(outfit, _visible_outfit(outfit, sh.get("framing")))
+    return " ".join(lines) + " " + scene
 
 
 def _resolve_source(sh, b) -> str:
@@ -966,7 +1076,11 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override="", ch
             job.say(f"  {len(paths)} images in {time.time() - t0:.0f}s")
             cands = [{"file": store.rel(p), "source": "qwen_2511" if found else "zimage", "seed": seed,
                       "batch_index": k, "sig": sig, "prompt": prompt, "loras": [], "plate": None,
-                      "refs": [rel for _, rel in found], "check": None} for k, p in enumerate(paths)]
+                      "refs": [rel for _, rel in found], "check": _identity_check(p, sh, b) if found else None}
+                     for k, p in enumerate(paths)]
+            for cand in cands:
+                if cand["check"] and cand["check"]["issues"]:
+                    job.say(f"  {os.path.basename(cand['file'])}: {', '.join(cand['check']['issues'])}")
         elif src == "qwen_refs" or (src == "zimage" and sh.get("first_frame") is not None):
             # A planned frame always goes compose -> check -> retry, even with nobody's face in it.
             try:
@@ -1011,7 +1125,7 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override="", ch
                       "prompt": prompt, "loras": loras, "plate": plate, "refs": ref_files, "check": None}
                      for k, p in enumerate(paths)]
         _add_candidates(sid, eid, sh["id"], cands)
-        if src == "qwen_refs" and any(cand.get("check") for cand in cands):
+        if src in ("qwen_refs", "qwen_2511") and any(cand.get("check") for cand in cands):
             auto_select_frames(sid, eid, [sh["id"]])        # only when nothing is selected yet
         job.progress = [i + 1, len(plan)]
     if s.get("vision_check"):

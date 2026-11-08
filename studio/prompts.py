@@ -3,6 +3,8 @@
 The LLM never writes final prompts. Editing a bible entry changes every prompt that uses it.
 """
 
+import re
+
 from . import blocking, store
 
 CLOSE_FRAMINGS = {"medium close-up", "close-up", "extreme close-up", "insert"}
@@ -42,6 +44,32 @@ def characters_in(shot: dict, bible: dict) -> list[tuple[dict, dict]]:
     return out
 
 
+_PARTS = r"(?:shoes?|feet|foot|legs?|knees?|hands?|fingers?|fists?|arms?|wrists?|boots?|sneakers?|torso|chest)"
+_PARTS_ONLY = re.compile(
+    rf"\bonly (?P<what>(?:the |his |her |their |a |an )?(?:[\w'-]+ ){{0,4}}{_PARTS}\b[^.]{{0,40}}?)\s+(?:are |is )?"
+    rf"(?:in frame|in the frame|in shot|visible|seen)|\b(?:no|not the|never the) (?:face|head)\b", re.I)
+_LOWER_CLOTHES = re.compile(r"\b(trousers|pants|jeans|shorts|skirt|socks?|shoes?|boots?|sneakers?|trainers|"
+                            r"leggings|tights|sandals)\b", re.I)
+_LOW = re.compile(r"\b(shoes?|feet|foot|legs?|knees?|boots?|sneakers?)\b", re.I)
+
+
+def body_parts_only(action: str) -> bool:
+    """True when a shot's action says only hands, shoes, legs ... are in frame ('Only the shoes and lower legs
+    are in frame'), so the character's face must not be described."""
+    return bool(_PARTS_ONLY.search(action or ""))
+
+
+def _insert_lead(action: str) -> str:
+    """The first words of an insert prompt name what fills the frame: Z-Image composes from the opening words, and
+    "Tight insert shot" alone still drew a whole child in a doorway (Hirad S02_SH01)."""
+    m = _PARTS_ONLY.search(action or "")
+    what = (m.group("what") or "").strip() if m and m.group("what") else ""
+    if not what:
+        return "Extreme close-up insert shot, camera right next to the subject"
+    level = "at floor level, " if _LOW.search(what) else ""
+    return f"Extreme close-up insert shot {level}filling the whole frame with {what}"
+
+
 def image_prompt(shot: dict, bible: dict, composition: bool = False) -> str:
     """First-frame prompt: a still moment, composition first."""
     if shot.get("first_frame") is not None:
@@ -52,9 +80,17 @@ def image_prompt(shot: dict, bible: dict, composition: bool = False) -> str:
     loc = bible["locations"].get(shot.get("location_id") or "")
     framing = (shot.get("framing") or "").lower()
     close = framing in CLOSE_FRAMINGS
+    parts_only = close and body_parts_only(shot.get("action", ""))
     chars = []
     for c, ch in characters_in(shot, bible):
         pos = "" if close else POSITION_WORDS.get((ch.get("position") or "").lower(), ch.get("position") or "")
+        if parts_only:      # naming the person or describing the face makes Z-Image draw the whole person
+            outfit = (c.get("outfits") or {}).get(ch.get("outfit") or c.get("default_outfit") or "default", "")
+            if _LOW.search(shot.get("action", "")):      # a hoodie or backpack brings the torso back into frame
+                outfit = ", ".join(x.strip() for x in outfit.split(",") if _LOWER_CLOTHES.search(x))
+            if outfit:      # after the crop, so trousers and shoes match the other shots without re-adding a body
+                chars.append(f"Clothes, only where the frame shows them: {outfit}")
+            continue
         chars.append(f"{_char_text(c, ch.get('outfit'), True)}{' ' + pos if pos else ''}")
     # Close shots: framing + subject first, and only the light/palette of the location.
     # A full room description makes Flux pull the camera back to a wide shot.
@@ -63,15 +99,22 @@ def image_prompt(shot: dict, bible: dict, composition: bool = False) -> str:
         setting = ", ".join(x for x in [variant, loc.get("palette", "")] if x)
     else:
         setting = _location_text(loc, shot.get("time_of_day")) if loc else ""
+    crop = ("The frame is cropped tight to what the moment names; the rest of the person is cut off by the frame "
+            "edge: no face, no head, no upper body in the picture") if parts_only else ""
     lines = [
-        f"{framing.capitalize()} shot" if framing else "",
+        _insert_lead(shot.get("action", "")) if parts_only else
+        (f"{framing.capitalize()} shot" if framing else ""),
         f"Moment: {shot.get('action', '')}" if close and shot.get("action") else "",
+        crop,
         "; ".join(chars),
         f"Setting: {setting}" if setting else "",
         "" if close else (f"Moment: {shot.get('action', '')}" if shot.get("action") else ""),
-        shot.get("image_prompt_extra", ""),
-        style.get("look", ""),
+        # An insert drops the shot's extra notes and the look: their wardrobe, cast and "kid performances"
+        # wording makes Z-Image draw the whole child again (measured on Hirad S02_SH01). The grade stays.
+        "" if parts_only else shot.get("image_prompt_extra", ""),
+        "" if parts_only else style.get("look", ""),
         style.get("grade", ""),
+        crop,               # repeated last: the shot's extra notes (wardrobe, cast) pull the whole figure back in
     ]
     return ". ".join(l.strip().rstrip(".") for l in lines if l and l.strip()) + "."
 

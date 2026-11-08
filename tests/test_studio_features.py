@@ -676,3 +676,18 @@ def test_lipsync_engine_is_listed_and_pipeline_endpoints_queue_jobs(client, monk
     for path in ("dialogue_elevenlabs", "sfx", "lipsync_cut"):
         assert client.post(f"/api/s/{sid}/e/{eid}/{path}", json={}).status_code == 200
     assert [q[1] for q in queued] == ["job_dialogue_elevenlabs", "job_sfx", "job_lipsync_cut"]
+
+
+def test_body_parts_only_shots_do_not_describe_the_face():
+    from studio import prompts
+    assert prompts.body_parts_only("Only the shoes and lower legs are in frame.")
+    assert prompts.body_parts_only("Only his hands are visible, typing.")
+    assert prompts.body_parts_only("Close on his fist, no face.")
+    assert not prompts.body_parts_only("Only Hirad is in frame, smiling.")
+    assert not prompts.body_parts_only("Hirad waves his hands at the camera.")
+    b = {"style": {}, "locations": {}, "characters": {"h": {"id": "h", "name": "Hirad", "appearance": "brown eyes",
+                                                            "outfits": {"default": "navy hoodie"}}}}
+    shot = {"framing": "close-up", "action": "Only the shoes are in frame.", "characters": [{"id": "h"}]}
+    p = prompts.image_prompt(shot, b)
+    assert "brown eyes" not in p and "Hirad" not in p and "no face" in p
+    assert "brown eyes" in prompts.image_prompt({**shot, "framing": "wide"}, b)

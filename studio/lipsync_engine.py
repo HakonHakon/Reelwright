@@ -143,6 +143,22 @@ def shot_audio(cfg, episode, shot, row, seconds, path):
     return path
 
 
+def dialogue_track(cfg, episode, shot, row, seconds, path):
+    """Every voiced line of the shot at its place (on-screen and off-screen speakers), for the take's sound."""
+    speakers = [{"id": x[0]} for x in row["lines"]]
+    return shot_audio(cfg, episode, {**shot, "characters": list(shot.get("characters", [])) + speakers}, row,
+                      seconds, path)
+
+
+def mux_audio(cfg, video, audio, dst):
+    """The picture of `video` with `audio` as its sound (padded with silence, cut to the picture's length)."""
+    tmp = dst + ".mux.mp4"
+    media._run([cfg["ffmpeg"], "-y", "-v", "error", "-i", video, "-i", audio, "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest", tmp])
+    os.replace(tmp, dst)
+    return dst
+
+
 def workflow(s, image_name, audio_name, text, seconds, seed, prefix):
     lt = s["ltx_lipsync"]
     with open(template(s), encoding="utf-8") as f:

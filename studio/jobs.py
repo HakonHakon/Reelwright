@@ -1292,6 +1292,12 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
                 raise RuntimeError("ComfyUI returned no video")
             path = _save_outputs(c, res["videos"][:1], out_dir, f"{sh['id']}_t")[0]
             raw_take = None
+            if engine == "infinitetalk" and row["lines"]:
+                # InfiniteTalk returns picture only: the voice drove the mouth but is not in the file, so the cut
+                # was silent. Put every line of the shot (off-screen speakers too) on the take.
+                track = os.path.join(out_dir, f"{sh['id']}_dialogue.wav")
+                lipsync_engine.dialogue_track(s, e, sh, row, seconds, track)
+                lipsync_engine.mux_audio(s, path, track, path)
             if engine == "ltx_lipsync" and sh.get("post_sync") and row["lines"]:
                 job.say(f"  lip-sync pass (LatentSync) on the speaker's face...")
                 info0 = media.probe(s["ffprobe"], path)

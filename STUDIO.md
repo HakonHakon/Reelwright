@@ -22,6 +22,11 @@ Uses the repo .venv plus your ComfyUI and Ollama.
    (new / chain = last frame of previous take / reuse previous frame). Approve.
 7. **First frames** - render candidates, vision check, select, refine (img2img with the LoRA or Z-Image),
    upload with crop (one shot) or bulk upload (files named `S01_SH02.png`), optional end frame, lock. Approve.
+   **Z-Image + Qwen identity** (`qwen_refs`, also chosen by Auto for photo references without a LoRA)
+   first composes each candidate with Z-Image Turbo using text only, then gives Qwen Edit that frame
+   and the character portraits to change facial identity while preserving pose, gaze and framing.
+   Location plates are not used for this source. The original composition is available under
+   **More → View composition before identity**. Both stages use the configured local models.
 8. **Animatic** - plays selected frames at shot length with dialogue captions; export mp4. Approve.
 9. **Takes** - generate candidates and edit a saved timeline: preview, reorder, trim, split,
    duplicate, delete, mute and add music. Choose lip-sync clips and render the edited MP4.

@@ -89,7 +89,7 @@ DEFAULT_STYLE = {
     "negative": "photorealistic, text, watermark, logo, subtitles, deformed hands, extra fingers",
     "music_policy": "no music in shots; score added at the cut",
     "default_frame_source": "flux_lora",
-    "default_engine": "ltx",
+    "default_engine": "infinitetalk",
     "version": 1,
 }
 
@@ -301,7 +301,7 @@ def bible(sid: str) -> dict:
 
 
 def bible_signature(b: dict, shot: dict) -> str:
-    """Hash of the bible versions a shot depends on (for stale detection)."""
+    """Hash the bible dependencies and the shot's actual prompt inputs for stale detection."""
     parts = [f"style:{b['style'].get('version', 1)}"]
     loc = b["locations"].get(shot.get("location_id") or "")
     if loc:
@@ -310,6 +310,10 @@ def bible_signature(b: dict, shot: dict) -> str:
         c = find_character(b["characters"], ch.get("id"))
         if c:
             parts.append(f"char:{c['id']}:{c.get('version', 1)}")
+    inputs = {key: shot.get(key) for key in (
+        "first_frame", "screen_text", "framing", "camera", "characters", "location_id", "time_of_day",
+        "action", "image_prompt_override", "image_prompt_extra")}
+    parts.append(json.dumps(inputs, sort_keys=True, ensure_ascii=False))
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
 
 

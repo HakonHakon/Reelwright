@@ -115,3 +115,19 @@ def test_comfy_jobs_free_voicestudio_gpu_memory(monkeypatch):
         def alive(self): return True
     jobs._gpu_prepare(jobs.Job("x", "t", None, {}), settings.load(), Alive())
     assert freed == [True]
+
+
+def test_voicestudio_profile_is_cast_onto_a_character(cast, monkeypatch):
+    client, sid, eid, calls, heard = cast
+    lib = [{"id": "me01", "name": "Hakon (my voice)", "kind": "clone", "language": "English",
+            "ref_text": "This is my real voice.", "own_voice": True, "demo": False}]
+    monkeypatch.setattr(voices, "profiles", lambda s: lib)
+    monkeypatch.setattr(voices, "profile_audio", lambda s, pid: tone(3.0, 220))
+    assert client.get("/api/voices/profiles").json()[0]["id"] == "me01"
+    c = client.post(f"/api/s/{sid}/characters/hakon/voice/profile", json={"profile_id": "me01"}).json()
+    assert c["voice"]["profile"] == {"id": "me01", "name": "Hakon (my voice)"}
+    assert c["voice"]["ref_text"] == "This is my real voice." and c["voice"]["designed"] is False
+    assert c["voice"]["description"] == "a cheerful four-year-old boy"      # kept for the video prompt
+    assert client.post(f"/api/s/{sid}/characters/hakon/voice/profile", json={"profile_id": "nope"}).status_code == 404
+    run(sid, eid)
+    assert calls["design"] == []            # the cast voice is used, nothing designed for Hakon

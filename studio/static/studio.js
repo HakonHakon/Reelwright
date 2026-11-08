@@ -95,8 +95,9 @@ function pageMenu(view, actions) {
 document.addEventListener("click", (e) => { $$(".more-menu[open]").forEach((m) => { if (!m.contains(e.target) || e.target.closest(".more-pop button")) m.open = false; }); });
 // Seconds for humans: 1.1666667 -> "1.2s".
 const fmtDur = (s) => `${Math.round((+s || 0) * 10) / 10}s`;
-const VIDEO_ENGINES =["minimax_local", "ltx", "wan", "minimax"];
-const engineOptions = (current) => VIDEO_ENGINES.map(x => `<option value="${x}" ${x === current ? "selected" : ""}>${esc({minimax_local:"MiniMax H3 (local)",ltx:"LTX-2.3",wan:"Wan 2.2",minimax:"MiniMax (cloud)"}[x])}</option>`).join("");
+const VIDEO_ENGINES = ["infinitetalk", "minimax_local", "ltx", "ltx_lipsync", "wan", "minimax"];
+const ENGINE_NAMES = {infinitetalk: "InfiniteTalk (local, lip-sync)", minimax_local: "MiniMax H3 (local)", ltx: "LTX-2.3", ltx_lipsync: "LTX-2.3 lip-sync", wan: "Wan 2.2", minimax: "MiniMax (cloud)"};
+const engineOptions = (current) => VIDEO_ENGINES.map(x => `<option value="${x}" ${x === current ? "selected" : ""}>${esc(ENGINE_NAMES[x])}</option>`).join("");
 
 // ── toasts ───────────────────────────────────────────────────────────────
 function toast(msg, bad) {
@@ -179,7 +180,7 @@ const imageOptions = (prefix = "") => (App.ai?.choices.image || []).map((c) =>
 
 function sourceLabel(s) {
   if (s && s.startsWith("img:")) return aiImageLabel(s) || s.slice(4).replace(":", " · ");
-  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Reference photos (Qwen Edit)", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master", openai_image: "ChatGPT image (OpenAI)", gemini_image: "Gemini image (Google)" }[s] || s || "inherit";
+  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Z-Image + Qwen identity", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master", openai_image: "ChatGPT image (OpenAI)", gemini_image: "Gemini image (Google)" }[s] || s || "inherit";
 }
 
 // ── sidebar ──────────────────────────────────────────────────────────────
@@ -400,11 +401,12 @@ async function route() {
     editor.destroy(); App.timelineEditor = null;
   }
   closeModal();
-  App.refreshers = []; App.soft = null; App.selecting = false; App.dirty = false; App.dirtyWarned = false;
+  App.refreshers = []; App.soft = null; App.selecting = false; App.dirty = false; App.dirtyWarned = false; App.saveKey = null;
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
   const first = !App.route.length || App.route.join("/") !== parts.join("/");
   App.route = parts;
   setMenu(false);
+  document.body.classList.remove("has-stepper");
   const view = $("#view");
   if (first) { view.innerHTML = SKELETON; view.style.animation = "none"; void view.offsetHeight; view.style.animation = ""; }
   renderNav();
@@ -446,6 +448,11 @@ function addCard(id, placeholder, btnId, btnLabel, primary) {
   return `<div class="addrow"><input id="${id}" placeholder="${placeholder}"><button class="${primary ? "primary" : ""}" id="${btnId}">${btnLabel}</button></div>`;
 }
 const printFig = (src, name, href, sub) => `<a class="print" href="${href}"><figure style="margin:0">${src ? `<img src="${src}" loading="lazy" alt="">` : `<div class="ph">${esc(name.charAt(0).toUpperCase())}</div>`}<figcaption><span class="nm">${esc(name)}</span><div class="muted small" style="font-weight:400">${esc(sub)}</div></figcaption></figure></a>`;
+// Ctrl/Cmd+S runs the current page's save (set per page with saveShortcut, cleared on navigation).
+const saveShortcut = (fn) => { App.saveKey = fn; };
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "s" && App.saveKey) { e.preventDefault(); App.saveKey(); }
+});
 const onEnter = (sel, fn) => $(sel).addEventListener("keydown", (e) => { if (e.key === "Enter") fn(); });
 
 // ── home ────────────────────────────────────────────────────────────────
@@ -571,9 +578,13 @@ async function viewCharacter(view, sid, cid) {
       <div class="full row save-bar"><button class="primary" id="save">Save character</button><span class="grow"></span><button class="danger" id="del">Delete character…</button></div>
     </div>
     <h2>Voice <span class="muted small">(the reference every dialogue line is cloned from)</span></h2>
-    <div class="card row">${c.voice?.file ? `<audio controls src="${media(c.voice.file)}"></audio><span class="chip">${c.voice.designed ? "designed" : "recorded"}</span>` : `<span class="muted">none yet</span>`}
+    <div class="card row">${c.voice?.file ? `<audio controls src="${media(c.voice.file)}"></audio><span class="chip">${c.voice.profile ? `VoiceStudio: ${esc(c.voice.profile.name)}` : c.voice.designed ? "designed" : "recorded"}</span>` : `<span class="muted">none yet</span>`}
       <input type="file" id="voice-file" accept="audio/*"><button id="voice-up">Upload a recording (5-20 s)</button>
       <button id="voice-design" title="Uses the voice description above">Design voice from description</button></div>
+    <div class="card row" style="margin-top:8px"><label for="voice-profile" class="small">VoiceStudio voice library</label>
+      <select id="voice-profile" aria-label="VoiceStudio voice"><option value="">Loading voices…</option></select>
+      <button id="voice-profile-use">Use this voice</button>
+      <span class="muted small">Clone or design voices in VoiceStudio; they appear here.</span></div>
     <h2>References <span class="muted small">(approved identity images)</span></h2>
     <div class="cards">${(c.refs || []).map((r) => `<div class="card"><img class="thumb square" src="${media(r)}" data-zoom="${media(r)}"><button class="link danger" data-unref="${esc(r)}">remove</button></div>`).join("") || `<p class="muted">None yet. Render a character sheet below and approve the best images, or upload your own.</p>`}</div>
     <div class="row" style="margin-top:8px"><input type="file" id="ref-file" accept="image/*"><button id="ref-up">Upload reference</button></div>
@@ -604,6 +615,17 @@ async function viewCharacter(view, sid, cid) {
     await FORM(`/api/s/${sid}/characters/${cid}/upload`, fd); route();
   };
   $("#voice-up").onclick = () => upload("voice", "#voice-file");
+  GET("/api/voices/profiles").then((list) => {
+    const sel = $("#voice-profile"); if (!sel) return;
+    sel.innerHTML = list.length ? list.map((p) => `<option value="${esc(p.id)}" ${c.voice?.profile?.id === p.id ? "selected" : ""}>${esc(p.name)}${p.own_voice ? " (own voice)" : ""}${p.kind === "design" ? " (designed)" : ""}${p.demo ? " (demo)" : ""}</option>`).join("")
+      : `<option value="">No voices in VoiceStudio yet</option>`;
+  }).catch(() => { const sel = $("#voice-profile"); if (sel) sel.innerHTML = `<option value="">VoiceStudio offline</option>`; });
+  $("#voice-profile-use").onclick = async () => {
+    const profile_id = $("#voice-profile").value;
+    if (!profile_id) return toast("Choose a VoiceStudio voice first.", true);
+    await POST(`/api/s/${sid}/characters/${cid}/voice/profile`, { profile_id });
+    toast("Voice assigned. Re-voice the dialogue to hear it in the film."); route();
+  };
   $("#voice-design").onclick = async () => {
     const description = $("#f-voice").value.trim();
     if (!description) return toast("Write a voice description first.", true);
@@ -880,7 +902,8 @@ async function viewModels(view) {
   const [settings, models] = await Promise.all([GET("/api/settings"), GET("/api/models")]);
   const cfg = settings.effective, face = cfg.face_correction;
   view.innerHTML = `<h1>Models</h1><h2>Video generation</h2>
-    <p>Choose a model when rendering in Takes, or set a default engine in Style &amp; props.</p>
+    <p>Choose a model when rendering in Takes, or set a project's default engine in its Style &amp; props.</p>
+    <div class="card form-grid"><div><label for="new-engine">Default video engine for new projects</label><select id="new-engine">${engineOptions(cfg.style_defaults?.default_engine || "infinitetalk")}</select></div></div>
     <div class="card model-list">${models.map(m => { const [nm, ...rest] = String(m.name).split(" · "); return `<div class="model-row"><b>${esc(nm)}</b><span class="grow"></span>${rest.join(" · ").split(", ").filter(Boolean).map(t => `<span class="chip ${/cloud/.test(t) ? "warn" : /silent/.test(t) ? "" : "good"}">${esc(t)}</span>`).join("")}</div>`; }).join("")}</div>
     <h2>Lip-sync · local</h2><p>LatentSync 1.6 synchronizes existing shots to an uploaded music or voice recording. Optional Demucs vocal isolation separates the singing voice for guidance while keeping the full music mix in the export. Upload audio in Cut, choose the character and shots, then review the new version. Runs in ComfyUI on this PC with no paid API.</p>
     <h2>MiniMax H3 · local</h2><p>Generates video and sound on this PC through ComfyUI, with no API key or per-generation API fee. Uses quantized open weights and 4-step Turbo sampling. Local clips are at least 4 seconds; trim shorter shots in Takes. Model weight license: <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE" target="_blank" rel="noopener">MiniMax H3 Community License</a>.</p>
@@ -900,6 +923,7 @@ async function viewModels(view) {
     <button class="primary" id="save-models">Save model settings</button>`;
   $("#save-models").onclick = async () => {
     const user = {...settings.user,
+      style_defaults: {...(settings.user.style_defaults || {}), default_engine: $("#new-engine").value},
       minimax: {...(settings.user.minimax || {}), model: $("#mm-model").value, resolution: $("#mm-resolution").value},
       face_correction: {...(settings.user.face_correction || {}), model: $("#face-model").value,
         python: $("#face-python").value.trim(), keep_dir: $("#keep-dir").value.trim(),

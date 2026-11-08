@@ -24,7 +24,9 @@ from urllib.parse import urlparse
 import requests
 from PIL import Image, ImageOps
 
-TYPES = {"openai": "OpenAI", "gemini": "Google Gemini", "openai_compatible": "OpenAI-compatible"}
+TYPES = {"openai": "OpenAI", "gemini": "Google Gemini", "anthropic": "Anthropic Claude", "codex": "ChatGPT app (Codex on this PC)",
+         "claude_code": "Claude Code on this PC",
+         "openai_compatible": "OpenAI-compatible"}
 DEFAULT_CONNECTIONS = [
     {"id": "openai", "name": "ChatGPT (OpenAI)", "type": "openai", "base_url": "https://api.openai.com/v1",
      "api_key_env": "OPENAI_API_KEY", "text_model": "gpt-6.1-terra", "image_model": "gpt-image-2",
@@ -33,11 +35,29 @@ DEFAULT_CONNECTIONS = [
      "base_url": "https://generativelanguage.googleapis.com/v1beta", "api_key_env": "GEMINI_API_KEY",
      "text_model": "gemini-3.6-flash", "image_model": "gemini-3.1-flash-image", "max_refs": 6,
      "extra_models": "", "enabled": True},
+    {"id": "claude", "name": "Claude (Anthropic)", "type": "anthropic", "base_url": "https://api.anthropic.com",
+     "api_key_env": "ANTHROPIC_API_KEY", "text_model": "claude-opus-5-5", "image_model": "", "max_refs": 8,
+     "extra_models": "", "enabled": True},
+    # GPT through the ChatGPT desktop app's Codex CLI, on the user's ChatGPT subscription (no API key).
+    {"id": "codex", "name": "ChatGPT (Codex on this PC)", "type": "codex", "base_url": "http://localhost/codex",
+     "api_key_env": "", "text_model": "gpt-6.1-sol", "image_model": "", "max_refs": 0, "extra_models": "",
+     "enabled": True},
+    # Claude through the Claude Code CLI, on the user's Claude subscription (no API key).
+    {"id": "claude_code", "name": "Claude (Claude Code on this PC)", "type": "claude_code",
+     "base_url": "http://localhost/claude-code", "api_key_env": "", "text_model": "opus", "image_model": "",
+     "max_refs": 0, "extra_models": "sonnet", "enabled": True},
+    # Claude (and other models) billed to a fal.ai account, through fal's OpenRouter OpenAI-compatible endpoint.
+    {"id": "fal", "name": "fal.ai (OpenRouter)", "type": "openai_compatible",
+     "base_url": "https://fal.run/openrouter/router/openai/v1", "api_key_env": "FAL_KEY",
+     "text_model": "anthropic/claude-opus-5.5", "image_model": "", "max_refs": 8,
+     "extra_models": "anthropic/claude-sonnet-5", "enabled": True},
 ]
 # Starting points for "Add connection" (all editable).
 PRESETS = [
     {"label": "OpenRouter (many models, one key)", "type": "openai_compatible", "id": "openrouter", "name": "OpenRouter",
      "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
+    {"label": "fal.ai (OpenRouter: Claude, GPT, Gemini... on your fal balance)", "type": "openai_compatible", "id": "fal",
+     "name": "fal.ai (OpenRouter)", "base_url": "https://fal.run/openrouter/router/openai/v1", "api_key_env": "FAL_KEY"},
     {"label": "Groq", "type": "openai_compatible", "id": "groq", "name": "Groq",
      "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY"},
     {"label": "DeepSeek", "type": "openai_compatible", "id": "deepseek", "name": "DeepSeek",
@@ -60,6 +80,7 @@ PRESETS = [
 LEGACY_IMAGE_SOURCES = {"openai_image": "openai", "gemini_image": "gemini"}
 MASK = "********"
 TIMEOUT = 300
+TEXT_TIMEOUT = 900     # writing a whole script with reasoning can take several minutes
 _ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _lock = threading.Lock()
 
@@ -211,6 +232,8 @@ def _need_key(s, c):
 def _headers(c, key):
     if c["type"] == "gemini":
         return {"x-goog-api-key": key}
+    if "fal.run" in (c.get("base_url") or ""):     # fal keys go in "Authorization: Key <key>", not Bearer
+        return {"Authorization": f"Key {key}"} if key else {}
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
@@ -227,14 +250,19 @@ def _error(c, response) -> CloudError:
     return CloudError(f"{c['name']} HTTP {response.status_code}" + (f": {detail}" if detail else ""))
 
 
-def _post(c, url, headers, **kwargs):
-    try:
-        r = requests.post(url, headers=headers, timeout=TIMEOUT, **kwargs)
-    except requests.RequestException as exc:
-        raise CloudError(f"{c['name']} is unreachable: {type(exc).__name__}") from None
-    if not r.ok:
-        raise _error(c, r)
-    return r.json()
+def _post(c, url, headers, timeout=TIMEOUT, **kwargs):
+    """POST with retries on a busy service (503 overloaded, 429 rate limited, 500/502): 10 s, 30 s, 60 s."""
+    import time
+    for wait in (10, 30, 60, None):
+        try:
+            r = requests.post(url, headers=headers, timeout=timeout, **kwargs)
+        except requests.RequestException as exc:
+            raise CloudError(f"{c['name']} is unreachable: {type(exc).__name__}") from None
+        if r.ok:
+            return r.json()
+        if r.status_code not in (429, 500, 502, 503) or wait is None or "limit: 0" in r.text:
+            raise _error(c, r)
+        time.sleep(wait)
 
 
 def _strip_json(text: str) -> dict:
@@ -357,7 +385,147 @@ def chat_json(s: dict, conn_id: str, system: str, user: str, schema: dict,
     model = model or c.get("text_model")
     if c["type"] == "gemini":
         return _gemini_chat(s, c, model, system, user, schema, images or [], temperature)
+    if c["type"] == "anthropic":
+        return _anthropic_chat(s, c, model, system, user, schema, images or [])
+    if c["type"] == "codex":
+        return _codex_chat(s, c, model, system, user, schema)
+    if c["type"] == "claude_code":
+        return _claude_code_chat(s, c, model, system, user, schema)
     return _openai_chat(s, c, model, system, user, schema, images or [], temperature)
+
+
+def _closed_schema(schema):
+    """Structured outputs want every object closed: additionalProperties false, recursively."""
+    if isinstance(schema, dict):
+        out = {k: _closed_schema(v) for k, v in schema.items()}
+        if out.get("type") == "object":
+            out["additionalProperties"] = False
+            out.setdefault("properties", {})
+        return out
+    if isinstance(schema, list):
+        return [_closed_schema(x) for x in schema]
+    return schema
+
+
+CODEX_PATHS = ("/usr/lib/chatgpt/resources/codex", os.path.expanduser("~/.codex/plugins/.plugin-appserver/codex"))
+
+
+def _strict_schema(schema):
+    """OpenAI strict structured output: every object closed and every property required."""
+    if isinstance(schema, dict):
+        out = {k: _strict_schema(v) for k, v in schema.items()}
+        if out.get("type") == "object":
+            out["additionalProperties"] = False
+            out["properties"] = out.get("properties") or {}
+            out["required"] = list(out["properties"].keys())
+        return out
+    if isinstance(schema, list):
+        return [_strict_schema(x) for x in schema]
+    return schema
+
+
+def _codex_chat(s, c, model, system, user, schema):
+    """One non-interactive Codex run (the ChatGPT app's CLI, the user's subscription) in an empty read-only sandbox;
+    the final message is constrained to the schema and read back from a file."""
+    import shutil, subprocess, tempfile
+    exe = next((p for p in CODEX_PATHS if os.path.isfile(p)), None) or shutil.which("codex")
+    if not exe:
+        raise CloudError("The ChatGPT app's Codex CLI was not found on this PC.")
+    with tempfile.TemporaryDirectory(prefix="reelwright_codex_") as work:
+        sch, out = os.path.join(work, "schema.json"), os.path.join(work, "answer.json")
+        with open(sch, "w", encoding="utf-8") as f:
+            json.dump(_strict_schema(schema), f)
+        prompt = (f"{system}\n\n{user}\n\nAnswer directly from the text above. Do not run commands, read files or "
+                  "browse; reply only with the final JSON.")
+        cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only", "--color", "never",
+               "--output-schema", sch, "-o", out]
+        if model:
+            cmd += ["-m", model]
+        try:
+            r = subprocess.run(cmd + ["-"], input=prompt, capture_output=True, text=True, cwd=work, timeout=TEXT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise CloudError(f"{c['name']} did not finish within {TEXT_TIMEOUT // 60} minutes.") from None
+        if r.returncode != 0 or not os.path.isfile(out):
+            tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+            raise CloudError(f"{c['name']} failed: {' / '.join(tail)[:300]}")
+        try:
+            with open(out, encoding="utf-8") as f:
+                return json.load(f)
+        except ValueError:
+            raise CloudError(f"{c['name']} returned no valid JSON.") from None
+
+
+CLAUDE_PATHS = (os.path.expanduser("~/.local/bin/claude"), os.path.expanduser("~/.claude/local/claude"))
+
+
+def _claude_code_chat(s, c, model, system, user, schema):
+    """One non-interactive Claude Code run (the user's Claude subscription) with no tools, settings, MCP servers or
+    saved session; the answer is validated against the schema by the CLI and returned as structured_output."""
+    import shutil, subprocess, tempfile
+    exe = next((p for p in CLAUDE_PATHS if os.path.isfile(p)), None) or shutil.which("claude")
+    if not exe:
+        raise CloudError("The Claude Code CLI (claude) was not found on this PC.")
+    cmd = [exe, "-p", "--output-format", "json", "--json-schema", json.dumps(_strict_schema(schema)),
+           "--tools", "", "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config",
+           "--system-prompt", system]
+    if model:
+        cmd += ["--model", model]
+    with tempfile.TemporaryDirectory(prefix="reelwright_claude_") as work:
+        try:
+            r = subprocess.run(cmd, input=user, capture_output=True, text=True, cwd=work, timeout=TEXT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise CloudError(f"{c['name']} did not finish within {TEXT_TIMEOUT // 60} minutes.") from None
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+        raise CloudError(f"{c['name']} failed: {' / '.join(tail)[:300]}") from None
+    if data.get("is_error") or not isinstance(data.get("structured_output"), dict):
+        raise CloudError(f"{c['name']} failed: {str(data.get('result') or data.get('subtype') or 'no JSON answer')[:300]}")
+    return data["structured_output"]
+
+
+def _anthropic_chat(s, c, model, system, user, schema, images):
+    """Claude via the official SDK: schema-constrained JSON (output_config.format), adaptive thinking at the
+    connection's effort (default high - writing is intelligence-sensitive), streamed so long scripts do not time
+    out, and the server-side refusal fallback. Sampling parameters are not sent (current models reject them)."""
+    import anthropic
+    key = _need_key(s, c)
+    client = anthropic.Anthropic(api_key=key, base_url=c.get("base_url") or None, max_retries=2)
+    content = []
+    for p in images:
+        data, mime = _image_bytes(p)
+        content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": _b64(data)}})
+    content.append({"type": "text", "text": user})
+    try:
+        with client.beta.messages.stream(
+            model=model, max_tokens=64000, system=system,
+            messages=[{"role": "user", "content": content}],
+            output_config={"effort": c.get("effort") or "high",
+                           "format": {"type": "json_schema", "schema": _closed_schema(schema)}},
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+        ) as stream:
+            msg = stream.get_final_message()
+    except anthropic.AuthenticationError:
+        raise CloudError(f"{c['name']}: the API key was rejected. Check it on the AI models page.") from None
+    except anthropic.NotFoundError:
+        raise CloudError(f"{c['name']}: model '{model}' was not found.") from None
+    except anthropic.RateLimitError:
+        raise CloudError(f"{c['name']}: rate limited - try again in a minute.") from None
+    except anthropic.APIStatusError as exc:
+        raise CloudError(f"{c['name']}: HTTP {exc.status_code} - {str(exc.message)[:300]}") from None
+    except anthropic.APIConnectionError:
+        raise CloudError(f"{c['name']} is unreachable.") from None
+    if msg.stop_reason == "refusal":
+        why = getattr(getattr(msg, "stop_details", None), "explanation", "") or ""
+        raise CloudError(f"{c['name']} declined this request. {why}".strip())
+    if msg.stop_reason == "max_tokens":
+        raise CloudError(f"{c['name']}: the answer was cut off at the output limit.")
+    text = next((b.text for b in msg.content if b.type == "text"), "")
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise CloudError(f"{c['name']} returned no valid JSON.") from None
 
 
 def _openai_chat(s, c, model, system, user, schema, images, temperature):
@@ -375,7 +543,7 @@ def _openai_chat(s, c, model, system, user, schema, images, temperature):
     url, headers = c["base_url"] + "/chat/completions", _headers(c, key)
     for _ in range(3):
         try:
-            data = _post(c, url, headers, json=body)
+            data = _post(c, url, headers, timeout=TEXT_TIMEOUT, json=body)
             break
         except CloudError as exc:
             msg = str(exc).lower()
@@ -408,13 +576,13 @@ def _gemini_chat(s, c, model, system, user, schema, images, temperature):
                                  "responseJsonSchema": schema}}
     url, headers = f"{c['base_url']}/models/{model}:generateContent", _headers(c, key)
     try:
-        data = _post(c, url, headers, json=body)
+        data = _post(c, url, headers, timeout=TEXT_TIMEOUT, json=body)
     except CloudError as exc:
         if "responsejsonschema" not in str(exc).lower().replace("_", ""):
             raise
         body["generationConfig"].pop("responseJsonSchema")
         parts[0]["text"] = f"{user}\n\nReply with JSON only, matching this JSON Schema:\n{json.dumps(schema)}"
-        data = _post(c, url, headers, json=body)
+        data = _post(c, url, headers, timeout=TEXT_TIMEOUT, json=body)
     cands = data.get("candidates") or []
     if not cands:
         reason = (data.get("promptFeedback") or {}).get("blockReason")
@@ -528,7 +696,15 @@ def _gemini_image(s, c, model, prompt, width, height, refs):
 
 def list_models(s: dict, conn_id: str) -> list[str]:
     c = get_conn(s, conn_id)
+    if c["type"] in ("codex", "claude_code"):        # CLIs on this PC: no model listing endpoint
+        return [m for m in [c.get("text_model"), *(c.get("extra_models") or "").split(",")] if m and m.strip()]
     key = _need_key(s, c)
+    if c["type"] == "anthropic":
+        import anthropic
+        try:
+            return sorted(m.id for m in anthropic.Anthropic(api_key=key, base_url=c.get("base_url") or None).models.list())
+        except anthropic.APIError as exc:
+            raise CloudError(f"{c['name']}: {type(exc).__name__}") from None
     try:
         params = {"pageSize": 1000} if c["type"] == "gemini" else None
         r = requests.get(c["base_url"] + "/models", headers=_headers(c, key), params=params, timeout=30)

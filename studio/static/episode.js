@@ -1,8 +1,8 @@
 // Reelwright - episode views: story, shots, frames, animatic, takes, cut.
 "use strict";
 
-const TABS = [["story", "1. Story", null], ["shots", "2. Shot list", "shots"], ["frames", "3. First frames", "frames"],
-  ["animatic", "4. Animatic", "animatic"], ["takes", "5. Takes", "takes"], ["cut", "6. Cut", null]];
+const TABS = [["story", "1. Story", null, "Story"], ["shots", "2. Shot list", "shots", "Shots"], ["frames", "3. First frames", "frames", "Frames"],
+  ["animatic", "4. Animatic", "animatic", "Animatic"], ["takes", "5. Takes", "takes", "Takes"], ["cut", "6. Cut", null, "Cut"]];
 const FRAMINGS = ["extreme wide", "wide", "full", "medium wide", "medium", "medium close-up", "close-up", "extreme close-up", "over-the-shoulder", "two-shot", "insert"];
 
 async function viewEpisode(view, sid, eid, tab) {
@@ -17,7 +17,7 @@ async function viewEpisode(view, sid, eid, tab) {
     $("#ep-head").innerHTML = `
     <div class="page-head"><div class="grow"><h1>${esc(e.title)}</h1>
       <div class="row sub"><span class="chip">${e.shots.length} shots</span><span class="chip">runtime ${fmtSec(e._runtime)}</span><span class="chip">est. render ${fmtSec(e._estimate_s)} at ${e._settings.takes_per_shot} takes/shot</span><span class="chip ${nDone === 6 ? "good" : "accent"}">${nDone}/6 stages done</span></div></div></div>
-    <div class="tabs">${TABS.map(([k, label, gate], i) => `<a href="#/s/${sid}/e/${eid}/${k}" class="${k === tab ? "on" : ""} ${done[k] ? "done" : ""}" ${k === tab ? 'aria-current="page"' : ""}><span class="n">${done[k] ? ic("check") : i + 1}</span><span>${label.replace(/^\d+\.\s*/, "")}</span>${gate && g[gate] ? `<span class="gate chip good">approved</span>` : ""}</a>`).join("")}</div>
+    <nav class="tabs" aria-label="Episode stages">${TABS.map(([k, label, gate, short], i) => `<a href="#/s/${sid}/e/${eid}/${k}" class="${k === tab ? "on" : ""} ${done[k] ? "done" : ""}" ${k === tab ? 'aria-current="page"' : ""}><span class="n">${done[k] ? ic("check") : i + 1}</span><span class="tl">${label.replace(/^\d+\.\s*/, "")}</span><span class="ts">${short}</span>${gate && g[gate] ? `<span class="gate chip good">approved</span>` : ""}</a>`).join("")}</nav>
     <div class="progress"><div style="width:${Math.round((nDone / 6) * 100)}%"></div></div>`;
     pageMenu($("#ep-head"), [["Delete episode…", async () => {
       if (await ask(`Delete episode ${ctx.e.title}? Files are kept in a .deleted folder.`, "Delete", true)) {
@@ -26,6 +26,7 @@ async function viewEpisode(view, sid, eid, tab) {
     }, true]]);
   };
   paintHead();
+  document.body.classList.add("has-stepper");  // phones: the stage stepper takes the bottom bar
   const el = $("#tab");
   const fn = { story: tabStory, shots: tabShots, frames: tabFrames, animatic: tabAnimatic, takes: tabTakes, cut: tabCut }[tab] || tabStory;
   await fn(el, ctx);
@@ -95,22 +96,48 @@ async function tabStory(el, ctx) {
     <div class="card">
       <label>Title</label><input id="title" value="${esc(e.title)}" style="width:100%">
       <label>Story - a script (INT./EXT. headings, NAME: dialogue) or plain prose</label>
-      <textarea id="story" style="min-height:360px">${esc(e.story)}</textarea>
-      <div class="row" style="margin-top:10px">
-        <button id="save">Save</button>
-        <button id="draft">Draft bible from story</button>
-        <button class="primary" id="plan">${e.shots.length ? "Re-plan all shots" : "Plan scenes and shots"}</button>
+      <textarea id="story" class="story-text">${esc(e.story)}</textarea>
+      <div class="row story-save"><button id="save">Save</button><span class="muted small" id="story-count"></span></div>
+    </div>
+    <div class="card story-flow">
+      <div class="flow-steps">
+        <button class="${e.scenes.length ? "" : "primary"}" id="plan-cards" title="Story spine (theme, arcs, setups and payoffs, continuity) and one card per scene">1. Write spine and scene cards</button>
+        <button class="${e.spine && !e.shots.length ? "primary" : ""}" id="plan-shots" ${e.spine ? "" : "disabled title=\"Write the spine and scene cards first\""} title="Design the shots from the cards, then a script-supervisor review">2. Plan shots from the cards</button>
+        ${e.shots.length ? `<a class="btn primary" href="#/s/${ctx.sid}/e/${ctx.eid}/shots">Review ${pl(e.shots.length, "shot")} →</a>` : ""}
+      </div>
+      <div class="row flow-more">
         <label class="row small" style="margin:0;gap:6px">Write with ${textPicker("plan-model", "planner", "Model that writes the bible draft, scenes and shots")}</label>
+        <button id="draft">Draft bible from story</button>
+        <button id="plan" title="The older one-step planner">Quick plan</button>
         <span class="muted small grow">Bible: ${nChars} characters, ${nLocs} locations. The planner may only use bible ids.</span>
       </div>
     </div>
     ${!nLocs ? `<div class="notice">The bible has no locations yet. Use "Draft bible from story", review the drafts, then plan.</div>` : ""}
-    ${e.scenes.length ? `<h2>Scenes</h2>${e.scenes.map((s) => `<div class="card"><b>${esc(s.id)}</b> · ${esc(ctx.locs[s.location_id]?.name || s.location_id)} ${esc(s.time_of_day || "")}
-      <div class="muted">${esc(s.summary)}</div><div class="small muted">${(s.characters || []).map((c) => esc(charName(ctx, c.id) + (c.outfit ? ` (${c.outfit})` : ""))).join(", ")}</div></div>`).join("")}` : ""}`;
+    ${e.spine ? `<h2>Story spine</h2><div class="card"><b>${esc(e.spine.logline || "")}</b><div class="muted">Theme: ${esc(e.spine.theme || "")}</div>
+      ${(e.spine.characters || []).map((c) => `<div class="small"><b>${esc(charName(ctx, c.id))}</b> wants ${esc(c.want)}; needs ${esc(c.need)}${c.secret ? `; secret: ${esc(c.secret)}` : ""}. <span class="muted">${esc(c.arc || "")}</span></div>`).join("")}
+      ${(e.spine.setups || []).length ? `<h3>Setups and payoffs</h3>${e.spine.setups.map((x) => `<div class="small"><b>${esc(x.what)}</b>: ${esc(x.planted)} <span class="muted">→</span> ${esc(x.payoff)}</div>`).join("")}` : ""}</div>` : ""}
+    ${e.scenes.length ? `<h2>Scene cards</h2>${e.scenes.map((s) => `<div class="card"><b>${esc(s.id)}</b> · ${esc(ctx.locs[s.location_id]?.name || s.location_id)} ${esc(s.time_of_day || "")}${s.turn ? ` <span class="chip">${esc(s.turn)}</span>` : ""}
+      <div class="muted">${esc(s.summary)}</div>${s.purpose ? `<div class="small"><b>Purpose:</b> ${esc(s.purpose)}</div>` : ""}
+      ${(s.entrances || []).length || (s.exits || []).length ? `<div class="small muted">In: ${esc((s.entrances || []).join("; ") || "-")} · Out: ${esc((s.exits || []).join("; ") || "-")}</div>` : ""}
+      <div class="small muted">${(s.characters || []).map((c) => esc(charName(ctx, c.id) + (c.outfit ? ` (${c.outfit})` : ""))).join(", ")}</div></div>`).join("")}` : ""}
+    ${(e.review || []).length ? `<details><summary>Script supervisor: ${e.review.length} fixes</summary>${e.review.map((x) => `<div class="small">${esc(x)}</div>`).join("")}</details>` : ""}`;
   const save = () => PUT(`${ctx.base}/story`, { title: $("#title").value, story: $("#story").value });
+  const count = () => { const t = $("#story").value.trim(); $("#story-count").textContent = t ? `${t.split(/\s+/).length} words` : ""; };
+  count();
+  $("#story").oninput = () => { App.dirty = true; count(); };
+  $("#title").oninput = () => { App.dirty = true; };
   $("#save").onclick = async () => { await save(); App.dirty = false; toast("Saved."); };
+  saveShortcut(() => $("#save").click());
   const writer = () => ({ model: $("#plan-model")?.value || "" });
   $("#draft").onclick = async () => { await save(); App.dirty = false; await startJob(`${ctx.base}/draft_bible`, writer()); };
+  $("#plan-cards").onclick = async () => {
+    if (e.scenes.length && !(await ask("Rewrite the spine and scene cards? The current cards are replaced.", "Rewrite", true))) return;
+    await save(); App.dirty = false; await startJob(`${ctx.base}/plan_cards`, writer());
+  };
+  $("#plan-shots").onclick = async () => {
+    if (e.shots.length && !(await ask("Replace the whole shot list with shots designed from these cards? Existing frames and takes stay on disk but are detached.", "Replace", true))) return;
+    await startJob(`${ctx.base}/plan_shots`, writer());
+  };
   $("#plan").onclick = async () => {
     if (e.shots.length && !(await ask("Replace the whole shot list? Existing frames and takes stay on disk but are detached.", "Replace", true))) return;
     await save(); App.dirty = false; await startJob(`${ctx.base}/plan`, writer());
@@ -138,6 +165,14 @@ function textToDlg(t) {
 async function tabShots(el, ctx) {
   const shots = JSON.parse(JSON.stringify(ctx.e.shots));
   const locIds = Object.keys(ctx.locs);
+  // Shot cards fold to a one-line summary. Phones start folded, desktops open; the choice survives re-renders.
+  const open = new Set(matchMedia("(max-width: 700px)").matches ? [] : shots);
+  const summary = (sh) => {
+    const who = (sh.characters || []).map((c) => charName(ctx, c.id)).join(", ");
+    const n = (sh.dialogue || []).length;
+    return `<span class="sr-sum">${esc(sh.framing || "")}${who ? " · " + esc(who) : ""}${n ? ` · ${pl(n, "line")}` : ""}</span>
+      <span class="sr-sum-action">${esc(sh.action || "No action yet")}</span>`;
+  };
   const sel = (f, i, v, opts, labels) => `<select data-i="${i}" data-f="${f}">${opts.map((o, k) => `<option value="${esc(o)}" ${o === (v || "") ? "selected" : ""}>${esc(labels ? labels[k] : o || "inherit")}</option>`).join("")}</select>`;
   const render = () => {
     let lastScene = null;
@@ -145,25 +180,32 @@ async function tabShots(el, ctx) {
     el.innerHTML = `
       <div class="toolbar"><div class="tb-group"><button class="primary" id="save">Save shot list</button><button id="add">Add shot</button></div>
         <div class="tb-group"><button id="cont" title="master per scene, punch-ins for closer shots, reuse for returns to wide">Auto continuity</button></div>
+        ${shots.some((x) => !x.first_frame) ? `<div class="tb-group"><button id="block" title="Write first-frame blocking for shots that have none, keeping their action and dialogue (uses the re-plan model)">Add blocking to ${pl(shots.filter((x) => !x.first_frame).length, "shot")}</button></div>` : ""}
         <div class="tb-group"><label class="row small" style="margin:0;gap:6px">Re-plan scenes with ${textPicker("replan-model", "planner", "Model used by re-plan this scene")}</label></div>
         <span class="grow"></span>${gateBtn(ctx, "shots", "shot list")}</div>
+      <div class="list-bar"><button id="fold-all">${open.size ? "Collapse all" : "Expand all"}</button>
+        ${ctx.e.scenes.length > 1 ? `<select id="jump-scene" aria-label="Jump to scene"><option value="">Jump to scene…</option>${[...new Set(shots.map((x) => x.scene_id))].map((id) => `<option value="${esc(id)}">${esc(id)} · ${esc(sceneById[id]?.summary || "")}</option>`).join("")}</select>` : ""}
+        <span class="muted small">${pl(shots.length, "shot")} · ${fmtSec(shots.reduce((a, x) => a + (+x.duration_s || 0), 0))}</span></div>
       <p class="muted small" style="margin:0 0 16px">Characters: <code>id:position:outfit</code>, comma separated. Dialogue: one <code>id [acting direction]: line</code> per line (the direction is optional). Editing a duration locks it.</p>
       <div class="shot-rows">
       ${shots.map((sh, i) => {
         let head = "";
         if (sh.scene_id !== lastScene) {
           lastScene = sh.scene_id; const sc = sceneById[sh.scene_id];
-          head = `<div class="scene-head"><b>${esc(sh.scene_id || "no scene")}</b><span>${sc ? esc(sc.summary) : ""}</span>
+          head = `<div class="scene-head" id="scene-${esc(sh.scene_id || "none")}"><b>${esc(sh.scene_id || "no scene")}</b><span>${sc ? esc(sc.summary) : ""}</span>
             ${sc ? `<button class="link" data-replan="${esc(sc.id)}">re-plan this scene</button>` : ""}</div>`;
         }
         const f = (label, html, cls = "") => `<div class="sr-f ${cls}"><label>${label}</label>${html}</div>`;
-        return head + `<article class="shot-row">
-          <header class="sr-head"><b class="sr-id">${esc(sh.id || "new")}</b>
+        const isOpen = open.has(sh);
+        return head + `<article class="shot-row ${isOpen ? "" : "folded"}">
+          <header class="sr-head"><button class="sr-toggle" data-fold="${i}" aria-expanded="${isOpen}" aria-label="${isOpen ? "Collapse" : "Expand"} ${esc(sh.id || "new shot")}">${ic("chev")}</button><b class="sr-id" data-fold="${i}">${esc(sh.id || "new")}</b>
             ${sh._stale ? `<span class="chip warn">stale</span>` : ""}${sh.frame?.locked ? `<span class="chip good">frame locked</span>` : ""}
-            <span class="muted small">${fmtDur(sh.duration_s)}</span><span class="grow"></span>
+            <span class="muted small ${+sh.duration_s ? "" : "warn-text"}" title="${+sh.duration_s ? "" : "No duration yet: voice the dialogue or set one"}">${fmtDur(sh.duration_s)}</span><span class="grow"></span>
             <div class="row sr-acts"><button class="link" data-up="${i}" title="Move up" aria-label="Move shot up">↑</button><button class="link" data-down="${i}" title="Move down" aria-label="Move shot down">↓</button>
               <button class="link" data-dup="${i}" title="Duplicate below">split</button><button class="link" data-merge="${i}" title="Merge with next">merge</button>
               <button class="link danger" data-del="${i}">delete</button></div></header>
+          ${isOpen ? "" : `<div class="sr-summary" data-fold="${i}">${summary(sh)}</div>`}
+          <div class="sr-body">
           <div class="sr-grid">
             ${f("Framing", sel("framing", i, sh.framing, FRAMINGS))}
             ${f("Camera", `<input data-i="${i}" data-f="camera" value="${esc(sh.camera)}" placeholder="e.g. static, slow push-in">`)}
@@ -176,39 +218,59 @@ async function tabShots(el, ctx) {
             ${f(`Duration ${sh.duration_locked ? `<button class="link" data-unlock="${i}" title="Locked - click to auto-compute">🔒 locked</button>` : ""}`, `<input data-i="${i}" data-f="duration_s" type="number" step="0.1" value="${Math.round((+sh.duration_s || 0) * 100) / 100}" aria-label="Duration in seconds">`)}
             ${f("Start", sel("start_mode", i, sh.start_mode, ["new", "punch_in", "reuse", "chain"], ["New frame (master)", "Punch-in from scene master", "Reuse master angle", "Chain: last frame of prev take"]))}
             ${f("Frame source", sel("frame_source", i, sh.frame_source, frameSourceValues(sh.frame_source), frameSourceValues(sh.frame_source).map((v) => v ? sourceLabel(v) : "Inherit (" + sourceLabel(sh._source) + ")")))}
-            ${f("Video engine", sel("engine", i, sh.engine, ["", "minimax_local", "ltx", "wan", "minimax"], ["Series default", "MiniMax H3 (local)", "LTX-2.3", "Wan 2.2", "MiniMax (cloud)"]))}
+            ${f("Video engine", sel("engine", i, sh.engine, ["", ...VIDEO_ENGINES], ["Project default", ...VIDEO_ENGINES.map(x => ENGINE_NAMES[x])]))}
           </div>
+          <details class="sr-blocking"><summary>First-frame blocking${sh.first_frame ? " · planned" : " · legacy prompt"}</summary>
+            ${sh.first_frame ? `<p class="muted small">The opening instant controls the still image. Action describes what happens afterward. Each character appears once in the declared zone.</p>
+            <div class="sr-grid">${["camera", "layout", "moment", "lighting"].map(key => f(key[0].toUpperCase() + key.slice(1), `<textarea data-i="${i}" data-f="first_frame.${key}" rows="2">${esc(sh.first_frame[key])}</textarea>`, "span2")).join("")}</div>
+            ${sh.first_frame.subjects.map((subject, index) => `<h4>${esc(charName(ctx, subject.id))}</h4><div class="sr-grid">${["position", "depth", "space", "zone", "pose", "facing", "gaze_target", "gaze_direction", "expression", "visibility", "wardrobe_state"].map(key => f(key.replaceAll("_", " "), `<input data-i="${i}" data-f="first_frame.subjects.${index}.${key}" value="${esc(subject[key])}">`)).join("")}</div>`).join("")}
+            ${sh.first_frame.props.map((prop, index) => `<h4>${esc(prop.id)}</h4><div class="sr-grid">${["placement", "state", "holder"].map(key => f(key, `<input data-i="${i}" data-f="first_frame.props.${index}.${key}" value="${esc(prop[key])}">`)).join("")}</div>`).join("")}
+            <label>Required details · one per line</label><textarea data-i="${i}" data-f="first_frame.constraints" rows="3">${esc(sh.first_frame.constraints.join("\n"))}</textarea>`
+            : `<p class="muted small">This shot uses a legacy prompt. Re-plan the scene to create explicit camera, position, gaze, prop and visibility plans.</p>`}
+          </details>
           <details class="sr-prompts"><summary>Prompts${sh.image_prompt_override || sh.motion_prompt_override ? " (overridden)" : ""}</summary>
             <label>Image prompt (auto)</label><pre class="prompt">${esc(sh._image_prompt)}</pre>
-            <label>Extra for image</label><input data-i="${i}" data-f="image_prompt_extra" value="${esc(sh.image_prompt_extra)}">
+            <label>Extra for image${sh.first_frame ? " · edit the blocking plan instead" : ""}</label><input data-i="${i}" data-f="image_prompt_extra" value="${esc(sh.image_prompt_extra)}" ${sh.first_frame ? "disabled" : ""}>
             <label>Motion prompt (auto, ${esc(sh._engine)})</label><pre class="prompt">${esc(sh._motion_prompt)}</pre>
             <label>Extra for motion</label><input data-i="${i}" data-f="motion_prompt_extra" value="${esc(sh.motion_prompt_extra)}">
-            <label>Full image prompt override (replaces auto)</label><textarea data-i="${i}" data-f="image_prompt_override">${esc(sh.image_prompt_override)}</textarea>
+            <label>Full image prompt override${sh.first_frame ? " · controlled by blocking" : " (replaces auto)"}</label><textarea data-i="${i}" data-f="image_prompt_override" ${sh.first_frame ? "disabled" : ""}>${esc(sh.image_prompt_override)}</textarea>
             <label>Full motion prompt override</label><textarea data-i="${i}" data-f="motion_prompt_override">${esc(sh.motion_prompt_override)}</textarea>
-          </details></article>`;
+          </details></div></article>`;
       }).join("")}</div>`;
     bulkSelect(el, "[data-del]", async targets => {
       const indices = targets.map(t => +t.dataset.del).sort((a,b) => b-a);
       indices.forEach(i => shots.splice(i, 1)); App.dirty = true;
     }, render, "shots");
+    const jump = $("#jump-scene", el);
+    if (jump) jump.onchange = () => { const h = document.getElementById("scene-" + jump.value); jump.value = ""; if (h) h.scrollIntoView({ behavior: "smooth", block: "start" }); };
   };
   render();
   const payload = () => shots.map((sh) => ({ ...sh }));
   el.oninput = (ev) => {
     const t = ev.target; const i = t.dataset.i, f = t.dataset.f; if (i == null || !f) return;
     const sh = shots[+i];
-    if (f === "characters") sh.characters = textToChars(t.value);
+    if (f.startsWith("first_frame.")) {
+      const keys = f.split("."), key = keys.pop(); let target = sh;
+      for (const part of keys) target = target[part];
+      target[key] = key === "constraints" ? t.value.split("\n").map(x => x.trim()).filter(Boolean) : t.value;
+    }
+    else if (f === "characters") sh.characters = textToChars(t.value);
     else if (f === "dialogue") sh.dialogue = textToDlg(t.value);
     else if (f === "duration_s") { sh.duration_s = parseFloat(t.value) || 0; sh.duration_locked = true; }
     else sh[f] = t.value;
+    App.dirty = true;
   };
+  saveShortcut(() => $("#save", el)?.click());
   el.onchange = el.oninput;
   el.onclick = async (ev) => {
     const t = ev.target, ds = t.dataset;
+    const fold = t.closest("[data-fold]");
+    if (fold) { const sh = shots[+fold.dataset.fold]; open.has(sh) ? open.delete(sh) : open.add(sh); return render(); }
+    if (t.id === "fold-all") { if (open.size) open.clear(); else shots.forEach((x) => open.add(x)); return render(); }
     const move = (i, j) => { if (j < 0 || j >= shots.length) return; [shots[i], shots[j]] = [shots[j], shots[i]]; App.dirty = true; render(); };
     if (ds.up) move(+ds.up, +ds.up - 1);
     if (ds.down) move(+ds.down, +ds.down + 1);
-    if (ds.dup) { const src = shots[+ds.dup]; const copy = { ...JSON.parse(JSON.stringify(src)), id: "", _copy_of: src.id, dialogue: [], duration_locked: false }; shots.splice(+ds.dup + 1, 0, copy); App.dirty = true; render(); }
+    if (ds.dup) { const src = shots[+ds.dup]; const copy = { ...JSON.parse(JSON.stringify(src)), id: "", _copy_of: src.id, dialogue: [], duration_locked: false }; shots.splice(+ds.dup + 1, 0, copy); open.add(copy); App.dirty = true; render(); }
     if (ds.merge) {
       const i = +ds.merge; if (i + 1 >= shots.length) return;
       const a = shots[i], b = shots[i + 1];
@@ -218,7 +280,8 @@ async function tabShots(el, ctx) {
     if (ds.del) { if (await ask(`Delete ${shots[+ds.del].id || "this shot"}?`, "Delete", true)) { shots.splice(+ds.del, 1); App.dirty = true; render(); } }
     if (ds.unlock) { shots[+ds.unlock].duration_locked = false; App.dirty = true; render(); }
     if (ds.replan) { if (await ask(`Re-plan all shots of ${ds.replan}? Its current shots are replaced.`, "Re-plan", true)) startJob(`${ctx.base}/replan/${ds.replan}`, { model: $("#replan-model")?.value || "" }); }
-    if (t.id === "add") { shots.push({ id: "", scene_id: shots.at(-1)?.scene_id || "S01", location_id: shots.at(-1)?.location_id || locIds[0] || "", framing: "medium", camera: "", characters: [], action: "", dialogue: [], sound: "", action_seconds: 3, start_mode: "new", frame_source: "", engine: "" }); App.dirty = true; render(); }
+    if (t.id === "add") { shots.push({ id: "", scene_id: shots.at(-1)?.scene_id || "S01", location_id: shots.at(-1)?.location_id || locIds[0] || "", framing: "medium", camera: "", characters: [], action: "", dialogue: [], sound: "", action_seconds: 3, start_mode: "new", frame_source: "", engine: "" }); open.add(shots.at(-1)); App.dirty = true; render(); el.querySelector(".shot-row:last-of-type")?.scrollIntoView({ behavior: "smooth", block: "center" }); }
+    if (t.id === "block") { if (App.dirty) await PUT(`${ctx.base}/shots`, payload()); App.dirty = false; return startJob(`${ctx.base}/block_shots`, { model: $("#replan-model")?.value || "" }); }
     if (t.id === "cont") { await PUT(`${ctx.base}/shots`, payload()); await POST(`${ctx.base}/continuity`); App.dirty = false; toast("Continuity assigned: masters, punch-ins, reuses."); return reload(); }
     if (t.id === "save" || ds.gate) {
       await PUT(`${ctx.base}/shots`, payload()); App.dirty = false;
@@ -372,7 +435,7 @@ async function tabFrames(el, ctx) {
     <div class="toolbar">
       <div class="tb-group">
         <button class="${needs ? "primary" : ""}" id="render-missing" ${needs ? "" : "disabled title=\"Every shot already has a frame\""}>Render missing frames</button>
-        <select id="src-override" aria-label="Frame source"><option value="">Per-shot source</option><option value="flux_lora">Force Flux + LoRA</option><option value="zimage">Force Z-Image</option><option value="qwen_refs">Force reference photos</option>${imageOptions("Force ")}</select>
+        <select id="src-override" aria-label="Frame source"><option value="">Per-shot source</option><option value="flux_lora">Force Flux + LoRA</option><option value="zimage">Force Z-Image</option><option value="qwen_refs">Force Z-Image + Qwen identity</option>${imageOptions("Force ")}</select>
         <label class="row small" style="margin:0;gap:6px">Check with ${textPicker("check-model", "vision", "Model that checks rendered frames")}</label>
       </div>
       <div class="tb-group">
@@ -383,6 +446,8 @@ async function tabFrames(el, ctx) {
       ${gateBtn(ctx, "frames", "frames")}
     </div>
     <p class="status-line">${framesStatus(ctx).html}</p>
+    <p class="muted small">Z-Image + Qwen identity: Z-Image Turbo composes the shot from text, then Qwen Edit applies the reference faces while preserving pose, gaze and framing.</p>
+    <div class="list-bar"><label class="row small" style="margin:0"><input type="checkbox" id="only-needs"> Only shots that still need a frame</label></div>
     <div id="frames-list">${shots.map((sh) => frameCard(ctx, sh)).join("")}</div>`;
   ctx.repaint = (ids) => {
     repaintCards($("#frames-list", el), ctx, ids, frameCard);
@@ -390,6 +455,7 @@ async function tabFrames(el, ctx) {
     $(".status-line", el).innerHTML = s.html; b.disabled = !s.needs; b.className = s.needs ? "primary" : ""; b.title = s.needs ? "" : "Every shot already has a frame";
   };
   const checker = () => $("#check-model")?.value || "";
+  $("#only-needs").onchange = (ev) => $("#frames-list", el).classList.toggle("only-needs", ev.target.checked);
   $("#render-missing").onclick = () => startJob(`${ctx.base}/frames`, { source: $("#src-override").value, check_model: checker() });
   $("#render-all").onclick = async () => { if (await ask("Render new candidates for every unlocked shot?", "Render")) startJob(`${ctx.base}/frames`, { force: true, source: $("#src-override").value, check_model: checker(), shot_ids: shots.filter((s) => !s.frame.locked).map((s) => s.id) }); };
   $("#vision").onclick = () => startJob(`${ctx.base}/vision`, { model: checker() });
@@ -402,6 +468,7 @@ async function tabFrames(el, ctx) {
   el.onclick = async (ev) => {
     const t = ev.target, ds = t.dataset;
     if (ds.zoom) zoom(ds.zoom);
+    if (t.classList.contains("shot-desc")) t.classList.toggle("open");
     if (ds.gate) setGate(ctx, ds.gate, ds.val === "1");
     if (ds.pick != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { select: +ds.pick }); reload(); }
     if (ds.rm != null && ds.shot) { await POST(`${ctx.base}/shots/${ds.shot}/frame`, { remove: +ds.rm }); reload(); }
@@ -424,28 +491,33 @@ function frameCard(ctx, sh) {
   const who = (sh.characters || []).map((c) => esc(charName(ctx, c.id) + (c.position ? ` (${c.position})` : ""))).join(", ");
   const cands = sh.frame.candidates || [];
   const chained = sh.start_mode === "chain";
-  return `<div class="shot-card ${sh.frame.locked ? "locked" : ""}" data-card="${esc(sh.id)}">
+  const needs = !chained && sh.frame.selected == null;
+  return `<div class="shot-card ${sh.frame.locked ? "locked" : ""} ${needs ? "needs" : ""}" data-card="${esc(sh.id)}">
     <div class="shot-head"><span class="id">${esc(sh.id)}</span><span class="muted">${esc(sh.framing)} · ${who || "no characters"} · ${fmtDur(sh.duration_s)}</span>
       <span class="chip accent">${sourceLabel(sh._source)}</span>${sh._loras.length ? `<span class="chip" title="${esc(sh._loras.map((l) => l.name + " @" + l.strength).join("\n"))}">${sh._loras.length} LoRA</span>` : ""}
       ${sh._stale ? `<span class="chip warn" title="bible changed since these frames were made">stale</span>` : ""}
-      ${sh.frame.locked ? `<span class="chip good">locked</span>` : ""}<span class="grow"></span>
-      ${chained ? "" : `<select id="src-${sh.id}"><option value="">${sourceLabel(sh._source)}</option><option value="flux_lora">Flux + LoRA</option><option value="zimage">Z-Image</option><option value="qwen_refs">Reference photos</option>${imageOptions()}</select>
+      ${sh.frame.locked ? `<span class="chip good">locked</span>` : ""}${needs ? `<span class="chip warn">pick a frame</span>` : ""}<span class="grow"></span>
+      ${chained ? "" : `<select id="src-${sh.id}"><option value="">${sourceLabel(sh._source)}</option><option value="flux_lora">Flux + LoRA</option><option value="zimage">Z-Image</option><option value="qwen_refs">Z-Image + Qwen identity</option>${imageOptions()}</select>
       <button data-render="1" data-shot="${sh.id}">Render ${ctx.e._settings.candidates_per_shot} more</button>
       <label class="btn file-pick" style="margin:0;color:var(--ink)">Upload photo<input type="file" accept="image/*,.heic,.heif" data-upframe="${sh.id}" aria-label="Upload photo for ${esc(sh.id)}"></label>`}
       <button data-lock="${sh.frame.locked ? 0 : 1}" data-shot="${sh.id}">${sh.frame.locked ? "Unlock" : "Lock"}</button></div>
-    <div class="muted small">${esc(sh.action)}${(sh.dialogue || []).length ? " · " + sh.dialogue.map((d) => esc(charName(ctx, d.speaker) + ": " + d.line)).join(" / ") : ""}</div>
-    <details><summary>image prompt</summary><pre class="prompt">${esc(sh._image_prompt)}</pre></details>
+    <div class="muted small shot-desc" title="Click to show all">${esc(sh.action)}${(sh.dialogue || []).length ? " · " + sh.dialogue.map((d) => esc(charName(ctx, d.speaker) + ": " + d.line)).join(" / ") : ""}</div>
     ${chained ? `<p class="muted">Chained: this shot starts from the last frame of ${esc("the previous shot's")} selected take (made at the Takes stage).</p>` : ""}
-    <div class="row small" style="margin:6px 0">End frame (optional, LTX):
-      ${sh.end_frame ? `<img src="${media(sh.end_frame)}" style="height:44px;border-radius:4px" data-zoom="${media(sh.end_frame)}"><button class="link" data-clearend="1" data-shot="${sh.id}">clear</button>` : `<span class="muted">none</span>`}
-      <label class="btn file-pick" style="margin:0">Upload end frame<input type="file" accept="image/*,.heic,.heif" data-upend="${sh.id}" aria-label="Upload end frame for ${esc(sh.id)}"></label>
-      <span class="grow"></span>refine strength <input id="dn-${sh.id}" type="number" min="0.1" max="0.8" step="0.05" value="0.3" style="width:64px"></div>
+    <details class="frame-opts"><summary>Prompt, end frame &amp; refine${sh.end_frame ? " · end frame set" : ""}</summary>
+      ${sh.first_frame ? `<p class="muted small">This prompt is compiled from the opening-frame blocking in Shot list. Later actions and portrait poses do not set the opening positions.</p>` : ""}
+      <pre class="prompt">${esc(sh._image_prompt)}</pre>
+      <div class="row small" style="margin:6px 0">End frame (optional, LTX):
+        ${sh.end_frame ? `<img src="${media(sh.end_frame)}" style="height:44px;border-radius:4px" data-zoom="${media(sh.end_frame)}"><button class="link" data-clearend="1" data-shot="${sh.id}">clear</button>` : `<span class="muted">none</span>`}
+        <label class="btn file-pick" style="margin:0">Upload end frame<input type="file" accept="image/*,.heic,.heif" data-upend="${sh.id}" aria-label="Upload end frame for ${esc(sh.id)}"></label>
+        <span class="grow"></span>refine strength <input id="dn-${sh.id}" type="number" min="0.1" max="0.8" step="0.05" value="0.3" style="width:64px"></div>
+    </details>
     <div class="cands"><div class="cands-in">${cands.map((c, k) => `<div class="cand ${sh.frame.selected === k ? "sel" : ""}">
       <div class="frame"><img src="${media(c.file)}" data-zoom="${media(c.file)}" loading="lazy"></div>
       <div class="meta"><span class="code">${esc(sh.id)}/${String.fromCharCode(65 + k)}</span>${sh.frame.selected === k ? `<span class="pick">picked</span>` : ""}<span>${sourceLabel(c.source)}${c.plate ? ", on location plate" : ""}</span> ${checkChip(c)}</div>
       <div class="acts">${sh.frame.selected === k ? ""  : `<button data-pick="${k}" data-shot="${sh.id}">Pick this</button>`}
         <button data-qwenface="${k}" data-shot="${sh.id}" title="Correct this frame using the uploaded character portrait">Correct face</button>
         <details class="cand-more"><summary aria-label="More actions for ${esc(sh.id)}/${String.fromCharCode(65 + k)}">More</summary><div class="cand-pop">
+          ${c.composition ? `<button data-zoom="${media(c.composition)}">View composition before identity</button>` : ""}
           <button data-refine="flux_lora" data-idx="${k}" data-shot="${sh.id}" title="img2img with the character LoRA">Refine with Flux + LoRA</button>
           <button data-refine="zimage" data-idx="${k}" data-shot="${sh.id}" title="img2img to match style">Refine with Z-Image</button>
           <button data-asend="${esc(c.file)}" data-shot="${sh.id}">Use as end frame</button></div></details>
@@ -460,27 +532,61 @@ async function tabAnimatic(el, ctx) {
     return { id: sh.id, src: f ? media(f.file) : "", dur: +sh.duration_s || 2, cap, action: sh.action, missing: !f };
   });
   const total = items.reduce((a, b) => a + b.dur, 0);
+  const nMissing = items.filter((i) => i.missing).length;
+  const v = ctx.e._settings.video || {}, ratio = v.width && v.height ? `${v.width} / ${v.height}` : "16 / 9";
+  const starts = items.map((_, i) => items.slice(0, i).reduce((a, b) => a + b.dur, 0));
   el.innerHTML = `
-    <div class="row" style="margin-bottom:10px"><button class="primary" id="play">Play</button><button id="restart">Restart</button>
-      <label class="row small" style="margin:0"><input type="checkbox" id="showact"> show action text</label>
-      <span class="muted grow">${fmtSec(total)} · ${items.filter((i) => i.missing).length} shots without a frame</span>
+    <div class="row anim-bar"><span class="muted">${fmtSec(total)} · ${pl(items.length, "shot")}</span>${nMissing ? `<span class="chip warn">${pl(nMissing, "shot")} without a frame</span>` : ""}
+      <span class="grow"></span>
       <button id="export">Export animatic.mp4</button>${ctx.e.outputs?.animatic ? `<a href="${media(ctx.e.outputs.animatic)}" target="_blank">open animatic.mp4</a>` : ""}
       ${gateBtn(ctx, "animatic", "pacing")}</div>
-    <div class="player"><img id="pimg"><div class="tag" id="ptag"></div><div class="cap" id="pcap"></div></div>
-    <div class="timeline" id="tl">${items.map((it, k) => `<div data-k="${k}" style="flex:${it.dur}" title="${esc(it.id)} ${fmtDur(it.dur)}">${esc(it.id)}</div>`).join("")}</div>
+    <div class="anim-stage">
+      <div class="player ${v.height > v.width ? "portrait" : ""}" id="player" style="aspect-ratio:${ratio};--ar:${v.width && v.height ? v.width / v.height : 16 / 9}" title="Click to play or pause"><img id="pimg" alt=""><div class="tag" id="ptag"></div><div class="cap" id="pcap"></div>
+        <div class="pbar"><div id="pbar"></div></div></div>
+      <div class="anim-controls">
+        <button id="prev" aria-label="Previous shot" title="Previous shot (←)">${ic("left")}</button>
+        <button class="primary" id="play" title="Play / pause (Space)">Play</button>
+        <button id="next" aria-label="Next shot" title="Next shot (→)">${ic("chev")}</button>
+        <button id="restart" title="Back to the first shot (Home)">Restart</button>
+        <label class="row small" style="margin:0"><input type="checkbox" id="showact"> show action text</label>
+        <span class="muted small" id="ptime"></span>
+      </div>
+    </div>
+    <div class="timeline" id="tl">${items.map((it, k) => `<div data-k="${k}" class="${it.missing ? "missing" : ""}" style="flex:${it.dur}" title="${esc(it.id)} ${fmtDur(it.dur)}">${esc(it.id.replace(/^.*_SH/, "SH"))}</div>`).join("")}</div>
     <p class="muted small">Change durations in the Shot list tab (editing a duration locks it).</p>`;
   let k = 0, timer = null, playing = false;
   const show = (i) => {
+    if (!el.isConnected) { playing = false; clearTimeout(timer); return; }  // left the page while playing
     k = i; const it = items[i]; if (!it) return;
     $("#pimg").src = it.src || ""; $("#pimg").style.visibility = it.src ? "visible" : "hidden";
     $("#ptag").textContent = `${it.id} · ${fmtDur(it.dur)}${it.missing ? " · no frame" : ""}`;
     $("#pcap").textContent = $("#showact").checked && it.action ? `${it.cap ? it.cap + "\n" : ""}[${it.action}]` : it.cap;
     $$("#tl div").forEach((d, j) => d.classList.toggle("on", j === i));
+    $("#ptime").textContent = `${k + 1} / ${items.length} · ${fmtSec(starts[k])} of ${fmtSec(total)}`;
+    $("#pbar").style.width = `${total ? (starts[k] / total) * 100 : 0}%`;
   };
   const step = () => { if (!playing) return; timer = setTimeout(() => { if (k + 1 < items.length) { show(k + 1); step(); } else { playing = false; $("#play").textContent = "Play"; } }, items[k].dur * 1000); };
-  $("#play").onclick = () => { playing = !playing; $("#play").textContent = playing ? "Pause" : "Play"; clearTimeout(timer); if (playing) step(); };
-  $("#restart").onclick = () => { clearTimeout(timer); show(0); if (playing) step(); };
-  $("#tl").onclick = (e) => { const i = e.target.dataset.k; if (i != null) { clearTimeout(timer); show(+i); if (playing) step(); } };
+  const player = $("#player");
+  const go = (i) => { if (i < 0 || i >= items.length) return; clearTimeout(timer); show(i); if (playing) step(); };
+  const toggle = () => { playing = !playing; $("#play").textContent = playing ? "Pause" : "Play"; clearTimeout(timer); if (playing) step(); };
+  $("#play").onclick = toggle;
+  $("#player").onclick = toggle;
+  $("#prev").onclick = () => go(k - 1);
+  $("#next").onclick = () => go(k + 1);
+  $("#restart").onclick = () => go(0);
+  $("#tl").onclick = (e) => { const i = e.target.dataset.k; if (i != null) go(+i); };
+  // Swipe on the player for the previous/next shot.
+  let sx = null;
+  $("#player").addEventListener("touchstart", (e) => { sx = e.touches[0].clientX; }, { passive: true });
+  $("#player").addEventListener("touchend", (e) => { if (sx == null) return; const dx = e.changedTouches[0].clientX - sx; sx = null; if (Math.abs(dx) > 40) { e.preventDefault(); go(k + (dx < 0 ? 1 : -1)); } });
+  const keys = (e) => {
+    if (!player.isConnected) return document.removeEventListener("keydown", keys);
+    if (e.target.closest("input, textarea, select") || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === "ArrowRight") go(k + 1); else if (e.key === "ArrowLeft") go(k - 1); else if (e.key === "Home") go(0);
+    else if (e.key === " ") { if (e.target.closest("button")) return; toggle(); } else return;
+    e.preventDefault();
+  };
+  document.addEventListener("keydown", keys);
   $("#export").onclick = () => startJob(`${ctx.base}/animatic`);
   el.addEventListener("click", (e) => { if (e.target.dataset.gate) setGate(ctx, e.target.dataset.gate, e.target.dataset.val === "1"); });
   show(0);
@@ -613,8 +719,17 @@ async function tabCut(el, ctx) {
   const e = ctx.e, o = e.outputs || {}, m = e.music || {};
   const missing = e.shots.filter((s) => !(s.takes.items || []).length).map((s) => s.id);
   el.innerHTML = `
-    ${missing.length ? `<div class="notice">No takes yet for: ${esc(missing.join(", "))}. They'll be left out.</div>` : ""}
-    ${e.timeline ? `<div class="notice">This film uses the saved Takes timeline. <a href="#/s/${ctx.sid}/e/${ctx.eid}/takes">Edit clips, music and lip-sync in Takes</a>.</div>` : ''}
+    ${missing.length ? `<div class="notice">${pl(missing.length, "shot")} without takes will be left out: ${esc(missing.join(", "))}. <a href="#/s/${ctx.sid}/e/${ctx.eid}/takes">Render takes</a></div>` : ""}
+    ${o.final ? `<section class="final-film"><h2>Final film ${o.runtime ? "· " + fmtSec(o.runtime) : ""}</h2>
+      <video class="film-video" playsinline preload="metadata" controls src="${media(o.final)}#t=0.5" style="aspect-ratio:${e._settings.video.width} / ${e._settings.video.height}"></video>
+      <div class="row" style="margin-top:8px"><a href="${media(o.final)}" download>final.mp4</a>${o.srt ? `<a href="${media(o.srt)}" download>subtitles (.srt)</a>` : ""}
+        ${o.edl ? `<a href="${media(o.edl)}" download>edit list (.edl for DaVinci Resolve)</a>` : ""}${o.animatic ? `<a href="${media(o.animatic)}" download>animatic.mp4</a>` : ""}</div>
+      <p class="muted small">In Resolve: import the takes folders as media, then File > Import > Timeline > the .edl.</p></section>` : `<div class="card empty-film"><b>No final film yet.</b> <span class="muted">Render it below once the takes are ready.</span></div>`}
+
+    <div class="card render-card">
+      ${e.timeline ? `<div class="row"><button class="primary" id="render-edit">${o.final ? "Re-render" : "Render"} saved timeline</button><span class="muted small grow">Uses the clip order, trims, mute settings, music placement and lip-sync choices saved in Takes. <a href="#/s/${ctx.sid}/e/${ctx.eid}/takes">Edit them in Takes</a>.</span></div>`
+        : `<p class="muted small" style="margin-top:0">Each selected take is trimmed, scaled to ${e._settings.video.width}x${e._settings.video.height} @ ${e._settings.video.fps} fps and loudness-normalised, then joined. Wan takes (silent) get a silent track.</p>`}
+    </div>
     <div class="card form-grid ${e.timeline ? 'hidden' : ''}">
       <div><label>Music or voice recording</label><input type="file" id="mfile" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac">
         <div id="music-current" class="small muted">${m.file ? "current: " + esc(m.file.split("/").pop()) : "none"}</div></div>
@@ -624,13 +739,15 @@ async function tabCut(el, ctx) {
         <button id="lip-setup" ${m.file ? "" : "disabled"}>Lip-sync to uploaded audio</button><span class="grow"></span>
         <button class="primary" id="cut">Render final cut</button></div>
     </div>
-    <div class="card row"><button id="voice-dialogue">Voice all dialogue</button><span class="muted small grow">Voices every line with its acting direction (VoiceStudio), checks the words, and puts each line on the timeline as its own lip-sync-guide clip. Unchanged lines are reused.</span></div>
-    ${e.timeline ? `<button class="primary" id="render-edit">Render saved timeline</button><p class="muted small">Uses the clip order, trims, mute settings, music placement and lip-sync choices saved in Takes.</p>` : `<p class="muted small">Each selected take is trimmed, scaled to ${e._settings.video.width}x${e._settings.video.height} @ ${e._settings.video.fps} fps and loudness-normalised, then joined. Wan takes (silent) get a silent track.</p>`}
-    ${o.final ? `<h2>Final film ${o.runtime ? "· " + fmtSec(o.runtime) : ""}</h2>
-      <video playsinline preload="metadata" controls src="${media(o.final)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
-      <div class="row" style="margin-top:8px"><a href="${media(o.final)}" download>final.mp4</a>${o.srt ? `<a href="${media(o.srt)}" download>subtitles (.srt)</a>` : ""}
-        ${o.edl ? `<a href="${media(o.edl)}" download>edit list (.edl for DaVinci Resolve)</a>` : ""}${o.animatic ? `<a href="${media(o.animatic)}" download>animatic.mp4</a>` : ""}</div>
-      <p class="muted small">In Resolve: import the takes folders as media, then File > Import > Timeline > the .edl.</p>` : ""}
+    <h2>Dialogue &amp; sound</h2>
+    <div class="card tool-card">
+      <div class="tool-row"><button id="voice-dialogue">Voice all dialogue</button><span class="muted small">VoiceStudio voices every line with its acting direction, checks the words, and puts each line on the timeline as its own lip-sync guide. Unchanged lines are reused.</span></div>
+      <div class="tool-row"><button id="voice-eleven">Voice with ElevenLabs</button><span class="muted small">Alternative voices for the LTX-2.3 lip-sync engine.</span></div>
+      <div class="tool-row"><button id="make-sfx">Generate sound effects</button><span class="muted small">From each shot's sound description.</span></div>
+      <details><summary>Build a cut automatically</summary>
+        <p class="muted small">Rebuilds the Takes timeline from scratch. Lip-sync cut: each shot speaks its own lines, timed by the pause before each line and the shot's action seconds. Coverage cut: cuts between singles, inserts and the master with the dialogue running underneath.</p>
+        <div class="row"><button id="lipsync-cut">Build cut from lip-sync takes</button><button id="coverage-cut">Build coverage cut</button></div></details>
+    </div>
     ${(o.lipsync_versions || []).map((version, i) => `<div class="card"><h2>Lip-sync preview ${i + 1}</h2>
       <p class="muted small">${esc(version.model)} · ${fmtSec(version.runtime)} · ${esc((version.audio_file || "").split("/").pop())} · ${version.isolated_vocals ? "isolated vocal guide" : "uploaded audio guide"}. The full uploaded music mix is used in this export.</p>
       <video playsinline preload="metadata" controls src="${media(version.file)}" style="width:100%;max-width:1024px;border-radius:8px"></video>
@@ -663,6 +780,10 @@ async function tabCut(el, ctx) {
   });
   $("#cut").onclick = () => startJob(`${ctx.base}/cut`);
   if ($("#voice-dialogue")) $("#voice-dialogue").onclick = () => startJob(`${ctx.base}/dialogue`, {});
+  if ($("#voice-eleven")) $("#voice-eleven").onclick = () => startJob(`${ctx.base}/dialogue_elevenlabs`, {});
+  if ($("#make-sfx")) $("#make-sfx").onclick = () => startJob(`${ctx.base}/sfx`, {});
+  if ($("#lipsync-cut")) $("#lipsync-cut").onclick = () => startJob(`${ctx.base}/lipsync_cut`, {});
+  if ($("#coverage-cut")) $("#coverage-cut").onclick = () => startJob(`${ctx.base}/coverage_cut`, {});
   if ($('#render-edit')) $('#render-edit').onclick = () => startJob(`${ctx.base}/cut`);
   App.refreshers.push(reload);
 }

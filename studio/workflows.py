@@ -5,9 +5,10 @@ Every graph is validated against /object_info before it is queued (comfy.Comfy.r
 """
 
 import copy
+import re
 import os
 
-from . import settings as _settings
+from . import blocking, settings as _settings
 
 
 def _loras(wf: dict, model_ref: list, loras: list[dict], start_id: int) -> list:
@@ -73,8 +74,7 @@ def zimage_image(s: dict, prompt: str, seed: int, width: int, height: int, batch
 
 def qwen_edit_image(s: dict, prompt: str, seed: int, width: int, height: int, batch: int,
                     ref_images: list[str], prefix: str = "studio/frame") -> dict:
-    """Qwen Image Edit 2509 (+Lightning): compose a new picture from up to 3 reference images
-    (character photos), so identity comes from the photos instead of a LoRA."""
+    """Qwen Image Edit 2509 (+Lightning), conditioned on up to three ordered input images."""
     q = s["qwen_edit"]
     wf = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": q["unet"], "weight_dtype": "default"}},
@@ -120,6 +120,69 @@ def qwen_correct_face(s: dict, source_image: str, ref_images: list[str], charact
         f"Character details: {character.get('appearance', '')}")
     return qwen_edit_image(s, prompt, seed, width, height, 1,
                            [source_image, *ref_images[:2]], prefix)
+
+
+def qwen_frame_identity(s: dict, source_image: str, references: list[tuple[dict, dict, str]],
+                        width: int, height: int, seed: int, prefix: str = "studio/frame") -> dict:
+    """Transfer at most two identities onto an already composed frame (image 1)."""
+    if not 1 <= len(references) <= 2:
+        raise ValueError("A frame identity pass needs one or two character references")
+    parts = ["Edit image 1. Image 1 is the composition frame."]
+    for i, (character, role, _) in enumerate(references, 2):
+        position = role.get("position") or ""
+        position = f", {position}," if position else ""
+        appearance = blocking.identity_description(character)
+        parts.append(
+            f"Give {character.get('name') or character['id']}{position} in image 1 the facial identity "
+            f"of the person in image {i}. "
+            + (f"Identify this character in image 1 by their appearance: {appearance}. " if appearance else "")
+            + f"Use image {i} only for this person's face.")
+    parts.append(
+        "Keep every person's exact body pose, head position, head angle, gaze direction, expression "
+        "and placement from image 1. Keep the framing, camera angle, clothing, hair placement, "
+        "hands, props, background, lighting and shadows exactly as in image 1. "
+        "Keep all occlusions and the visible portion of each face; leave hidden faces hidden. "
+        "Preserve all other people and any identities already applied. "
+        "Change only the specified facial identities, naturally lit to match image 1. "
+        "Do not copy the portraits' pose, gaze, expression, framing, clothes or background. "
+        "Do not turn anyone toward the camera or recompose the scene.")
+    return qwen_edit_image(s, " ".join(parts), seed, width, height, 1,
+                           [source_image, *(ref for _, _, ref in references)], prefix)
+
+
+def qwen_frame_insert(s: dict, source_image: str, character: dict, subject: dict, clothes: str, target: str,
+                      reference: str, width: int, height: int, seed: int, prefix: str = "studio/frame") -> dict:
+    """Add one person (a layered subject: behind glass, in another room) into an already composed frame. `target`
+    describes what they look at by its place in the picture: Qwen knows no character names. The portrait in image 2
+    usually smiles into the lens, so the acting comes first and the portrait's expression and gaze are excluded."""
+    name = character.get("name") or character["id"]
+    expression = subject["expression"]
+    if not re.search(r"\b(smil|grin|laugh)", expression, re.I):
+        expression += "; not smiling, lips together"
+    prompt = (f"Edit image 1. Add exactly one person to image 1, {subject['position']}, {subject['depth']}, "
+              f"{subject['zone']} ({subject['space']}). Expression: {expression}. Her or his head and eyes turn toward "
+              f"{target}, {subject['gaze_direction']}; the eyes do NOT look at the viewer or the camera. "
+              f"{subject['pose']}. Facing {subject['facing']}. Visible: {subject['visibility'].replace('_', ' ')}. "
+              f"Wearing {clothes}. {subject.get('wardrobe_state', '')} The face is the facial identity of the person in "
+              "image 2 only: copy the face shape and features, NOT the portrait's smile, expression, head angle, gaze, "
+              f"hair styling, clothes or background. This person is {name}. Match the scale, perspective, focus, light, "
+              "reflections and glass of that spot in image 1. Keep everything else in image 1 exactly as it is: every "
+              "other person, their pose, face and hands, every prop they hold, the framing and the lighting.")
+    return qwen_edit_image(s, prompt, seed, width, height, 1, [source_image, reference], prefix)
+
+
+def qwen_frame_performance(s: dict, source_image: str, who: str, subject: dict, target: str, width: int,
+                           height: int, seed: int, prefix: str = "studio/frame") -> dict:
+    """Text-only edit of one person's expression and gaze. An inserted person inherits the portrait's smile and
+    lens gaze; with no portrait in the conditioning, Qwen changes the acting and keeps the identity."""
+    expression = subject["expression"]
+    if not re.search(r"\b(smil|grin|laugh)", expression, re.I):
+        expression += "; mouth closed, no smile"
+    prompt = (f"Edit image 1. Change ONLY {who}: expression {expression}. Head and eyes turn toward {target}, "
+              f"{subject['gaze_direction']}; the eyes do NOT look at the viewer or the camera. Keep this person's "
+              "identity, face shape, hair, clothes, size and position exactly. Keep everything else in image 1 exactly "
+              "as it is: every other person and their pose, every prop, the framing and the lighting.")
+    return qwen_edit_image(s, prompt, seed, width, height, 1, [source_image], prefix)
 
 
 def _latent(wf, s, vae_id, width, height, batch, init_image, use_sd3_latent):
@@ -345,4 +408,58 @@ def minimax_h3_reference_edit(s: dict, prompt: str, references: list[str], video
     wf.pop("4")
     wf.pop("13")
     wf["14"]["inputs"].pop("audio")
+    return wf
+
+
+def infinitetalk_size(s: dict) -> tuple[int, int]:
+    """The project's shape at the 480p model's pixel budget, multiples of 16."""
+    import math
+    v = s["video"]; ratio = v["width"] / v["height"]; px = float(s["infinitetalk"]["pixels"])
+    return (max(16, round(math.sqrt(px * ratio) / 16) * 16), max(16, round(math.sqrt(px / ratio) / 16) * 16))
+
+
+def infinitetalk(s: dict, image: str, audio: str, prompt: str, frames: int, seed: int, prefix: str = "studio/take") -> dict:
+    """Wan 2.1 I2V + InfiniteTalk (ComfyUI native), one speaker. Chunks of `chunk` frames, each continuing from the
+    last `motion_frames` frames of the one before, so any length plays at the audio's pace (25 fps)."""
+    it = s["infinitetalk"]; W, H = infinitetalk_size(s)
+    LEN, MOTION = int(it["chunk"]), int(it["motion_frames"])
+    neg = "字幕，文字，静止不动，模糊，畸形的脸，多余的手指，背景人很多"
+    wf = {
+        "unet": {"class_type": "UNETLoader", "inputs": {"unet_name": it["unet"], "weight_dtype": "default"}},
+        "lora": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["unet", 0], "lora_name": it["lora"], "strength_model": 1.0}},
+        "shift": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["lora", 0], "shift": float(it["shift"])}},
+        "patch": {"class_type": "ModelPatchLoader", "inputs": {"name": it["patch"]}},
+        "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": it["clip"], "type": "wan"}},
+        "pos": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["clip", 0], "text": prompt}},
+        "neg": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["clip", 0], "text": neg}},
+        "vae": {"class_type": "VAELoader", "inputs": {"vae_name": it["vae"]}},
+        "cvl": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": it["clip_vision"]}},
+        "img": {"class_type": "LoadImage", "inputs": {"image": image}},
+        "cve": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["cvl", 0], "image": ["img", 0], "crop": "none"}},
+        "ael": {"class_type": "AudioEncoderLoader", "inputs": {"audio_encoder_name": it["audio_encoder"]}},
+        "aud": {"class_type": "LoadAudio", "inputs": {"audio": audio}},
+        "ae": {"class_type": "AudioEncoderEncode", "inputs": {"audio_encoder": ["ael", 0], "audio": ["aud", 0]}},
+    }
+    chunks = 1 + max(0, -(-(frames - LEN) // (LEN - MOTION)))
+    prev = None
+    for k in range(chunks):
+        node = {"mode": "single_speaker", "model": ["shift", 0], "model_patch": ["patch", 0], "positive": ["pos", 0],
+                "negative": ["neg", 0], "vae": ["vae", 0], "width": W, "height": H, "length": LEN,
+                "clip_vision_output": ["cve", 0], "start_image": ["img", 0], "audio_encoder_output_1": ["ae", 0],
+                "motion_frame_count": MOTION, "audio_scale": 1.0}
+        if prev:
+            node["previous_frames"] = [prev, 0]
+        wf[f"it{k}"] = {"class_type": "WanInfiniteTalkToVideo", "inputs": node}
+        wf[f"ks{k}"] = {"class_type": "KSampler", "inputs": {"model": [f"it{k}", 0], "positive": [f"it{k}", 1],
+                        "negative": [f"it{k}", 2], "latent_image": [f"it{k}", 3], "seed": int(seed) + k,
+                        "steps": int(it["steps"]), "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}}
+        wf[f"dec{k}"] = {"class_type": "VAEDecode", "inputs": {"samples": [f"ks{k}", 0], "vae": ["vae", 0]}}
+        if prev is None:
+            prev = f"dec{k}"
+        else:
+            wf[f"trim{k}"] = {"class_type": "ImageFromBatch", "inputs": {"image": [f"dec{k}", 0], "batch_index": MOTION, "length": LEN - MOTION}}
+            wf[f"cat{k}"] = {"class_type": "ImageBatch", "inputs": {"image1": [prev, 0], "image2": [f"trim{k}", 0]}}
+            prev = f"cat{k}"
+    wf["vid"] = {"class_type": "CreateVideo", "inputs": {"images": [prev, 0], "fps": float(it["fps"])}}
+    wf["save"] = {"class_type": "SaveVideo", "inputs": {"video": ["vid", 0], "filename_prefix": prefix, "format": "mp4", "codec": "auto"}}
     return wf

@@ -381,7 +381,7 @@ def test_anchor_end_rules():
 
 
 def test_reference_photo_source(client):
-    """Characters with a photo but no LoRA render through Qwen Edit ('auto'/'qwen_refs')."""
+    """Photo identity is applied to each text-only Z-Image composition."""
     c = client
     sid = c.post("/api/series", json={"name": "Photos"}).json()["id"]
     eid = c.post(f"/api/s/{sid}/episodes", json={"title": "Ep"}).json()["id"]
@@ -402,11 +402,18 @@ def test_reference_photo_source(client):
     n0 = len(FakeComfy.prompts)
     wait(c, c.post(f"/api/s/{sid}/e/{eid}/frames", json={}).json())
     wfs = FakeComfy.prompts[n0:]
+    composition = wfs[0]
+    assert composition["1"]["inputs"]["unet_name"] == settings.load()["zimage"]["unet"]
+    assert not any(n["class_type"] == "LoadImage" for n in composition.values())
     qwen = [w for w in wfs if any(n["class_type"] == "TextEncodeQwenImageEditPlus" for n in w.values())]
-    assert qwen, "no Qwen Edit graph was queued"
+    assert len(qwen) == 2, "each composition needs its own Qwen identity edit"
     te = next(n for n in qwen[0].values() if n["class_type"] == "TextEncodeQwenImageEditPlus")["inputs"]
-    assert "image1" in te and "image2" in te
-    assert te["prompt"].startswith("Image 1 is Amin. Image 2 is Mona.")
+    assert all(f"image{i}" in te for i in (1, 2, 3))
+    assert "Image 1 is the composition frame" in te["prompt"]
+    assert "Give Amin, left, in image 1" in te["prompt"]
+    assert "Give Mona, right, in image 1" in te["prompt"]
     e = c.get(f"/api/s/{sid}/e/{eid}").json()
     cand = e["shots"][0]["frame"]["candidates"][0]
     assert cand["source"] == "qwen_refs" and len(cand["refs"]) == 2
+    assert cand["file"] != cand["composition"]
+    assert os.path.isfile(os.path.join(DATA, cand["composition"]))

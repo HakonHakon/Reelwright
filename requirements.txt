@@ -11,3 +11,4 @@ python-multipart
 
 pillow-heif
 numpy
+anthropic>=2.6.0

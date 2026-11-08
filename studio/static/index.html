@@ -14,7 +14,7 @@
 <meta name="color-scheme" content="dark light">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23181a19'/%3E%3Crect x='14' y='4' width='4' height='24' fill='%23d8341f'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/studio.css">
-<script>try { var t = localStorage.getItem("rw-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script>try { var t = localStorage.getItem("rw-theme") || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"); document.documentElement.dataset.theme = t; } catch (e) {}</script>
 </head>
 <body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">

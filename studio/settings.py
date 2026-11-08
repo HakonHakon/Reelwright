@@ -53,7 +53,8 @@ DEFAULTS = {
         "shift": 3.0,
     },
     "qwen_edit": {
-        # "Reference photos" frame source: Qwen Image Edit takes up to 3 images (the shot's characters' refs)
+        # First frames: Z-Image composition, then Qwen identity. Each Qwen pass reserves
+        # one input for the composition; max_refs (up to 3 total inputs) includes it.
         "unet": "qwen_image_edit_2509_fp8_e4m3fn.safetensors",
         "clip": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
         "vae": "qwen_image_vae.safetensors",
@@ -74,6 +75,15 @@ DEFAULTS = {
                     "text on screen, deformed hands, extra fingers, background music, scene cut, jump cut, "
                     "camera cut, transition, new scene, different location, different person, reframing",
     },
+    "infinitetalk": {                 # Wan 2.1 + InfiniteTalk: one face, mouth driven by the shot's voice
+        "unet": "wan2.1_i2v_480p_14B_fp8_scaled.safetensors",
+        "patch": "wan2.1_infiniteTalk_multi_fp16.safetensors",
+        "lora": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+        "clip": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "vae": "wan_2.1_vae.safetensors",
+        "clip_vision": "clip_vision_h.safetensors", "audio_encoder": "wav2vec2-chinese-base_fp16.safetensors",
+        "pixels": 399360,             # ~480x832 portrait / 832x480 landscape (the 480p model)
+        "steps": 6, "shift": 8.0, "chunk": 81, "motion_frames": 9, "fps": 25, "max_seconds": 15,
+    },
     "wan": {
         "high": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
         "low": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
@@ -88,6 +98,13 @@ DEFAULTS = {
         "shift": 5.0,
         "max_seconds": 5,
         "negative": "blurry, static, deformed, extra fingers, watermark, subtitles, text",
+    },
+    "ltx_lipsync": {
+        "template": "workflows/ltx2.3_ia2v_api.json",
+        "max_seconds": 10.5,
+        "pixels": 983040,             # ~1536x640 at 2.4:1, ~720x1280 portrait
+        "first_frame_strength": 1.0,
+        "negative": "",               # "" = built-in: no scene cuts, no new people, no fades
     },
     "minimax_local": {
         "unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
@@ -229,18 +246,26 @@ def lipsync_params(cfg: dict) -> dict:
 
 
 def for_episode(s: dict, episode: dict) -> dict:
-    """Apply a project's portrait/landscape output sizes without changing other projects."""
-    if not episode.get('video') and not episode.get('image'):
+    """Apply a project's portrait/landscape output sizes (and its dialogue-voice engine/language, e.g. a Persian
+    film voiced with OmniVoice) without changing other projects."""
+    if not episode.get('video') and not episode.get('image') and not episode.get('voices'):
         return s
     import math
     result = copy.deepcopy(s)
+    if episode.get('voices'):
+        result['voices'].update(episode['voices'])
     for key in ('video', 'image'):
         if episode.get(key):
             result[key].update(episode[key])
     if episode.get('video'):
         ratio = result['video']['width'] / result['video']['height']
-        h3 = result['minimax_local']
-        pixels = h3['width'] * h3['height']
-        h3['width'] = max(32, round(math.sqrt(pixels * ratio) / 32) * 32)
-        h3['height'] = max(32, round(math.sqrt(pixels / ratio) / 32) * 32)
+        # Engines with their own render size keep their pixel budget but take the project's shape
+        # (Wan needs multiples of 16, MiniMax H3 multiples of 32).
+        for engine, step in (('minimax_local', 32), ('wan', 16)):
+            size = result.get(engine)
+            if not size or not size.get('width') or not size.get('height'):
+                continue
+            pixels = size['width'] * size['height']
+            size['width'] = max(step, round(math.sqrt(pixels * ratio) / step) * step)
+            size['height'] = max(step, round(math.sqrt(pixels / ratio) / step) * step)
     return result

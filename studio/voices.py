@@ -60,6 +60,34 @@ def unload(s: dict) -> None:
         pass
 
 
+def profiles(s: dict) -> list[dict]:
+    """The voice library saved in VoiceStudio (cloned recordings and designed voices), for character casting."""
+    try:
+        r = requests.get(_url(s, "/profiles"), timeout=10)
+    except requests.RequestException as exc:
+        raise VoiceError(f"VoiceStudio is unreachable: {type(exc).__name__}") from None
+    if not r.ok:
+        raise _error(r)
+    out = []
+    for p in r.json():
+        out.append({"id": p["id"], "name": p.get("name") or p["id"], "kind": p.get("kind") or "clone",
+                    "language": p.get("language") or "", "ref_text": p.get("ref_text") or "",
+                    "own_voice": bool(p.get("verified_own_voice")) or p.get("consent_basis") == "own_voice",
+                    "demo": bool(p.get("is_demo"))})
+    return sorted(out, key=lambda p: (p["demo"], p["name"].lower()))
+
+
+def profile_audio(s: dict, profile_id: str) -> bytes:
+    """The reference recording of one VoiceStudio voice profile."""
+    try:
+        r = requests.get(_url(s, f"/profiles/{profile_id}/audio"), timeout=60)
+    except requests.RequestException as exc:
+        raise VoiceError(f"VoiceStudio is unreachable: {type(exc).__name__}") from None
+    if not r.ok or not r.content:
+        raise _error(r)
+    return r.content
+
+
 def instruct_for(s: dict, description: str) -> str:
     """Voice-design tags (e.g. 'male, child, high pitch') from a plain description."""
     r = requests.post(_url(s, "/design/describe"), json={"description": description}, timeout=30)

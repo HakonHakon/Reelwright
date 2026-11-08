@@ -3,7 +3,7 @@
 The LLM never writes final prompts. Editing a bible entry changes every prompt that uses it.
 """
 
-from . import store
+from . import blocking, store
 
 CLOSE_FRAMINGS = {"medium close-up", "close-up", "extreme close-up", "insert"}
 
@@ -42,8 +42,10 @@ def characters_in(shot: dict, bible: dict) -> list[tuple[dict, dict]]:
     return out
 
 
-def image_prompt(shot: dict, bible: dict) -> str:
+def image_prompt(shot: dict, bible: dict, composition: bool = False) -> str:
     """First-frame prompt: a still moment, composition first."""
+    if shot.get("first_frame") is not None:
+        return blocking.image_prompt(shot, bible, composition=composition)
     if shot.get("image_prompt_override"):
         return shot["image_prompt_override"]
     style = bible["style"]
@@ -188,3 +190,11 @@ def location_plate_prompt(loc: dict, variant: str, bible: dict) -> str:
     style = bible["style"]
     return (f"{style.get('look', '')}. Wide establishing shot, no people. "
             f"{_location_text(loc, variant)}. {style.get('grade', '')}")
+
+
+def infinitetalk_prompt(shot: dict, bible: dict) -> str:
+    """What the shot shows; the mouth comes from the audio, so no dialogue words (quoted words get painted as text)."""
+    return (f"{shot.get('framing', '')} shot, camera: {shot.get('camera') or 'static'}. {shot.get('action', '')} "
+            "The person facing the camera speaks only when the voice is heard and listens with lips closed otherwise. "
+            "Same place, same light, same faces and clothes as the first frame. Restrained, natural acting, natural "
+            "blinking. Photorealistic, cinematic.")

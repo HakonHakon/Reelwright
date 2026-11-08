@@ -48,7 +48,7 @@ def voice_reference(job, s, sid, cid, force=False):
         raise ValueError(f"{c['name']} has no voice yet: upload a voice sample or write a voice description "
                          "(e.g. 'a cheerful four-year-old boy, high-pitched child voice') on the character page")
     job.say(f"{c['name']}: designing a voice from '{description}'...")
-    wav, text = voices.design_reference(s, description)
+    wav, text = voices.design_reference(s, description, language="en")    # the reference line is English
     path = os.path.join(store.char_dir(sid, cid), "voice_reference.wav")
     with open(path, "wb") as f:
         f.write(wav)
@@ -65,6 +65,7 @@ def job_design_voice(job, sid, cid, description=""):
         c.setdefault("voice", {})["description"] = description
     c.setdefault("voice", {}).pop("file", None)
     c["voice"].pop("ref_text", None)
+    c["voice"].pop("profile", None)
     store.save_character(sid, c, bump=False)
     _free_gpu(job, s)
     path, _ = voice_reference(job, sid=sid, s=s, cid=cid, force=True)

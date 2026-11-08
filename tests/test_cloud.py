@@ -220,7 +220,7 @@ def test_cloud_frames_render_without_comfyui_and_send_character_refs(client, mon
 
 def test_ai_page_adds_a_connection_and_stores_its_key_privately(client):
     view = client.get("/api/ai").json()
-    assert [c["id"] for c in view["connections"]] == ["openai", "gemini"] and view["presets"]
+    assert [c["id"] for c in view["connections"]] == ["openai", "gemini", "claude", "codex", "claude_code", "fal"] and view["presets"]
     conns = view["connections"] + [{"id": "openrouter", "name": "OpenRouter", "type": "openai_compatible",
                                     "base_url": "https://openrouter.ai/api/v1", "text_model": "some/model",
                                     "extra_models": "other/model, some/image-model"}]
@@ -284,3 +284,51 @@ def test_generate_endpoints_reject_unknown_models(client):
     assert r.status_code == 400 and "nosuch" in r.text
     r = client.post(f"/api/s/{sid}/e/{eid}/frames", json={"source": "img:nosuch"})
     assert r.status_code == 400
+
+
+def test_fal_connection_uses_key_auth_and_its_openrouter_endpoint():
+    c = cloud.get_conn(settings.load(), "fal")
+    assert c["type"] == "openai_compatible" and c["base_url"].startswith("https://fal.run/openrouter")
+    assert cloud._headers(c, "abc") == {"Authorization": "Key abc"}
+    assert cloud._headers(cloud.get_conn(settings.load(), "openai"), "abc") == {"Authorization": "Bearer abc"}
+
+
+def test_codex_connection_runs_the_cli_with_a_strict_schema(monkeypatch, tmp_path):
+    import subprocess
+    seen = {}
+
+    def fake_run(cmd, input, capture_output, text, cwd, timeout):
+        seen["cmd"], seen["prompt"] = cmd, input
+        seen["schema"] = json.load(open(cmd[cmd.index("--output-schema") + 1]))
+        with open(cmd[cmd.index("-o") + 1], "w") as f:
+            json.dump({"value": "trust"}, f)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    exe = tmp_path / "codex"; exe.write_text("")
+    monkeypatch.setattr(cloud, "CODEX_PATHS", (str(exe),))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out = cloud.chat_json(settings.load(), "codex", "SYS", "USER",
+                          {"type": "object", "properties": {"value": {"type": "string"}, "extra": {"type": "string"}}})
+    assert out == {"value": "trust"}
+    assert seen["cmd"][:2] == [str(exe), "exec"] and "read-only" in seen["cmd"] and seen["cmd"][-1] == "-"
+    assert seen["schema"]["required"] == ["value", "extra"] and seen["schema"]["additionalProperties"] is False
+    assert "SYS" in seen["prompt"] and "USER" in seen["prompt"]
+
+
+def test_claude_code_connection_runs_the_cli_without_tools(monkeypatch, tmp_path):
+    import subprocess
+    seen = {}
+
+    def fake_run(cmd, input, capture_output, text, cwd, timeout):
+        seen["cmd"], seen["prompt"] = cmd, input
+        return subprocess.CompletedProcess(cmd, 0, json.dumps({"is_error": False, "structured_output": {"value": "x"}}), "")
+
+    exe = tmp_path / "claude"; exe.write_text("")
+    monkeypatch.setattr(cloud, "CLAUDE_PATHS", (str(exe),))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out = cloud.chat_json(settings.load(), "claude_code", "SYS", "USER",
+                          {"type": "object", "properties": {"value": {"type": "string"}}})
+    assert out == {"value": "x"} and seen["prompt"] == "USER"
+    cmd = seen["cmd"]
+    assert cmd[:2] == [str(exe), "-p"] and cmd[cmd.index("--tools") + 1] == "" and cmd[cmd.index("--system-prompt") + 1] == "SYS"
+    assert json.loads(cmd[cmd.index("--json-schema") + 1])["additionalProperties"] is False

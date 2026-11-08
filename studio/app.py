@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
-from . import beats, cloud, dialogue, jobs, llm, media, planner, prompts, store, providers, timeline, voices
+from . import beats, blocking, cloud, dialogue, jobs, llm, media, planner, prompts, store, providers, timeline, voices
 from . import settings as settings_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +23,8 @@ EDITABLE_SHOT_FIELDS = {
     "scene_id", "location_id", "time_of_day", "framing", "camera", "characters", "action", "dialogue",
     "sound", "action_seconds", "duration_s", "duration_locked", "start_mode", "frame_source", "engine",
     "video_model", "image_prompt_extra", "motion_prompt_extra", "image_prompt_override", "motion_prompt_override", "notes",
+    "cover", "cutaway", "cue_line", "frame_from", "post_sync", "face",
+    "first_frame", "screen_text",
 }
 
 
@@ -104,7 +106,7 @@ def _required_model_options(s):
     if "flux_lora" in sources:
         require("UNETLoader", "unet_name", s["flux"]["unet"])
         require("VAELoader", "vae_name", s["flux"]["vae"])
-    if "zimage" in sources:
+    if sources & {"zimage", "qwen_refs"}:
         require("UNETLoader", "unet_name", s["zimage"]["unet"])
         require("CLIPLoader", "clip_name", s["zimage"]["clip"])
         require("VAELoader", "vae_name", s["zimage"]["vae"])
@@ -379,6 +381,7 @@ async def char_upload(sid: str, cid: str, kind: str = Form("ref"), file: UploadF
         c["voice"]["file"] = store.rel(p)
         c["voice"].pop("ref_text", None)          # transcribed again for dialogue cloning
         c["voice"]["designed"] = False
+        c["voice"].pop("profile", None)
         return store.save_character(sid, c, bump=True)
     p = await _save_upload(file, os.path.join(store.char_dir(sid, cid), "refs"))
     c["refs"] = (c.get("refs") or []) + [store.rel(p)]
@@ -408,6 +411,41 @@ def char_voice(sid: str, cid: str, body: dict = Body(default={})):
     if not voices.health(_s()):
         raise HTTPException(400, "VoiceStudio is not running (systemctl --user start reelwright-voice)")
     return _submit("voice", f"Voice: {c['name']}", dialogue.job_design_voice, sid=sid, cid=cid, description=desc)
+
+
+@app.get("/api/voices/profiles")
+def voice_profiles():
+    """Voices saved in VoiceStudio's library, to cast onto characters."""
+    try:
+        return voices.profiles(_s())
+    except voices.VoiceError as exc:
+        raise HTTPException(400, f"{exc}. Start it with: systemctl --user start reelwright-voice") from None
+
+
+@app.post("/api/s/{sid}/characters/{cid}/voice/profile")
+def char_voice_profile(sid: str, cid: str, body: dict = Body(...)):
+    """Cast a VoiceStudio voice profile {profile_id} as the character's reference voice."""
+    c = store.get_character(sid, cid) or _404("character")
+    pid = str(body.get("profile_id") or "").strip()
+    try:
+        prof = next((p for p in voices.profiles(_s()) if p["id"] == pid), None)
+        if prof is None:
+            raise HTTPException(404, f"VoiceStudio has no voice '{pid}'")
+        wav = voices.profile_audio(_s(), pid)
+    except voices.VoiceError as exc:
+        raise HTTPException(400, str(exc)) from None
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", pid)
+    path = os.path.join(store.char_dir(sid, cid), f"voice_vs_{safe}.wav")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(wav)
+    v = c.setdefault("voice", {})
+    v.update(file=store.rel(path), designed=False, profile={"id": pid, "name": prof["name"]})
+    if prof["ref_text"]:
+        v["ref_text"] = prof["ref_text"]
+    else:
+        v.pop("ref_text", None)                  # transcribed when the dialogue is voiced
+    return store.save_character(sid, c, bump=False)   # takes are keyed on the audio, frames stay valid
 
 
 @app.post("/api/s/{sid}/characters/{cid}/sheet")
@@ -474,7 +512,7 @@ def _decorate(sid: str, e: dict) -> dict:
         engine = sh.get("engine") or b["style"].get("default_engine") or "ltx"
         sh["_engine"] = engine
         sh["_source"] = prompts.frame_source(sh, b) if sh.get("start_mode") == "new" else sh.get("start_mode")
-        sh["_image_prompt"] = prompts.image_prompt(sh, b)
+        sh["_image_prompt"] = prompts.image_prompt(sh, b, composition=jobs._resolve_source(sh, b) == "qwen_refs")
         sh["_motion_prompt"] = prompts.motion_prompt(sh, b, engine)
         sig = store.bible_signature(b, sh)
         sh["_stale"] = bool(sh["frame"].get("candidates")) and sh["frame"].get("bible_sig") not in ("", sig)
@@ -519,9 +557,69 @@ def ep_dialogue(sid: str, eid: str, body: dict = Body(default={})):
                    shot_ids=body.get("shot_ids") or None)
 
 
+@app.post("/api/s/{sid}/e/{eid}/dialogue_elevenlabs")
+def ep_dialogue_elevenlabs(sid: str, eid: str, body: dict = Body(default={})):
+    """Voice every line with ElevenLabs (each character's designed voice), the line's emotion as stage direction."""
+    _ep(sid, eid)
+    return _submit("dialogue", f"ElevenLabs dialogue {eid}", jobs.job_dialogue_elevenlabs, sid=sid, eid=eid,
+                   shot_ids=body.get("shot_ids") or None)
+
+
+@app.post("/api/s/{sid}/e/{eid}/sfx")
+def ep_sfx(sid: str, eid: str, body: dict = Body(default={})):
+    """Sound effects for each shot's selected take (MMAudio, from the picture and the shot's sound notes)."""
+    _ep(sid, eid)
+    return _submit("sfx", f"Sound effects {eid}", jobs.job_sfx, sid=sid, eid=eid, shot_ids=body.get("shot_ids") or None)
+
+
+@app.post("/api/s/{sid}/e/{eid}/coverage_cut")
+def ep_coverage_cut(sid: str, eid: str):
+    _ep(sid, eid)
+    return _submit("cut", f"Coverage cut {eid}", jobs.job_coverage_cut, sid=sid, eid=eid)
+
+
+@app.post("/api/s/{sid}/e/{eid}/lipsync_cut")
+def ep_lipsync_cut(sid: str, eid: str):
+    """Build the Cut timeline from the lip-sync takes: picture, one dialogue lane per speaker, sound-effect beds."""
+    _ep(sid, eid)
+    return _submit("cut", f"Lip-sync cut {eid}", jobs.job_lipsync_cut, sid=sid, eid=eid)
+
+
+@app.post("/api/s/{sid}/e/{eid}/write_episode")
+def ep_write_episode(sid: str, eid: str, body: dict = Body(...)):
+    _ep(sid, eid)
+    prev = str(body.get("previous") or "")
+    if prev:
+        _ep(sid, prev)
+    return _submit("plan", f"Write episode {eid}", jobs.job_write_episode, sid=sid, eid=eid,
+                   number=int(body.get("number") or 1), ep_title=str(body.get("title") or ""), previous_eid=prev,
+                   model=_text_choice(body))
+
+
+@app.post("/api/s/{sid}/e/{eid}/plan_cards")
+def ep_plan_cards(sid: str, eid: str, body: dict = Body(default={})):
+    _ep(sid, eid)
+    return _submit("plan", f"Story spine and scene cards {eid}", jobs.job_plan_cards, sid=sid, eid=eid,
+                   model=_text_choice(body))
+
+
+@app.post("/api/s/{sid}/e/{eid}/plan_shots")
+def ep_plan_shots(sid: str, eid: str, body: dict = Body(default={})):
+    _ep(sid, eid)
+    return _submit("plan", f"Shot design {eid}", jobs.job_plan_shots, sid=sid, eid=eid, model=_text_choice(body),
+                   review=bool(body.get("review", True)))
+
+
 @app.post("/api/s/{sid}/e/{eid}/plan")
 def ep_plan(sid: str, eid: str, body: dict = Body(default={})):
     return _submit("plan", f"Plan {eid}", jobs.job_plan, sid=sid, eid=eid, model=_text_choice(body))
+
+
+@app.post("/api/s/{sid}/e/{eid}/block_shots")
+def ep_block_shots(sid: str, eid: str, body: dict = Body(default={})):
+    _ep(sid, eid)
+    return _submit("plan", f"First-frame blocking {eid}", jobs.job_block_shots, sid=sid, eid=eid,
+                   model=_text_choice(body))
 
 
 @app.post("/api/s/{sid}/e/{eid}/replan/{scene_id}")
@@ -535,11 +633,16 @@ def ep_shots(sid: str, eid: str, body: list = Body(...)):
     s = _s()
     b = store.bible(sid)
 
+    current = {shot["id"]: shot for shot in _ep(sid, eid)["shots"]}
     for inc in body:
         try:
             providers.validate_model(inc.get("engine") or b["style"].get("default_engine") or "ltx", inc.get("video_model") or "")
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        merged = {**current.get(inc.get("id") or inc.get("_copy_of"), {}), **inc}
+        errors = blocking.validate(merged, b)
+        if errors:
+            raise HTTPException(400, f"{inc.get('id') or 'Shot'}: " + "; ".join(errors))
     def apply(e):
         old = {sh["id"]: sh for sh in e["shots"]}
         new_list = []
@@ -591,7 +694,7 @@ def ep_vision(sid: str, eid: str, body: dict = Body(default={})):
     e = _ep(sid, eid)
     ids = body.get("shot_ids") or [sh["id"] for sh in e["shots"]]
     return _submit("vision", f"Vision check {eid}", jobs.job_vision, sid=sid, eid=eid, shot_ids=ids,
-                   model=_text_choice(body))
+                   model=_text_choice(body), force=bool(body.get("force")))
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/upload_frame")

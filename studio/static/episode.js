@@ -69,7 +69,7 @@ const reload = () => (App.soft ? App.soft() : route());
 async function setGate(ctx, gate, value) { await POST(`${ctx.base}/gate`, { gate, value }); toast(value ? "Approved." : "Gate reopened."); reload(); }
 /** Frame-source values for the shot editor: local sources, the cloud image models, and the current value. */
 function frameSourceValues(cur) {
-  const v = ["", "flux_lora", "zimage", "qwen_refs", ...(App.ai?.choices.image || []).map((c) => c.source), "auto", "upload"];
+  const v = ["", "flux_lora", "zimage", "qwen_refs", "qwen_2511", ...(App.ai?.choices.image || []).map((c) => c.source), "auto", "upload"];
   if (cur && !v.includes(cur)) v.push(cur);
   return v;
 }
@@ -435,7 +435,7 @@ async function tabFrames(el, ctx) {
     <div class="toolbar">
       <div class="tb-group">
         <button class="${needs ? "primary" : ""}" id="render-missing" ${needs ? "" : "disabled title=\"Every shot already has a frame\""}>Render missing frames</button>
-        <select id="src-override" aria-label="Frame source"><option value="">Per-shot source</option><option value="flux_lora">Force Flux + LoRA</option><option value="zimage">Force Z-Image</option><option value="qwen_refs">Force Z-Image + Qwen identity</option>${imageOptions("Force ")}</select>
+        <select id="src-override" aria-label="Frame source"><option value="">Per-shot source</option><option value="flux_lora">Force Flux + LoRA</option><option value="zimage">Force Z-Image</option><option value="qwen_refs">Force Z-Image + Qwen identity</option><option value="qwen_2511">Force Qwen 2511 from photos</option>${imageOptions("Force ")}</select>
         <label class="row small" style="margin:0;gap:6px">Check with ${textPicker("check-model", "vision", "Model that checks rendered frames")}</label>
       </div>
       <div class="tb-group">
@@ -497,7 +497,7 @@ function frameCard(ctx, sh) {
       <span class="chip accent">${sourceLabel(sh._source)}</span>${sh._loras.length ? `<span class="chip" title="${esc(sh._loras.map((l) => l.name + " @" + l.strength).join("\n"))}">${sh._loras.length} LoRA</span>` : ""}
       ${sh._stale ? `<span class="chip warn" title="bible changed since these frames were made">stale</span>` : ""}
       ${sh.frame.locked ? `<span class="chip good">locked</span>` : ""}${needs ? `<span class="chip warn">pick a frame</span>` : ""}<span class="grow"></span>
-      ${chained ? "" : `<select id="src-${sh.id}"><option value="">${sourceLabel(sh._source)}</option><option value="flux_lora">Flux + LoRA</option><option value="zimage">Z-Image</option><option value="qwen_refs">Z-Image + Qwen identity</option>${imageOptions()}</select>
+      ${chained ? "" : `<select id="src-${sh.id}"><option value="">${sourceLabel(sh._source)}</option><option value="flux_lora">Flux + LoRA</option><option value="zimage">Z-Image</option><option value="qwen_refs">Z-Image + Qwen identity</option><option value="qwen_2511">Qwen 2511 from photos</option>${imageOptions()}</select>
       <button data-render="1" data-shot="${sh.id}">Render ${ctx.e._settings.candidates_per_shot} more</button>
       <label class="btn file-pick" style="margin:0;color:var(--ink)">Upload photo<input type="file" accept="image/*,.heic,.heif" data-upframe="${sh.id}" aria-label="Upload photo for ${esc(sh.id)}"></label>`}
       <button data-lock="${sh.frame.locked ? 0 : 1}" data-shot="${sh.id}">${sh.frame.locked ? "Unlock" : "Lock"}</button></div>

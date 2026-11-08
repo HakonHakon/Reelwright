@@ -81,7 +81,7 @@ def frame_project(tmp_path, monkeypatch):
     return sid, eid, comfy, roles
 
 
-@pytest.mark.parametrize("source", ["qwen_refs", "auto", "override"])
+@pytest.mark.parametrize("source", ["qwen_refs", "override"])     # "auto" now means Qwen 2511
 def test_reference_frames_compose_then_apply_identity(frame_project, source):
     sid, eid, comfy, _ = frame_project
     def configure(ep):
@@ -238,3 +238,9 @@ def test_without_the_identity_pass_a_passing_composition_is_the_candidate(frame_
     candidates = store.get_episode(sid, eid)["shots"][0]["frame"]["candidates"]
     assert len(candidates) == 2 and all(c["identity_prompts"] == [] for c in candidates)
     assert all(os.path.basename(c["file"]).startswith("c") for c in candidates)
+
+
+def test_auto_source_draws_from_the_photos_with_qwen_2511(frame_project):
+    sid, eid, comfy, _ = frame_project
+    store.update_episode(sid, eid, lambda ep: ep["shots"][0].update(frame_source="auto"))
+    assert jobs._resolve_source(store.get_episode(sid, eid)["shots"][0], store.bible(sid)) == "qwen_2511"

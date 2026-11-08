@@ -88,7 +88,7 @@ DEFAULT_STYLE = {
     "aspect": "16:9",
     "negative": "photorealistic, text, watermark, logo, subtitles, deformed hands, extra fingers",
     "music_policy": "no music in shots; score added at the cut",
-    "default_frame_source": "flux_lora",
+    "default_frame_source": "qwen_2511",     # falls back to Z-Image text for shots with no visible face
     "default_engine": "infinitetalk",
     "version": 1,
 }

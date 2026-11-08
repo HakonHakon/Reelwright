@@ -367,7 +367,7 @@ def to_studio_shots(b, card, designed):
             time_of_day=planner._match_tod(b, card), framing=sh.get("framing", "medium"),
             camera=sh.get("camera") or "static, eye level", characters=chars, dialogue=lines,
             action=sh.get("action", ""), sound=sh.get("sound", ""), face=face, engine=engine,
-            frame_source="qwen_refs" if chars else "zimage", first_frame=sh["first_frame"],
+            frame_source="qwen_2511" if chars else "zimage", first_frame=sh["first_frame"],
             screen_text=(sh.get("screen_text") or "").strip(),
             duration_s=seconds, duration_locked=bool(seconds), action_seconds=seconds or 0.8,
             notes=sh.get("purpose", "")))

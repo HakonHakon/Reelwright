@@ -531,7 +531,7 @@ def dialogue_blocking(episode, b, scene_id, sides=None):
     first = lambda cid: (look[cid][0].get("name") or cid).split()[0]
     pos = lambda: [{"id": c["id"], "position": side[c["id"]], "outfit": c.get("outfit", "default")} for c in cast]
     base = dict(scene_id=scene_id, location_id=old[0].get("location_id"), time_of_day=old[0].get("time_of_day"),
-                frame_source="qwen_refs", engine="ltx_lipsync")
+                frame_source="qwen_2511", engine="ltx_lipsync")
     a, c2 = cast[0]["id"], cast[1]["id"]
     shots = [new_shot(id=f"{scene_id}_TS01", framing="two-shot", camera="static, eye level", characters=pos(),
                       dialogue=[], duration_s=3.0, duration_locked=True, action_seconds=3.0,

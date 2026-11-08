@@ -180,7 +180,7 @@ const imageOptions = (prefix = "") => (App.ai?.choices.image || []).map((c) =>
 
 function sourceLabel(s) {
   if (s && s.startsWith("img:")) return aiImageLabel(s) || s.slice(4).replace(":", " · ");
-  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Z-Image + Qwen identity", qwen_edit: "Qwen Edit from photo", qwen_2511: "Qwen 2511 from photos", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master", openai_image: "ChatGPT image (OpenAI)", gemini_image: "Gemini image (Google)" }[s] || s || "inherit";
+  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Z-Image + Qwen identity", qwen_edit: "Qwen Edit from photo", qwen_2511: "Qwen 2511 from photos", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > Qwen 2511 from photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master", openai_image: "ChatGPT image (OpenAI)", gemini_image: "Gemini image (Google)" }[s] || s || "inherit";
 }
 
 // ── sidebar ──────────────────────────────────────────────────────────────

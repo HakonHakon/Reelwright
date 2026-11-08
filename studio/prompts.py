@@ -201,8 +201,9 @@ def frame_source(shot: dict, bible: dict) -> str:
     for c, _ in characters_in(shot, bible):
         if c.get("frame_source"):
             return c["frame_source"]
-        if (c.get("image_lora") or {}).get("name"):
-            return bible["style"].get("default_frame_source") or "flux_lora"
+        if (c.get("image_lora") or {}).get("name"):     # a trained LoRA beats photos: keep Flux for those characters
+            src = bible["style"].get("default_frame_source") or "flux_lora"
+            return "flux_lora" if src in ("qwen_2511", "qwen_refs") else src
     src = bible["style"].get("default_frame_source") or "flux_lora"
     # Shots without any LoRA character gain nothing from Flux; Z-Image is faster.
     return "zimage" if src == "flux_lora" and not image_loras(shot, bible, 1.0) else src

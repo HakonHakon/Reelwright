@@ -232,12 +232,12 @@ def qwen2511_prompt(sh, b, refs) -> str:
 
 def _resolve_source(sh, b) -> str:
     """prompts.frame_source plus the 'auto' choice: LoRA characters -> Flux, else reference photos
-    -> Z-Image composition + Qwen identity, else Z-Image."""
+    -> Qwen 2511 drawing from the photos, else Z-Image."""
     src = prompts.frame_source(sh, b)
     if src == "auto":
         if prompts.image_loras(sh, b, 1.0):
             return "flux_lora"
-        return "qwen_refs" if _character_refs(sh, b) else "zimage"
+        return "qwen_2511" if _character_refs(sh, b) else "zimage"
     return src
 
 

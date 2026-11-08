@@ -186,6 +186,23 @@ def character_sheet_prompts(c: dict, bible: dict) -> list[tuple[str, str]]:
     ]
 
 
+def qwen_sheet_prompts(c: dict) -> list[tuple[str, str, tuple[int, int]]]:
+    """(view, Qwen Edit prompt, (width, height)) for a sheet redrawn from the character's photo (image 1)."""
+    keep = (f"Image 1 is {c.get('name') or 'the person'}. Show this exact same person: identical face, facial "
+            "features, hair, skin tone, age and body build. A new photograph, not a copy of image 1: plain light grey "
+            "studio background, soft even light, neutral relaxed expression, photorealistic, sharp focus.")
+    head, full = (1024, 1024), (832, 1216)
+    return [
+        ("front", f"{keep} Front view, head and shoulders, facing the camera, looking into the lens.", head),
+        ("three_quarter", f"{keep} Three-quarter view: head and body turned 45 degrees to the left, head and "
+                          "shoulders.", head),
+        ("profile", f"{keep} Side profile: head turned 90 degrees to the left, we see one side of the face, "
+                    "head and shoulders.", head),
+        ("full_body", f"{keep} Full body from head to feet, standing upright, front view, arms relaxed, the "
+                      "whole outfit visible.", full),
+    ]
+
+
 def location_plate_prompt(loc: dict, variant: str, bible: dict) -> str:
     style = bible["style"]
     return (f"{style.get('look', '')}. Wide establishing shot, no people. "

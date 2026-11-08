@@ -180,7 +180,7 @@ const imageOptions = (prefix = "") => (App.ai?.choices.image || []).map((c) =>
 
 function sourceLabel(s) {
   if (s && s.startsWith("img:")) return aiImageLabel(s) || s.slice(4).replace(":", " · ");
-  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Z-Image + Qwen identity", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master", openai_image: "ChatGPT image (OpenAI)", gemini_image: "Gemini image (Google)" }[s] || s || "inherit";
+  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Z-Image + Qwen identity", qwen_edit: "Qwen Edit from photo", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master", openai_image: "ChatGPT image (OpenAI)", gemini_image: "Gemini image (Google)" }[s] || s || "inherit";
 }
 
 // ── sidebar ──────────────────────────────────────────────────────────────
@@ -589,10 +589,10 @@ async function viewCharacter(view, sid, cid) {
     <div class="cards">${(c.refs || []).map((r) => `<div class="card"><img class="thumb square" src="${media(r)}" data-zoom="${media(r)}"><button class="link danger" data-unref="${esc(r)}">remove</button></div>`).join("") || `<p class="muted">None yet. Render a character sheet below and approve the best images, or upload your own.</p>`}</div>
     <div class="row" style="margin-top:8px"><input type="file" id="ref-file" accept="image/*"><button id="ref-up">Upload reference</button></div>
     <h2>Character sheet</h2>
-    <div class="row"><button class="primary" id="sheet-flux">Render sheet with Flux + LoRA</button><button id="sheet-z">Render with Z-Image</button>${imageOptions() ? `<span class="row"><select id="sheet-cloud" aria-label="Cloud image model">${imageOptions()}</select><button id="sheet-cloud-go" title="Keeps the face of the first reference photo">Render with this model</button></span>` : ""}
+    <div class="row"><button class="primary" id="sheet-qwen" title="Redraws the first reference photo in each view, so the sheet keeps the real face">Render from photo (Qwen Edit)</button><button id="sheet-flux">Render with Flux + LoRA</button><button id="sheet-z">Render with Z-Image</button>${imageOptions() ? `<span class="row"><select id="sheet-cloud" aria-label="Cloud image model">${imageOptions()}</select><button id="sheet-cloud-go" title="Keeps the face of the first reference photo">Render with this model</button></span>` : ""}
       <span class="muted small">Front, three-quarter, full body, profile. Save first if you changed the description.</span></div>
     <div class="cards" style="margin-top:12px">${(c.sheet || []).slice().reverse().map((s) => `<div class="card"><img class="thumb square" src="${media(s.file)}" data-zoom="${media(s.file)}">
-      <div class="row small muted" style="margin-top:6px"><span class="grow">${esc(s.view)} · ${sourceLabel(s.source)}</span>
+      <div class="row small muted" style="margin-top:6px"><span class="grow">${esc(s.view)} · ${sourceLabel(s.source)}${s.likeness != null ? ` · <span title="Face match with the photo (detector). Below 0.3 may not read as this person; 0.8+ looks copied.">likeness ${s.likeness}</span>` : ""}</span>
       ${(c.refs || []).includes(s.file) ? `<span class="chip good">reference</span>` : `<button data-ref="${esc(s.file)}">Use as reference</button>`}</div></div>`).join("")}</div>`;
   const collect = () => ({
     name: $("#f-name").value, trigger: $("#f-trigger").value.trim(), appearance: $("#f-app").value.trim(),
@@ -606,6 +606,7 @@ async function viewCharacter(view, sid, cid) {
   });
   $("#save").onclick = async () => { await PUT(`/api/s/${sid}/characters/${cid}`, collect()); toast("Saved. Shots using this character are now marked stale."); route(); };
   $("#del").onclick = async () => { if (await ask(`Delete ${c.name}? Files are kept in a .deleted folder.`, "Delete", true)) { await api("DELETE", `/api/s/${sid}/characters/${cid}`); location.hash = `#/s/${sid}`; } };
+  $("#sheet-qwen").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: "qwen_refs" });
   $("#sheet-flux").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: "flux_lora" });
   $("#sheet-z").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: "zimage" });
   if ($("#sheet-cloud-go")) $("#sheet-cloud-go").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: $("#sheet-cloud").value });

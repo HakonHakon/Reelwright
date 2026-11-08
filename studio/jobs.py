@@ -402,9 +402,11 @@ def job_character_sheet(job, sid, cid, source="flux_lora"):
     loras = []
     if source == "flux_lora" and (ch.get("image_lora") or {}).get("name"):
         loras = [{"name": ch["image_lora"]["name"], "strength": float(ch["image_lora"].get("strength", 0.9))}]
+    out_dir = os.path.join(store.char_dir(sid, cid), "sheet")
+    if source == "qwen_refs":
+        return _qwen_character_sheet(job, s, c, sid, ch, out_dir)
     views = prompts.character_sheet_prompts(ch, b)
     job.progress = [0, len(views)]
-    out_dir = os.path.join(store.char_dir(sid, cid), "sheet")
     new = []
     for i, (view, prompt) in enumerate(views):
         job.check()
@@ -421,6 +423,46 @@ def job_character_sheet(job, sid, cid, source="flux_lora"):
     cur["sheet"] = (cur.get("sheet") or []) + new
     store.save_character(sid, cur, bump=False)
     job.say(f"Done: {len(new)} sheet images. Approve the good ones as references.")
+
+
+def _qwen_character_sheet(job, s, c, sid, ch, out_dir):
+    """Local sheet FROM the character's photo: Qwen Image Edit redraws the same person in each view, so the sheet
+    has the photo's face (text-only Z-Image/Flux sheets invent a new one). Each view is scored against the photo
+    with the face detector; low scores are flagged rather than dropped (profiles score lower by nature)."""
+    from . import detect
+    photo = next((r for r in (ch.get("refs") or []) if os.path.exists(store.abs_media(r))), None)
+    if not photo:
+        raise ValueError(f"{ch.get('name')}: upload a photo first - the local sheet is drawn from it.")
+    name = c.upload(store.abs_media(photo), f"studio_sheet_{uuid.uuid4().hex[:8]}{os.path.splitext(photo)[1]}")
+    views = prompts.qwen_sheet_prompts(ch)
+    job.progress = [0, len(views)]
+    new = []
+    for i, (view, prompt, (w, h)) in enumerate(views):
+        job.check()
+        seed = _seed()
+        job.say(f"Rendering {view} from {os.path.basename(photo)} (Qwen Edit)...")
+        wf = workflows.qwen_edit_image(s, prompt, seed, w, h, 1, [name], f"studio/{sid}/{ch['id']}_{view}")
+        res = c.run(wf, cancel=lambda: job.cancel_flag)
+        for p in _save_outputs(c, res["images"], out_dir, f"{view}_"):
+            entry = {"file": store.rel(p), "view": view, "seed": seed, "source": "qwen_edit", "from": photo}
+            try:
+                sims = [f["sims"].get(ch["id"], 0) for f in detect.analyze(p, {ch["id"]: [store.abs_media(photo)]})["faces"]]
+                entry["likeness"] = round(max(sims), 3) if sims else None
+            except Exception as exc:          # detector models missing offline: the sheet is still usable
+                job.say(f"  likeness not measured: {exc}")
+            if entry.get("likeness") is not None and entry["likeness"] >= detect.PASTED:
+                job.say(f"  {view}: likeness {entry['likeness']} - looks like the photo copied, not redrawn")
+            elif entry.get("likeness") is not None and entry["likeness"] < detect.RESEMBLES:
+                job.say(f"  {view}: likeness {entry['likeness']} - may not read as {ch.get('name')}")
+            else:
+                job.say(f"  {view}: likeness {entry.get('likeness')}")
+            new.append(entry)
+        job.progress = [i + 1, len(views)]
+    c.free()
+    cur = store.get_character(sid, ch["id"])
+    cur["sheet"] = (cur.get("sheet") or []) + new
+    store.save_character(sid, cur, bump=False)
+    job.say(f"Done: {len(new)} sheet images drawn from the photo. Approve the good ones as references.")
 
 
 def job_location_plate(job, sid, lid, variant, source="zimage", count=4):

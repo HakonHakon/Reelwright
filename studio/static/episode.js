@@ -80,6 +80,22 @@ const gateBtn = (ctx, gate, label) => ctx.e.gates[gate]
   : `<button class="primary" data-gate="${gate}" data-label="${esc(label)}" data-val="1">Approve ${label}</button>`;
 
 /** Replace just the cards that changed. Untouched cards keep their DOM, scroll position and playing video. */
+// Frame and take cards fold to their header, like the shot list. They start folded; what you open stays open
+// across repaints and reloads of the tab.
+const openCards = { frames: new Set(), takes: new Set() };
+const foldBtn = (kind, id) => { const on = openCards[kind].has(id);
+  return `<button class="sr-toggle" data-card-fold="${esc(id)}" aria-expanded="${on}" aria-label="${on ? "Collapse" : "Expand"} ${esc(id)}">${ic("chev")}</button>`; };
+const foldAllLabel = (kind) => (openCards[kind].size ? "Collapse all" : "Expand all");
+// Wire the per-card toggles and the "Expand all" button. Returns true when the click was a fold click.
+function foldClick(ev, el, ctx, kind, list, make) {
+  const t = ev.target.closest("[data-card-fold]"), all = ev.target.closest("[data-fold-all]");
+  if (!t && !all) return false;
+  const set = openCards[kind];
+  if (t) { const id = t.dataset.cardFold; set.has(id) ? set.delete(id) : set.add(id); repaintCards(list, ctx, [id], make); }
+  else { const ids = ctx.e.shots.map((s) => s.id); if (set.size) set.clear(); else ids.forEach((id) => set.add(id)); repaintCards(list, ctx, ids, make); }
+  $$("[data-fold-all]", el).forEach((b) => { b.textContent = foldAllLabel(kind); });
+  return true;
+}
 function repaintCards(root, ctx, ids, make) {
   if (!root) return;
   for (const id of ids) {
@@ -447,7 +463,7 @@ async function tabFrames(el, ctx) {
     </div>
     <p class="status-line">${framesStatus(ctx).html}</p>
     <p class="muted small">Z-Image + Qwen identity: Z-Image Turbo composes the shot from text, then Qwen Edit applies the reference faces while preserving pose, gaze and framing.</p>
-    <div class="list-bar"><label class="row small" style="margin:0"><input type="checkbox" id="only-needs"> Only shots that still need a frame</label></div>
+    <div class="list-bar"><button data-fold-all="1">${foldAllLabel("frames")}</button><label class="row small" style="margin:0"><input type="checkbox" id="only-needs"> Only shots that still need a frame</label></div>
     <div id="frames-list">${shots.map((sh) => frameCard(ctx, sh)).join("")}</div>`;
   ctx.repaint = (ids) => {
     repaintCards($("#frames-list", el), ctx, ids, frameCard);
@@ -466,6 +482,7 @@ async function tabFrames(el, ctx) {
     toast(`Matched ${r.matched.length}${r.skipped.length ? `, skipped ${r.skipped.join(", ")}` : ""}`); reload();
   };
   el.onclick = async (ev) => {
+    if (foldClick(ev, el, ctx, "frames", $("#frames-list", el), frameCard)) return;
     const t = ev.target, ds = t.dataset;
     if (ds.zoom) zoom(ds.zoom);
     if (t.classList.contains("shot-desc")) t.classList.toggle("open");
@@ -492,8 +509,9 @@ function frameCard(ctx, sh) {
   const cands = sh.frame.candidates || [];
   const chained = sh.start_mode === "chain";
   const needs = !chained && sh.frame.selected == null;
-  return `<div class="shot-card ${sh.frame.locked ? "locked" : ""} ${needs ? "needs" : ""}" data-card="${esc(sh.id)}">
-    <div class="shot-head"><span class="id">${esc(sh.id)}</span><span class="muted">${esc(sh.framing)} · ${who || "no characters"} · ${fmtDur(sh.duration_s)}</span>
+  const folded = !openCards.frames.has(sh.id);
+  return `<div class="shot-card ${sh.frame.locked ? "locked" : ""} ${needs ? "needs" : ""} ${folded ? "folded" : ""}" data-card="${esc(sh.id)}">
+    <div class="shot-head">${foldBtn("frames", sh.id)}<span class="id" data-card-fold="${esc(sh.id)}">${esc(sh.id)}</span>${folded && cands.length ? `<span class="muted small">${pl(cands.length, "candidate")}</span>` : ""}<span class="muted">${esc(sh.framing)} · ${who || "no characters"} · ${fmtDur(sh.duration_s)}</span>
       <span class="chip accent">${sourceLabel(sh._source)}</span>${sh._loras.length ? `<span class="chip" title="${esc(sh._loras.map((l) => l.name + " @" + l.strength).join("\n"))}">${sh._loras.length} LoRA</span>` : ""}
       ${sh._stale ? `<span class="chip warn" title="bible changed since these frames were made">stale</span>` : ""}
       ${sh.frame.locked ? `<span class="chip good">locked</span>` : ""}${needs ? `<span class="chip warn">pick a frame</span>` : ""}<span class="grow"></span>
@@ -593,14 +611,18 @@ async function tabAnimatic(el, ctx) {
 }
 
 // ── 5. Takes ────────────────────────────────────────────────────────────
+// The takes editor starts folded. Opening or closing it is remembered on this device.
+const EDITOR_OPEN_KEY = "reelwright.takesEditorOpen";
+let editorOpen = (() => { try { return localStorage.getItem(EDITOR_OPEN_KEY) === "1"; } catch { return false; } })();
 async function tabTakes(el, ctx) {
   const shots = ctx.e.shots;
   const spf = ctx.e.stats?.spf || {};
   const models = await GET("/api/models");
   el.innerHTML = `
     ${!ctx.e.gates.frames ? `<div class="notice">First frames aren't approved yet. Shots without a selected frame are skipped.</div>` : ""}
-    <div id="take-timeline"></div>
-    <details class="take-library-panel"><summary>Take library &amp; batch generation</summary>
+    <div id="take-history"></div>
+    <details class="take-editor-panel" ${editorOpen ? "open" : ""}><summary>Takes editor</summary><div id="take-timeline"></div></details>
+    <details class="take-library-panel" open><summary>Take library &amp; batch generation</summary>
     <div class="card row">
       <label class="row" style="margin:0">takes per shot <input id="ntakes" type="number" min="1" max="8" value="${ctx.e._settings.takes_per_shot}" style="width:60px"></label>
       <label>Video model <select id="take-model"><option value="">Per-shot / project default</option>${models.map(m => `<option value="${esc(m.id)}" data-engine="${m.engine}" ${m.available === false ? `disabled title="${esc(m.note)}"` : ""}>${esc(m.name)}${m.available === false ? " (not installed)" : ""}</option>`).join("")}</select></label>
@@ -614,6 +636,7 @@ async function tabTakes(el, ctx) {
       <p class="muted small" style="flex-basis:100%;margin:2px 0 0">Measured speed: ${Object.entries(spf).map(([k, v]) => `${k} ${v} s/frame`).join(", ") || "not measured yet"} · est. ${fmtSec(ctx.e._estimate_s)} for all</p>
     </div>
     <h2>Take library</h2><p class="muted small">Generate candidates here, then add them to the timeline or replace its selected clip. Library picks and source files stay available.</p>
+    <div class="list-bar"><button data-fold-all="1">${foldAllLabel("takes")}</button></div>
     <div id="take-library">${shots.map((sh) => takeCard(ctx, sh)).join("")}</div></details>`;
   // "All shots" ticks every shot card; the button shows how many are ticked. Ticks survive in-place updates of the cards.
   const boxes = () => $$("input[data-chk]", el);
@@ -660,6 +683,12 @@ async function tabTakes(el, ctx) {
   };
   const editor = await mountTakeTimeline($("#take-timeline"), ctx, shotId =>
     startJob(`${ctx.base}/takes`, {shot_ids: [shotId], takes: n(), force: true, ...modelChoice()}));
+  // Render history lives outside the editor so it is visible while the editor is folded.
+  const history = $("#take-timeline .edit-results", el); if (history) $("#take-history", el).appendChild(history);
+  const panel = $(".take-editor-panel", el);
+  // The editor measures its own size, so redraw it once it is shown.
+  panel.ontoggle = () => { editorOpen = panel.open; try { localStorage.setItem(EDITOR_OPEN_KEY, editorOpen ? "1" : "0"); } catch { /* private mode */ } if (panel.open) requestAnimationFrame(() => editor.draw()); };
+  const openEditor = () => { if (!panel.open) panel.open = true; };
   $("#render-missing").onclick = () => startJob(`${ctx.base}/takes`, { takes: n(), ...modelChoice() });
   $("#render-checked").onclick = () => {
     const ids = $$("input[data-chk]:checked").map((x) => x.dataset.chk);
@@ -667,7 +696,9 @@ async function tabTakes(el, ctx) {
     startJob(`${ctx.base}/takes`, { shot_ids: ids, takes: n(), force: true, ...modelChoice() });
   };
   el.onclick = async (ev) => {
+    if (foldClick(ev, el, ctx, "takes", $("#take-library", el), takeCard)) return;
     const t = ev.target, ds = t.dataset;
+    if (ds.timelineAdd != null || ds.timelineReplace != null || ds.timelineOverlay != null) openEditor();
     if (ds.timelineAdd != null && ds.shot) return editor.addTake(ds.shot, +ds.timelineAdd);
     if (ds.timelineReplace != null && ds.shot) return editor.addTake(ds.shot, +ds.timelineReplace, true);
     if (ds.timelineOverlay != null && ds.shot) return editor.addOverlay(ds.shot, +ds.timelineOverlay);
@@ -688,8 +719,9 @@ async function tabTakes(el, ctx) {
 function takeCard(ctx, sh) {
   const f = selFrame(sh);
   const items = sh.takes.items || [];
-  return `<div class="shot-card ${sh.takes.locked ? "locked" : ""}" data-card="${esc(sh.id)}">
-    <div class="shot-head"><input type="checkbox" data-chk="${sh.id}" aria-label="Select ${esc(sh.id)} for batch render" title="Select for batch render"><span class="id">${esc(sh.id)}</span>
+  const folded = !openCards.takes.has(sh.id);
+  return `<div class="shot-card ${sh.takes.locked ? "locked" : ""} ${folded ? "folded" : ""}" data-card="${esc(sh.id)}">
+    <div class="shot-head">${foldBtn("takes", sh.id)}<input type="checkbox" data-chk="${sh.id}" aria-label="Select ${esc(sh.id)} for batch render" title="Select for batch render"><span class="id" data-card-fold="${esc(sh.id)}">${esc(sh.id)}</span>${folded && items.length ? `<span class="muted small">${pl(items.length, "take")}</span>` : ""}
       <span class="chip accent">${esc(sh._engine)}</span><span class="muted">${fmtDur(sh.duration_s)} · ${esc(sh.start_mode)}</span>
       ${f ? `<img src="${media(f.file)}" style="height:40px;border-radius:4px" data-zoom="${media(f.file)}">` : sh.start_mode === "chain" ? `<span class="chip">frame from previous take</span>` : `<span class="chip bad">no frame</span>`}
       ${sh.end_frame ? `<span class="chip">end frame</span>` : ""}<span class="grow"></span>

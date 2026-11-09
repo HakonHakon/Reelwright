@@ -32,6 +32,17 @@ def edit_server(film, monkeypatch):
     server.should_exit=True; thread.join(timeout=5)
 
 
+@pytest.fixture(autouse=True)
+def _takes_editor_open(monkeypatch):
+    """The takes editor starts folded for users; these tests drive it, so every page starts with it open."""
+    original = playwright.Browser.new_context
+    def new_context(self, *args, **kwargs):
+        context = original(self, *args, **kwargs)
+        context.add_init_script("localStorage.setItem('reelwright.takesEditorOpen', '1')")
+        return context
+    monkeypatch.setattr(playwright.Browser, 'new_context', new_context)
+
+
 @pytest.mark.parametrize('engine,mobile',[('chromium',False),('chromium',True),('webkit',True)])
 def test_timeline_edit_music_generate_and_export(edit_server,engine,mobile,tmp_path):
     base,sid,eid,shots,music,submitted=edit_server
@@ -129,7 +140,7 @@ def test_timeline_edit_music_generate_and_export(edit_server,engine,mobile,tmp_p
         playwright.expect(page.locator('#toasts')).to_contain_text('Timeline export')
         assert submitted[-1]['kind']=='timeline' and submitted[-1]['edit']==edit
         # Source library is retained and can append another candidate.
-        page.locator('.take-library-panel > summary').click()
+        page.locator('.take-library-panel [data-fold-all]').click()  # the library is open; unfold its shot cards
         page.locator('[data-timeline-add]').last.click()
         playwright.expect(page.locator('.edit-clip')).to_have_count(4)
         page.locator('[data-edit="undo"]').click()
@@ -924,7 +935,7 @@ def test_overlay_lane_add_select_drag_inspector_preview_delete_and_persistence(e
 
         # "Add as overlay" on a take card puts a clip on a new OVERLAY lane at the playhead, selected.
         page.locator('[data-edit-scrub]').fill('6')
-        page.locator('.take-library-panel > summary').click()
+        page.locator('.take-library-panel [data-fold-all]').click()  # the library is open; unfold its shot cards
         page.locator('[data-timeline-overlay]').last.click()
         page.locator('.edit-overlay-clip').first.wait_for()
         assert overlays() == [{'s': 6, 'n': 30, 'x': .75, 'y': .25, 'scale': .4, 'opacity': 1, 'muted': True, 'fi': 0, 'fo': 0}]
@@ -1114,7 +1125,7 @@ def test_pick_lock_delete_and_approve_update_in_place_without_rebuilding_the_pag
         browser = p.chromium.launch(headless=True)
         page = browser.new_context(viewport={'width': 1440, 'height': 900}, service_workers='block').new_page()
         errors, ed = _open_editor(page, base, sid, eid)
-        page.locator('.take-library-panel > summary').click()
+        page.locator('.take-library-panel [data-fold-all]').click()  # the library is open; unfold its shot cards
         first, second = shots[0]['id'], shots[1]['id']
         page.wait_for_selector(f'[data-card="{first}"] [data-pick="1"]')
         # state that a full rebuild would destroy
@@ -1176,6 +1187,7 @@ def test_frames_tab_picks_update_the_status_line_and_button_in_place(edit_server
         errors = []; page.on('pageerror', lambda e: errors.append(str(e)))
         page.route('**/api/status', lambda r: r.fulfill(json={'comfy': False, 'comfy_host': 'local', 'ollama_models': [], 'loras': [], 'missing': []}))
         page.goto(f'{base}/#/s/{sid}/e/{eid}/frames'); page.wait_for_selector(f'[data-card="{shots[0]["id"]}"]')
+        page.locator('[data-fold-all]').click()  # frame cards start folded
         assert 'without a frame' in page.locator('.status-line').inner_text() and page.locator('#render-missing').is_enabled()
         page.evaluate("""([second]) => { window.__routes = 0; const o = window.route; window.route = (...a) => { window.__routes++; return o(...a); };
             document.querySelector(`[data-card="${second}"]`).__mark = 'untouched'; window.scrollTo({top: 200, behavior: 'instant'}); }""", [shots[1]['id']])
@@ -1200,7 +1212,7 @@ def test_a_page_that_must_rebuild_keeps_its_scroll_position_and_open_panels(edit
         browser = p.chromium.launch(headless=True)
         page = browser.new_context(viewport={'width': 1440, 'height': 900}, service_workers='block').new_page()
         errors, ed = _open_editor(page, base, sid, eid)
-        page.locator('.take-library-panel > summary').click()
+        page.locator('.take-library-panel [data-fold-all]').click()  # the library is open; unfold its shot cards
         page.evaluate("window.scrollTo({top: 420, behavior: 'instant'})")
         y = page.evaluate('window.scrollY'); assert y > 150
         page.evaluate('route()'); page.wait_for_function('App.timelineEditor && App.timelineEditor.edit.clips.length > 0')
@@ -1217,7 +1229,7 @@ def test_all_shots_checkbox_ticks_every_shot_and_drives_the_batch_render(edit_se
         browser = p.chromium.launch(headless=True)
         page = browser.new_context(viewport={'width': 1440, 'height': 900}, service_workers='block').new_page()
         errors, ed = _open_editor(page, base, sid, eid)
-        page.locator('.take-library-panel > summary').click()
+        page.locator('.take-library-panel [data-fold-all]').click()  # the library is open; unfold its shot cards
         a, b = shots[0]['id'], shots[1]['id']
         every, button = page.locator('#chk-all'), page.locator('#render-checked')
         ticked = lambda: page.evaluate('[...document.querySelectorAll("input[data-chk]:checked")].map(x => x.dataset.chk)')
@@ -1310,7 +1322,7 @@ def test_delete_checked_and_delete_all_takes_confirm_skip_locked_and_update_in_p
         browser = p.chromium.launch(headless=True)
         page = browser.new_context(viewport={'width': 1440, 'height': 900}, service_workers='block').new_page()
         errors, ed = _open_editor(page, base, sid, eid)
-        page.locator('.take-library-panel > summary').click()
+        page.locator('.take-library-panel [data-fold-all]').click()  # the library is open; unfold its shot cards
         page.evaluate('() => { window.__routes = 0; const o = window.route; window.route = (...x) => { window.__routes++; return o(...x); }; }')
         takes = lambda: [len(s['takes']['items']) for s in store.get_episode(sid, eid)['shots']]
         clips_before = ed('edit.clips.length')
@@ -1358,7 +1370,7 @@ def test_the_video_model_menu_does_not_offer_an_engine_that_is_not_installed(edi
         browser = p.chromium.launch(headless=True)
         page = browser.new_context(viewport={'width': 1440, 'height': 900}, service_workers='block').new_page()
         errors, ed = _open_editor(page, base, sid, eid)
-        page.locator('.take-library-panel > summary').click()
+        page.locator('.take-library-panel [data-fold-all]').click()  # the library is open; unfold its shot cards
         ltx, wan = page.locator('#take-model option[value="ltx"]'), page.locator('#take-model option[value="wan"]')
         assert ltx.evaluate('el => el.disabled') is True and 'not installed' in ltx.inner_text() and 'workflow file is missing' in ltx.get_attribute('title')
         assert wan.evaluate('el => el.disabled') is False and 'not installed' not in wan.inner_text()

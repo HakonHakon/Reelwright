@@ -35,9 +35,10 @@ const FORM = (u, fd) => api("POST", u, fd, true);
 
 // A shared selection control for every deletable collection.
 // Hidden behind a quiet "Select" toggle so checkboxes only appear when the user asks for them.
+// Targets are re-read live: cards that repaint (fold, soft reload) get fresh checkboxes instead of losing them.
 function bulkSelect(root, selector, remove, refresh = route, label = "items") {
-  const targets = $$(selector, root);
-  if (!targets.length) return;
+  root._bulkObs?.disconnect();
+  if (!$$(selector, root).length) return;
   const bar = document.createElement("div");
   bar.className = "row bulk-actions";
   bar.innerHTML = `<button class="bulk-toggle" aria-pressed="false">Select ${esc(label)}…</button>
@@ -45,33 +46,47 @@ function bulkSelect(root, selector, remove, refresh = route, label = "items") {
   const head = $(":scope > .page-head", root);
   if (head) head.after(bar); else root.prepend(bar);
   root.classList.add("bulk-off");
+  const all = $(".bulk-tools input", bar), button = $(".bulk-tools button", bar), count = $(".bulk-tools span", bar);
+  const boxes = () => $$(".bulk-check", root).filter((b) => b._target?.isConnected);
+  // Ticks survive a card repaint: remember them by the target's data attributes.
+  const keyOf = (t) => JSON.stringify(t.dataset);
+  let picked = new Set();
+  const attach = () => {
+    $$(selector, root).forEach((target, i) => {
+      if (target._bulkBox?.isConnected) return;
+      const box = document.createElement("input"); box.type = "checkbox";
+      box.className = "bulk-check"; box.setAttribute("aria-label", `Select ${label} ${i + 1}`);
+      box._target = target; target._bulkBox = box; box.checked = picked.has(keyOf(target));
+      box.addEventListener("click", e => e.stopPropagation());
+      box.addEventListener("change", sync);
+      if (target.tagName === "A") {
+        const wrap = document.createElement("div"); target.replaceWith(wrap); wrap.append(box, target);
+      } else target.before(box);
+    });
+  };
+  const sync = () => {
+    const bs = boxes(), on = bs.filter(b => b.checked), n = on.length;
+    picked = new Set(on.map(b => keyOf(b._target)));
+    button.disabled = !n; count.textContent = `${n} selected`;
+    all.checked = n > 0 && n === bs.length; all.indeterminate = n > 0 && n < bs.length;
+    App.selecting = n > 0;
+  };
+  attach();
+  const obs = new MutationObserver(() => { obs.disconnect(); if (!bar.isConnected) return; attach(); sync(); obs.observe(root, { childList: true, subtree: true }); });
+  obs.observe(root, { childList: true, subtree: true });
+  root._bulkObs = obs;
   const toggle = $(".bulk-toggle", bar);
   toggle.onclick = () => {
     const on = root.classList.toggle("bulk-off") === false;
     toggle.setAttribute("aria-pressed", String(on)); toggle.textContent = on ? "Done" : `Select ${label}…`;
-    if (!on) { boxes.forEach(b => { b.checked = false; }); sync(); }
+    if (!on) boxes().forEach(b => { b.checked = false; });
+    sync();
   };
-  const boxes = targets.map((target, i) => {
-    const box = document.createElement("input"); box.type = "checkbox";
-    box.className = "bulk-check"; box.setAttribute("aria-label", `Select ${label} ${i + 1}`);
-    box.addEventListener("click", e => e.stopPropagation());
-    if (target.tagName === "A") {
-      const wrap = document.createElement("div"); target.replaceWith(wrap); wrap.append(box, target);
-    } else target.before(box);
-    return box;
-  });
-  const all = $(".bulk-tools input", bar), button = $(".bulk-tools button", bar), count = $(".bulk-tools span", bar);
-  const sync = () => {
-    const n = boxes.filter(b => b.checked).length;
-    button.disabled = !n; count.textContent = `${n} selected`;
-    all.checked = n === boxes.length; all.indeterminate = n > 0 && n < boxes.length;
-    App.selecting = n > 0;
-  };
-  boxes.forEach(b => b.addEventListener("change", sync));
-  all.onchange = () => { boxes.forEach(b => { b.checked = all.checked; }); sync(); };
+  all.onchange = () => { boxes().forEach(b => { b.checked = all.checked; }); sync(); };
   button.onclick = async (event) => {
     event.stopPropagation();
-    const selected = targets.filter((_, i) => boxes[i].checked);
+    const selected = boxes().filter(b => b.checked).map(b => b._target);
+    if (!selected.length) return;
     if (!(await ask(`Delete ${selected.length} selected ${label}?`, "Delete selected", true))) return;
     button.disabled = true;
     try { await remove(selected); App.selecting = false; await refresh(); }

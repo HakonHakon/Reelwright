@@ -1042,7 +1042,8 @@ label.btn.file-pick, label.btn { font-size: 13.5px; margin: 0; }
 .sr-sum { font-size: 13px; color: var(--ink-2); }
 .sr-sum-action { color: var(--ink); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 /* Frame and take cards fold to their header */
-.shot-card.folded > :not(.shot-head) { display: none; }
+/* While selecting for bulk delete, folded cards still show their candidates/takes so you can see what you tick. */
+.shot-card.folded > :not(.shot-head):not(:has(.bulk-check)), .bulk-off .shot-card.folded > :not(.shot-head) { display: none; }
 .shot-card.folded { margin-bottom: 12px; padding-bottom: 0; }
 .shot-card .shot-head .id[data-card-fold] { cursor: pointer; }
 .shot-card.folded .sr-toggle svg { transform: none; }

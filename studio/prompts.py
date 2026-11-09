@@ -253,6 +253,14 @@ def location_plate_prompt(loc: dict, variant: str, bible: dict) -> str:
             f"{_location_text(loc, variant)}. {style.get('grade', '')}")
 
 
+def infinitetalk_sing_prompt(shot: dict, bible: dict) -> str:
+    """InfiniteTalk driven by the song's isolated vocals: the face sings along with its window of the song."""
+    return (f"{shot.get('framing', '')} shot, camera: {shot.get('camera') or 'static'}. {shot.get('action', '')} "
+            "The person facing the camera sings along with the song, lips following the sung words, and keeps "
+            "the lips closed in the pauses. Same place, same light, same face and clothes as the first frame. "
+            "Natural, heartfelt singing, natural blinking. Photorealistic, cinematic.")
+
+
 def infinitetalk_prompt(shot: dict, bible: dict) -> str:
     """What the shot shows; the mouth comes from the audio, so no dialogue words (quoted words get painted as text)."""
     return (f"{shot.get('framing', '')} shot, camera: {shot.get('camera') or 'static'}. {shot.get('action', '')} "

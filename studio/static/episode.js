@@ -629,6 +629,7 @@ async function tabTakes(el, ctx) {
       <button class="primary" id="render-missing">Render shots without takes</button>
       <label class="row small check-all" style="margin:0"><input type="checkbox" id="chk-all" data-chk-all aria-label="Select all shots for batch render"> All shots</label>
       <button id="render-checked" title="Render only the shots ticked on their cards">Render checked shots</button>
+      ${songFile(ctx.e) ? `<button id="sing-song" title="Music video: InfiniteTalk takes whose mouths follow the singer's isolated vocals from each shot's window in the song">Lip-sync to the song</button>` : ""}
       <span class="grow"></span>
       <button class="danger" id="delete-checked" disabled title="Remove the takes of the ticked shots from their cards. The video files stay on disk.">Delete checked</button>
       <button class="danger" id="delete-all" title="Remove every take from every shot. The video files stay on disk.">Delete all takes</button>
@@ -690,6 +691,15 @@ async function tabTakes(el, ctx) {
   panel.ontoggle = () => { editorOpen = panel.open; try { localStorage.setItem(EDITOR_OPEN_KEY, editorOpen ? "1" : "0"); } catch { /* private mode */ } if (panel.open) requestAnimationFrame(() => editor.draw()); };
   const openEditor = () => { if (!panel.open) panel.open = true; };
   $("#render-missing").onclick = () => startJob(`${ctx.base}/takes`, { takes: n(), ...modelChoice() });
+  const sing = $("#sing-song", el);
+  if (sing) sing.onclick = async () => {
+    const ticked = $$("input[data-chk]:checked", el).map((x) => x.dataset.chk);
+    const ids = ticked.length ? ticked : ctx.e.shots.filter((sh) => sh.engine === "infinitetalk" && sh.face).map((sh) => sh.id);
+    if (!ids.length) return toast("No InfiniteTalk shots with a face. Tick the singing shots, or set their engine to InfiniteTalk and choose the face.", true);
+    const which = ticked.length ? `the ${pl(ids.length, "ticked shot")}` : `all ${pl(ids.length, "InfiniteTalk shot")}`;
+    if (!(await ask(`Lip-sync ${which} to the song? The singer's vocals are isolated from the song once (cached), then each shot gets a new InfiniteTalk take whose mouth follows the vocals of its own window in the song (shots play back to back from the song's start, each for its planned duration). The new take is selected and placed on the timeline at its planned length, muted so the song plays, with LatentSync off. Existing takes stay in the library. This renders ${pl(ids.length, "take")} on the GPU.`, "Lip-sync to the song"))) return;
+    startJob(`${ctx.base}/takes/song`, ticked.length ? { shot_ids: ids } : {});
+  };
   $("#render-checked").onclick = () => {
     const ids = $$("input[data-chk]:checked").map((x) => x.dataset.chk);
     if (!ids.length) return toast("Tick some shots first", true);
@@ -715,6 +725,9 @@ async function tabTakes(el, ctx) {
   };
   App.refreshers.push(reload);
 }
+
+// The episode's song (music videos): uploaded with the episode, or placed on the Cut timeline.
+const songFile = (e) => (e.music && e.music.file) || (e.timeline && e.timeline.music && e.timeline.music.file) || "";
 
 function takeCard(ctx, sh) {
   const f = selFrame(sh);

@@ -1440,6 +1440,177 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
             job.progress = [done, len(todo) * n_takes]
 
 
+# ── lip-sync to the song (music videos) ─────────────────────────────────
+
+def song_windows(e, fps):
+    """Each shot's planned [start, end) in timeline frames: shots play back to back in order from the song's start,
+    each for its planned duration_s."""
+    out, t = {}, 0.0
+    for sh in sorted(e["shots"], key=lambda x: x["order"]):
+        d = float(sh.get("duration_s") or 0)
+        out[sh["id"]] = (round(t * fps), round((t + d) * fps))
+        t += d
+    return out
+
+
+def song_shots(e):
+    """The shots a song lip-sync pass renders by default: InfiniteTalk shots with a face on screen."""
+    return [sh["id"] for sh in sorted(e["shots"], key=lambda x: x["order"])
+            if sh.get("engine") == "infinitetalk" and sh.get("face")]
+
+
+def song_file(e):
+    return (e.get("music") or {}).get("file") or ((e.get("timeline") or {}).get("music") or {}).get("file") or ""
+
+
+def slice_song(s, vocals, start, seconds, dst):
+    """Cut [start, start + seconds) of the isolated vocals as 16 kHz mono, the input InfiniteTalk's encoder wants."""
+    media._run([s["ffmpeg"], "-y", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", vocals,
+                "-ar", "16000", "-ac", "1", dst])
+    return dst
+
+
+def song_vocals(job, s, c, sid, eid, song):
+    """The song's isolated vocals as 16 kHz mono, separated once per song file (cached by its content hash)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(song, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    key = h.hexdigest()[:16]
+    cache = _ep_path(sid, eid, "out", "song_vocals")
+    os.makedirs(cache, exist_ok=True)
+    dst = os.path.join(cache, f"{key}_vocals16k.wav")
+    if os.path.exists(dst):
+        job.say("Using the song's isolated vocals from the cache")
+        return dst
+    job.say("Isolating the singer's vocals from the song (once per song)...")
+    uploaded = c.upload(song, f"studio_{eid}_song_{key}{os.path.splitext(song)[1]}")
+    res = c.run(workflows.separate_vocals(uploaded, f"studio/{eid}/song_vocals"), cancel=lambda: job.cancel_flag)
+    if not res.get("audios"):
+        raise RuntimeError("Vocal isolation produced no audio")
+    raw = os.path.join(cache, f"{key}_vocals_raw" + (os.path.splitext(res["audios"][0]["filename"])[1] or ".flac"))
+    c.download(res["audios"][0], raw)
+    tmp = dst + ".part.wav"
+    media._run([s["ffmpeg"], "-y", "-v", "error", "-i", raw, "-ar", "16000", "-ac", "1", tmp])
+    os.replace(tmp, dst)
+    return dst
+
+
+def place_song_clip(ep, cfg, shot_id, take_file, frames):
+    """Put a song-synced take on the timeline at its shot: the take as the source, its planned length, muted (the
+    song plays) and with LatentSync off (InfiniteTalk already moved the mouth). Returns the timeline body to save."""
+    from . import timeline
+    cur = timeline.view(ep, cfg)["edit"] if ep.get("timeline") else timeline.default_edit(ep, cfg, selected_takes=True)
+    edit = copy.deepcopy(cur)
+    edit["revision"] = (ep.get("timeline") or {}).get("revision", 0)
+    if not edit.get("music") and (ep.get("music") or {}).get("file"):  # the muted clips need the song under them
+        edit["music"] = timeline.default_edit(ep, cfg).get("music")
+    fps = edit["fps"]
+    try:
+        have = int(timeline.source_info(ep, take_file, cfg)["video_duration"] * fps + 1e-6)
+        frames = max(1, min(frames, have))
+    except Exception:  # noqa: BLE001 - an unreadable take keeps its planned length; save() validates it
+        pass
+    clip = next((x for x in edit["clips"] if x.get("shot_id") == shot_id), None)
+    if clip is None:
+        order = {sh["id"]: sh["order"] for sh in ep["shots"]}
+        clip = {"id": "clip_" + shot_id, "shot_id": shot_id, "volume": 1, "fade_in": 0, "fade_out": 0, "speed": 1,
+                "transition": 0, "reframe": dict(timeline.DEFAULT_REFRAME)}
+        mine = order.get(shot_id, 0)
+        at = next((i for i, x in enumerate(edit["clips"]) if order.get(x.get("shot_id"), -1) > mine), len(edit["clips"]))
+        if any(x["id"] == clip["id"] for x in edit["clips"]):
+            clip["id"] += "_" + uuid.uuid4().hex[:6]
+        edit["clips"].insert(at, clip)
+    clip.update(source=take_file, source_in=0.0, frames=frames, muted=True, lipsync=False, speed=1,
+                fade_in=min(clip.get("fade_in", 0), frames // 2), fade_out=min(clip.get("fade_out", 0), frames // 2))
+    if clip.get("transition") and clip["transition"] * 2 > frames:
+        clip["transition"] = 0
+    return edit
+
+
+def job_song_takes(job, sid, eid, shot_ids=None):
+    """Music video lip-sync: one InfiniteTalk take per singing shot, its mouth driven by the singer's isolated vocals
+    from that shot's exact window in the song; the take is selected and laid on the timeline at its planned length."""
+    from . import timeline
+    s, c = _ctx()
+    b = store.bible(sid)
+    e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
+    rel = song_file(e)
+    if not rel:
+        raise ValueError("This episode has no song. Upload the song on the Cut page (Music) first.")
+    song = store.abs_media(rel)
+    if not os.path.exists(song):
+        raise ValueError(f"The song file is missing: {rel}")
+    ids = list(shot_ids or []) or song_shots(e)
+    known = {sh["id"] for sh in e["shots"]}
+    if not ids:
+        raise ValueError("No shots to sing: give singing shots the InfiniteTalk engine and a face, or tick them.")
+    unknown = [i for i in ids if i not in known]
+    if unknown:
+        raise ValueError(f"Unknown shots: {', '.join(unknown)}")
+    problem = providers.engine_problem(s, "infinitetalk")
+    if problem:
+        raise ValueError(problem)
+    _gpu_prepare(job, s, c)
+    fps = int(s["video"]["fps"])
+    it_fps = int(s["infinitetalk"]["fps"])
+    max_s = float(s["infinitetalk"]["max_seconds"])
+    job.progress = [0, len(ids) + 1]
+    vocals = song_vocals(job, s, c, sid, eid, song)
+    song_len = media.probe(s["ffprobe"], vocals)["duration"]
+    job.progress = [1, len(ids) + 1]
+    done = 0
+    for n, shot_id in enumerate(ids, 1):
+        job.check()
+        e = store.get_episode(sid, eid)
+        sh = store.find_shot(e, shot_id)
+        a, z = song_windows(e, fps)[shot_id]
+        start, seconds = a / fps, (z - a) / fps
+        if seconds <= 0:
+            job.say(f"{shot_id}: no planned duration; skipped.")
+        elif start >= song_len:
+            job.say(f"{shot_id}: starts at {start:.2f}s, after the song ends ({song_len:.2f}s); skipped.")
+        elif seconds > max_s:
+            job.say(f"{shot_id}: its {seconds:.1f}s window is longer than InfiniteTalk's {max_s:.0f}s limit; "
+                    "split the shot. Skipped.")
+        else:
+            first = _first_frame_for(job, s, sid, eid, e, sh)
+            if first:
+                out_dir = _ep_path(sid, eid, "takes", shot_id)
+                os.makedirs(out_dir, exist_ok=True)
+                voice = slice_song(s, vocals, start, seconds, os.path.join(out_dir, f"{shot_id}_song_vocals16k.wav"))
+                frames = math.ceil(seconds * it_fps)
+                seed = _seed()
+                wf = workflows.infinitetalk(s, c.upload(first, f"studio_{eid}_{shot_id}_first.png"),
+                                            c.upload(voice, f"studio_{eid}_{shot_id}_song16k.wav"),
+                                            prompts.infinitetalk_sing_prompt(sh, b), frames, seed, f"studio/{eid}/{shot_id}")
+                job.say(f"[{n}/{len(ids)}] {shot_id}: {start:.2f}-{start + seconds:.2f}s of the song, {frames} frames...")
+                res = c.run(wf, cancel=lambda: job.cancel_flag)
+                if not res["videos"]:
+                    raise RuntimeError("ComfyUI returned no video")
+                path = _save_outputs(c, res["videos"][:1], out_dir, f"{shot_id}_t")[0]
+                info = media.probe(s["ffprobe"], path)
+                item = {"file": store.rel(path), "engine": "infinitetalk", "model": "InfiniteTalk · song vocals",
+                        "seed": seed, "frames": frames, "seconds": round(info["duration"], 2),
+                        "render_s": round(res["seconds"]), "flags": media.qc_video(path, seconds, info["duration"]),
+                        "first_frame": store.rel(first), "sig": store.bible_signature(b, sh), "created": store.now(),
+                        "song_window": [round(start, 3), round(start + seconds, 3)]}
+
+                def add(ep, item=item, shot_id=shot_id):
+                    t = store.find_shot(ep, shot_id)["takes"]
+                    t["items"].append(item)
+                    t["selected"] = len(t["items"]) - 1
+                store.update_episode(sid, eid, add)
+                e = store.get_episode(sid, eid)
+                timeline.save(sid, eid, place_song_clip(e, s, shot_id, item["file"], z - a), s)
+                job.say(f"  done in {res['seconds']:.0f}s, selected and placed on the timeline (muted, {z - a} frames)")
+        done += 1
+        job.progress = [done + 1, len(ids) + 1]
+    job.say("Song lip-sync finished. The song plays under the muted clips on the Cut page.")
+
+
 def _first_frame_for(job, s, sid, eid, e, sh):
     if sh.get("start_mode") == "chain":
         prev = _prev_shot(e, sh)

@@ -947,6 +947,28 @@ def ep_takes(sid: str, eid: str, body: dict = Body(default={})):
                    engine_override=body.get("engine") or "", model_override=body.get("model") or "")
 
 
+@app.post("/api/s/{sid}/e/{eid}/takes/song")
+def ep_song_takes(sid: str, eid: str, body: dict = Body(default={})):
+    """Music videos: InfiniteTalk takes driven by the song's isolated vocals, each from its shot's window in the song.
+    {shot_ids?: [...]} - default: every InfiniteTalk shot with a face."""
+    e = _ep(sid, eid)
+    shot_ids = body.get("shot_ids") or []
+    if not isinstance(shot_ids, list) or not all(isinstance(x, str) for x in shot_ids):
+        raise HTTPException(400, "shot_ids must be a list of shot ids")
+    if not jobs.song_file(e):
+        raise HTTPException(400, "This episode has no song. Upload the song on the Cut page (Music) first.")
+    known = {sh["id"] for sh in e["shots"]}
+    unknown = [x for x in shot_ids if x not in known]
+    if unknown:
+        raise HTTPException(400, f"Unknown shots: {', '.join(unknown)}")
+    if not shot_ids and not jobs.song_shots(e):
+        raise HTTPException(400, "No InfiniteTalk shots with a face to sing; tick the singing shots or set their engine.")
+    problem = providers.engine_problem(_s(), "infinitetalk")
+    if problem:
+        raise HTTPException(400, problem)
+    return _submit("takes", f"Song lip-sync {eid}", jobs.job_song_takes, sid=sid, eid=eid, shot_ids=shot_ids)
+
+
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/take")
 def shot_take(sid: str, eid: str, shot_id: str, body: dict = Body(...)):
     """{select: idx} | {lock: bool} | {trim_in, trim_out} | {remove: idx}"""

@@ -34,42 +34,85 @@ const GET = (u) => api("GET", u), POST = (u, b) => api("POST", u, b ?? {}), PUT 
 const FORM = (u, fd) => api("POST", u, fd, true);
 
 // A shared selection control for every deletable collection.
+// Hidden behind a quiet "Select" toggle so checkboxes only appear when the user asks for them.
+// Targets are re-read live: cards that repaint (fold, soft reload) get fresh checkboxes instead of losing them.
 function bulkSelect(root, selector, remove, refresh = route, label = "items") {
-  const targets = $$(selector, root);
-  if (!targets.length) return;
+  root._bulkObs?.disconnect();
+  if (!$$(selector, root).length) return;
   const bar = document.createElement("div");
   bar.className = "row bulk-actions";
-  bar.innerHTML = `<label><input type="checkbox" aria-label="Select all ${esc(label)}"> Select all ${esc(label)}</label><button class="danger" disabled>Delete selected</button><span class="muted small"></span>`;
-  root.prepend(bar);
-  const boxes = targets.map((target, i) => {
-    const box = document.createElement("input"); box.type = "checkbox";
-    box.className = "bulk-check"; box.setAttribute("aria-label", `Select ${label} ${i + 1}`);
-    box.addEventListener("click", e => e.stopPropagation());
-    if (target.tagName === "A") {
-      const wrap = document.createElement("div"); target.replaceWith(wrap); wrap.append(box, target);
-    } else target.before(box);
-    return box;
-  });
-  const all = $("input", bar), button = $("button", bar), count = $("span", bar);
+  bar.innerHTML = `<button class="bulk-toggle" aria-pressed="false">Select ${esc(label)}…</button>
+    <span class="bulk-tools"><label><input type="checkbox" aria-label="Select all ${esc(label)}"> All</label><span class="muted small"></span><button class="danger" disabled>Delete selected</button></span>`;
+  const head = $(":scope > .page-head", root);
+  if (head) head.after(bar); else root.prepend(bar);
+  root.classList.add("bulk-off");
+  const all = $(".bulk-tools input", bar), button = $(".bulk-tools button", bar), count = $(".bulk-tools span", bar);
+  const boxes = () => $$(".bulk-check", root).filter((b) => b._target?.isConnected);
+  // Ticks survive a card repaint: remember them by the target's data attributes.
+  const keyOf = (t) => JSON.stringify(t.dataset);
+  let picked = new Set();
+  const attach = () => {
+    $$(selector, root).forEach((target, i) => {
+      if (target._bulkBox?.isConnected) return;
+      const box = document.createElement("input"); box.type = "checkbox";
+      box.className = "bulk-check"; box.setAttribute("aria-label", `Select ${label} ${i + 1}`);
+      box._target = target; target._bulkBox = box; box.checked = picked.has(keyOf(target));
+      box.addEventListener("click", e => e.stopPropagation());
+      box.addEventListener("change", sync);
+      if (target.tagName === "A") {
+        const wrap = document.createElement("div"); target.replaceWith(wrap); wrap.append(box, target);
+      } else target.before(box);
+    });
+  };
   const sync = () => {
-    const n = boxes.filter(b => b.checked).length;
+    const bs = boxes(), on = bs.filter(b => b.checked), n = on.length;
+    picked = new Set(on.map(b => keyOf(b._target)));
     button.disabled = !n; count.textContent = `${n} selected`;
-    all.checked = n === boxes.length; all.indeterminate = n > 0 && n < boxes.length;
+    all.checked = n > 0 && n === bs.length; all.indeterminate = n > 0 && n < bs.length;
     App.selecting = n > 0;
   };
-  boxes.forEach(b => b.addEventListener("change", sync));
-  all.onchange = () => { boxes.forEach(b => { b.checked = all.checked; }); sync(); };
+  attach();
+  const obs = new MutationObserver(() => { obs.disconnect(); if (!bar.isConnected) return; attach(); sync(); obs.observe(root, { childList: true, subtree: true }); });
+  obs.observe(root, { childList: true, subtree: true });
+  root._bulkObs = obs;
+  const toggle = $(".bulk-toggle", bar);
+  toggle.onclick = () => {
+    const on = root.classList.toggle("bulk-off") === false;
+    toggle.setAttribute("aria-pressed", String(on)); toggle.textContent = on ? "Done" : `Select ${label}…`;
+    if (!on) boxes().forEach(b => { b.checked = false; });
+    sync();
+  };
+  all.onchange = () => { boxes().forEach(b => { b.checked = all.checked; }); sync(); };
   button.onclick = async (event) => {
     event.stopPropagation();
-    const selected = targets.filter((_, i) => boxes[i].checked);
+    const selected = boxes().filter(b => b.checked).map(b => b._target);
+    if (!selected.length) return;
     if (!(await ask(`Delete ${selected.length} selected ${label}?`, "Delete selected", true))) return;
     button.disabled = true;
     try { await remove(selected); App.selecting = false; await refresh(); }
     catch { App.selecting = false; await refresh(); }
   };
 }
-const VIDEO_ENGINES = ["minimax_local", "ltx", "wan", "minimax"];
-const engineOptions = (current) => VIDEO_ENGINES.map(x => `<option value="${x}" ${x === current ? "selected" : ""}>${esc({minimax_local:"MiniMax H3 (local)",ltx:"LTX-2.3",wan:"Wan 2.2",minimax:"MiniMax (cloud)"}[x])}</option>`).join("");
+// Destructive page actions live in a quiet overflow menu instead of a red button beside every title.
+function pageMenu(view, actions) {
+  const menu = document.createElement("details");
+  menu.className = "more-menu";
+  menu.innerHTML = `<summary class="icon-btn" aria-label="More actions" title="More actions">${ic("dots")}</summary><div class="more-pop" role="menu"></div>`;
+  for (const [text, fn, danger] of actions) {
+    const b = document.createElement("button");
+    b.textContent = text; b.setAttribute("role", "menuitem"); if (danger) b.className = "danger";
+    b.onclick = () => { menu.open = false; fn(); };
+    $(".more-pop", menu).append(b);
+  }
+  $(".page-head", view).append(menu);
+  return menu;
+}
+document.addEventListener("click", (e) => { $$(".more-menu[open]").forEach((m) => { if (!m.contains(e.target) || e.target.closest(".more-pop button")) m.open = false; }); });
+// Seconds for humans: 1.1666667 -> "1.2s".
+const fmtDur = (s) => `${Math.round((+s || 0) * 10) / 10}s`;
+const VIDEO_ENGINES = ["infinitetalk", "minimax_local", "ltx", "ltx_lipsync", "wan", "minimax"];
+const ENGINE_NAMES = {infinitetalk: "InfiniteTalk (local, lip-sync)", minimax_local: "MiniMax H3 (local)", ltx: "LTX-2.3", ltx_lipsync: "LTX-2.3 lip-sync", wan: "Wan 2.2", minimax: "MiniMax (cloud)"};
+const engineOptions = (current) => VIDEO_ENGINES.map(x => `<option value="${x}" ${x === current ? "selected" : ""}>${esc(ENGINE_NAMES[x])}</option>`).join("");
 
 // ── toasts ───────────────────────────────────────────────────────────────
 function toast(msg, bad) {
@@ -106,6 +149,29 @@ function ask(msg, okLabel = "Confirm", danger = false) {
     $("#ask-yes").focus();
   });
 }
+function promptText(msg, value = "", okLabel = "OK") {
+  return new Promise((resolve) => {
+    modal(`<h3 style="margin:0 0 8px;font-size:16px;max-width:420px">${esc(msg)}</h3>
+      <input id="ask-input" value="${esc(value)}" style="width:100%" aria-label="${esc(msg)}">
+      <div class="row" style="justify-content:flex-end;margin-top:16px">
+        <button id="ask-no">Cancel</button><button class="primary" id="ask-yes">${esc(okLabel)}</button></div>`);
+    const finish = (v) => { askDone = null; closeModal(); resolve(v); };
+    askDone = () => resolve(null);
+    $("#ask-no").onclick = () => finish(null);
+    $("#ask-yes").onclick = () => finish($("#ask-input").value.trim());
+    $("#ask-input").onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); $("#ask-yes").click(); } };
+    $("#ask-input").focus();
+    $("#ask-input").select();
+  });
+}
+async function cloneEpisode(sid, eid, title) {
+  const name = await promptText("Name the copy", `${title || "Episode"} copy`, "Clone");
+  if (name == null) return;
+  const e = await POST(`/api/s/${sid}/e/${eid}/clone`, { title: name || `${title || "Episode"} copy` });
+  toast("Episode cloned.");
+  delete App.sd[sid];
+  location.hash = `#/s/${sid}/e/${e.id}/story`;
+}
 $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
 
 const LB = { items: [], i: 0 };
@@ -136,8 +202,23 @@ function crumbs(parts) {
   document.title = `${all[all.length - 1][0]} · ${APP_NAME}`;
 }
 
+// ── AI models: connections, defaults and the per-job pickers ──────────────
+async function loadAI() { try { App.ai = await GET("/api/ai"); } catch { /* keep the last copy */ } return App.ai; }
+const aiImageLabel = (src) => (App.ai?.choices.image || []).find((c) => c.source === src)?.label;
+/** A model picker for one job. role: "planner" (writing) or "vision" (frame checks). */
+function textPicker(id, role, title) {
+  const ai = App.ai; if (!ai) return "";
+  const def = ai.defaults[role], opts = ai.choices.text.slice();
+  if (def && !opts.some((o) => o.ref === def)) opts.unshift({ ref: def, label: ai.labels[role] });
+  return `<select id="${id}" class="model-pick" aria-label="${esc(title)}" title="${esc(title)} (default set on the AI models page)">${opts.map((o) =>
+    `<option value="${esc(o.ref)}" ${o.ref === def ? "selected" : ""}>${esc(o.label)}${o.ref === def ? " · default" : ""}${o.ready === false ? " · no key yet" : ""}</option>`).join("")}</select>`;
+}
+const imageOptions = (prefix = "") => (App.ai?.choices.image || []).map((c) =>
+  `<option value="${esc(c.source)}">${esc(prefix + c.label)}${c.ready === false ? " · no key yet" : ""}</option>`).join("");
+
 function sourceLabel(s) {
-  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Reference photos (Qwen Edit)", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master" }[s] || s || "inherit";
+  if (s && s.startsWith("img:")) return aiImageLabel(s) || s.slice(4).replace(":", " · ");
+  return { flux_lora: "Flux + LoRA", zimage: "Z-Image", qwen_refs: "Z-Image + Qwen identity", qwen_edit: "Qwen Edit from photo", qwen_2511: "Qwen 2511 from photos", qwen_identity: "Qwen face correction", auto: "Auto (LoRA > Qwen 2511 from photos > Z-Image)", upload: "Upload", reuse: "Reuse master angle", chain: "Last frame of prev take", punch_in: "Punch-in from master", openai_image: "ChatGPT image (OpenAI)", gemini_image: "Gemini image (Google)" }[s] || s || "inherit";
 }
 
 // ── sidebar ──────────────────────────────────────────────────────────────
@@ -146,17 +227,19 @@ function renderNav() {
   const d = a === "s" ? App.sd[sid] : null;
   const item = (href, icon, label, extra = "", sub = false) => {
     const on = location.hash.replace(/\/(story|shots|frames|animatic|takes|cut)$/, "") === href.replace(/\/(story|shots|frames|animatic|takes|cut)$/, "");
-    return `<a class="nav-item ${sub ? "sub" : ""} ${on ? "on" : ""}" href="${href}" data-i="${esc(label.trim().charAt(0).toUpperCase())}" title="${esc(label)}"><span class="lbl">${esc(label)}</span>${extra}</a>`;
+    return `<a class="nav-item ${sub || ""} ${on ? "on" : ""}" href="${href}" ${on ? 'aria-current="page"' : ""} data-i="${esc(label.trim().charAt(0).toUpperCase())}" title="${esc(label)}"><span class="lbl">${esc(label)}</span>${extra}</a>`;
   };
-  let html = item("#/", "folder", "Projects") + item("#/settings", "settings", "Settings") + item("#/models", "settings", "Models");
+  let html = item("#/", "folder", "Projects", "", "top");
   if (d) {
     const chars = Object.values(d.bible.characters), locs = Object.values(d.bible.locations);
     html += `<div class="nav-sec">${esc(d.series.name)}</div>` +
       item(`#/s/${sid}`, "folder", "Overview") + item(`#/s/${sid}/style`, "palette", "Style & props") +
+      item(`#/s/${sid}/playground`, "image", "Playground") +
       `<div class="nav-sec">Episodes</div>` + d.episodes.map((e) => item(`#/s/${sid}/e/${e.id}/story`, "clapper", e.title, `<span class="count">${e.shots}</span>`)).join("") +
       `<div class="nav-sec">Characters</div>` + chars.slice(0, 10).map((c) => item(`#/s/${sid}/c/${c.id}`, "user", c.name, c.draft ? `<span class="count">draft</span>` : "")).join("") +
       `<div class="nav-sec">Locations</div>` + locs.slice(0, 10).map((l) => item(`#/s/${sid}/l/${l.id}`, "pin", l.name, l.draft ? `<span class="count">draft</span>` : "")).join("");
   }
+  html += `<div class="nav-sec">Studio</div>` + item("#/ai", "settings", "AI models", "", "top") + item("#/models", "settings", "Video models", "", "top") + item("#/settings", "settings", "Settings", "", "top");
   $("#nav").innerHTML = html;
 }
 async function getSeries(sid) {
@@ -190,10 +273,29 @@ async function refreshStatus() {
     App.status = s; App.loras = s.loras || [];
     const line = (ok, text, title) => `<div class="line" title="${esc(title || text)}"><span class="dot ${ok ? "ok" : "bad"}"></span><span class="lbl">${esc(text)}</span></div>`;
     $("#status").innerHTML = line(s.comfy, s.comfy ? "ComfyUI online" : "ComfyUI offline", s.comfy_host) +
-      line(s.ollama_models.length > 0, s.ollama_models.length ? "Ollama · " + s.planner_model : "Ollama offline", s.planner_model) +
+      (s.planner_provider && s.planner_provider !== "ollama" ? line(!s.missing.includes(s.planner_provider + ":api_key"), "Shots · " + s.planner, s.planner) : line(s.ollama_models.length > 0, s.ollama_models.length ? "Ollama · " + s.planner_model : "Ollama offline", s.planner_model)) +
+      (s.voices ? line(s.voices.ok, s.voices.ok ? "Voices · VoiceStudio" : "VoiceStudio offline", s.voices.device || "systemctl --user start reelwright-voice") : "") +
       (s.missing.length ? `<div class="line"><span class="chip warn" title="${esc(s.missing.join("\n"))}">${s.missing.length} missing models</span></div>` : "");
   } catch { $("#status").innerHTML = `<div class="line"><span class="dot bad"></span><span class="lbl">Server unreachable</span></div>`; }
 }
+
+/** Reload the whole app: fetches fresh scripts and data. Asks first if there is something unsaved. */
+async function reloadApp(clearCaches = false) {
+  const button = $("#refresh-btn"); button.classList.add("spinning");
+  try {
+    let lost = App.dirty;
+    if (App.timelineEditor?.dirty) { try { await App.timelineEditor.flush(); lost = false; } catch { lost = true; } }
+    if (lost && !(await ask("You have changes that are not saved. Reload anyway?", "Reload", true))) return;
+    App.dirty = false;  // we have asked; do not let the browser ask again
+    try {
+      const registration = await navigator.serviceWorker?.getRegistration();
+      await registration?.update();
+      if (clearCaches) { for (const key of await caches.keys()) await caches.delete(key); await registration?.unregister(); }
+    } catch { /* reloading still works without the service worker */ }
+    location.reload();
+  } finally { button.classList.remove("spinning"); }
+}
+$("#refresh-btn").onclick = (event) => reloadApp(event.shiftKey || event.altKey);
 
 function openJobs(on = true) { $("#jobs").classList.toggle("on", on); $("#scrim").classList.toggle("on", on); }
 $("#jobs-btn").onclick = () => openJobs(!$("#jobs").classList.contains("on"));
@@ -253,6 +355,7 @@ async function buildPalette() {
     { g: "Actions", label: "Toggle light / dark theme", icon: "sun", run: () => $("#theme-btn").click() },
     { g: "Actions", label: "Toggle sidebar", icon: "panel", run: () => $("#collapse-btn").click() },
     { g: "Actions", label: "Open activity", icon: "activity", run: () => openJobs(true) },
+    { g: "Actions", label: "Reload the app", icon: "refresh", run: () => reloadApp(false) },
     { g: "Actions", label: "Keyboard shortcuts", icon: "info", run: showShortcuts },
   ];
   try { App.series = await GET("/api/series"); } catch { /* offline */ }
@@ -330,22 +433,34 @@ document.addEventListener("keydown", (e) => {
 // ── router ───────────────────────────────────────────────────────────────
 const SKELETON = `<div class="skel h1"></div><div class="skel row-card"></div><div class="skel row-card"></div>`;
 async function route() {
+  if (App.pgViewport) { App.pgViewport.destroy(); App.pgViewport = null; }
+  if (App.timelineEditor) {
+    const editor = App.timelineEditor;
+    try { if (editor.dirty) await editor.flush(); }
+    catch (error) { toast('Timeline could not save. Your edit is still open: ' + error.message, true); return; }
+    editor.destroy(); App.timelineEditor = null;
+  }
   closeModal();
-  App.refreshers = []; App.selecting = false; App.dirty = false; App.dirtyWarned = false;
+  App.refreshers = []; App.soft = null; App.selecting = false; App.dirty = false; App.dirtyWarned = false; App.saveKey = null;
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
   const first = !App.route.length || App.route.join("/") !== parts.join("/");
   App.route = parts;
   setMenu(false);
+  document.body.classList.remove("has-stepper");
   const view = $("#view");
   if (first) { view.innerHTML = SKELETON; view.style.animation = "none"; void view.offsetHeight; view.style.animation = ""; }
   renderNav();
-  try {
+  // Re-rendering the page you are already on must not throw away where you were in it.
+  const keep = first ? null : { y: window.scrollY, open: $$("details", view).map((d) => d.open) };
+  const dispatch = async () => {
     if (!parts.length) return await viewHome(view);
     if (parts[0] === "models") return await viewModels(view);
+    if (parts[0] === "ai") return await viewAI(view);
     if (parts[0] === "settings") return await viewSettings(view);
     if (parts[0] === "s") {
       const sid = parts[1];
       if (parts.length === 2) return await viewSeries(view, sid);
+      if (parts[2] === "playground") return await viewPlayground(view, sid);
       if (parts[2] === "c") return await viewCharacter(view, sid, parts[3]);
       if (parts[2] === "l") return await viewLocation(view, sid, parts[3]);
       if (parts[2] === "style") return await viewStyle(view, sid);
@@ -353,12 +468,16 @@ async function route() {
     }
     crumbs([["Not found", null]]);
     view.innerHTML = `<div class="empty"><b>Page not found</b><a href="#/">Back to projects</a></div>`;
-  } catch (err) {
-    view.innerHTML = `<div class="notice">${ic("alert")}<span>${esc(err.message)}</span></div>`;
+  };
+  try { await dispatch(); }
+  catch (err) { view.innerHTML = `<div class="notice">${ic("alert")}<span>${esc(err.message)}</span></div>`; }
+  if (keep) {
+    $$("details", view).forEach((d, i) => { if (i < keep.open.length) d.open = keep.open[i]; });
+    window.scrollTo({ top: keep.y, behavior: "instant" });
   }
 }
 window.addEventListener("hashchange", route);
-$("#view").addEventListener("input", (e) => { if (!e.target.matches("input[type=file], .bulk-check, .bulk-actions input, input[data-chk]")) App.dirty = true; });
+$("#view").addEventListener("input", (e) => { if (!e.target.closest(".pg-page") && !e.target.matches("input[type=file], .bulk-check, .bulk-actions input, input[data-chk], input[data-chk-all], #take-model, #ntakes, #src-override, [data-edit-model]")) App.dirty = true; });
 window.addEventListener("beforeunload", (e) => { if (App.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
 // ── shared bits ──────────────────────────────────────────────────────────
@@ -370,6 +489,11 @@ function addCard(id, placeholder, btnId, btnLabel, primary) {
   return `<div class="addrow"><input id="${id}" placeholder="${placeholder}"><button class="${primary ? "primary" : ""}" id="${btnId}">${btnLabel}</button></div>`;
 }
 const printFig = (src, name, href, sub) => `<a class="print" href="${href}"><figure style="margin:0">${src ? `<img src="${src}" loading="lazy" alt="">` : `<div class="ph">${esc(name.charAt(0).toUpperCase())}</div>`}<figcaption><span class="nm">${esc(name)}</span><div class="muted small" style="font-weight:400">${esc(sub)}</div></figcaption></figure></a>`;
+// Ctrl/Cmd+S runs the current page's save (set per page with saveShortcut, cleared on navigation).
+const saveShortcut = (fn) => { App.saveKey = fn; };
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "s" && App.saveKey) { e.preventDefault(); App.saveKey(); }
+});
 const onEnter = (sel, fn) => $(sel).addEventListener("keydown", (e) => { if (e.key === "Enter") fn(); });
 
 // ── home ────────────────────────────────────────────────────────────────
@@ -381,15 +505,20 @@ async function viewHome(view) {
   const details = await Promise.all(list.map((s) => getSeries(s.id).catch(() => null)));
   view.innerHTML = `
     <div class="page-head"><div><h1>${list.length ? "Projects" : "Start your first project"}</h1>
-      <p class="sub">${list.length ? `${pl(list.length, "project")}, ${pl(details.reduce((a, d) => a + (d ? d.episodes.length : 0), 0), "episode")}, ${pl(details.reduce((a, d) => a + (d ? Object.keys(d.bible.characters).length : 0), 0), "character")}` : "A project holds a story world: its characters, locations and episodes."}</p></div></div>
+      <p class="sub">${list.length ? `${pl(list.length, "project")}, ${pl(details.reduce((a, d) => a + (d ? d.episodes.length : 0), 0), "episode")}, ${pl(details.reduce((a, d) => a + (d ? Object.keys(d.bible.characters).length : 0), 0), "character")} · Recently edited first by default; use the arrows to set a custom order.` : "A project holds a story world: its characters, locations and episodes."}</p></div></div>
     ${st.comfy === false ? `<div class="notice">${ic("alert")}<span>ComfyUI is not reachable at ${esc(st.comfy_host)}. Start Comfy Desktop - planning works without it, rendering doesn't.</span></div>` : ""}
     ${(st.missing || []).length ? `<div class="notice">${ic("alert")}<span>Not found: ${esc(st.missing.join(", "))}. Fix names in Settings or install them.</span></div>` : ""}
     <div class="sheets">${list.map((s, k) => {
       const d = details[k];
       const imgs = d ? [...Object.values(d.bible.characters).map(charThumb), ...Object.values(d.bible.locations).map(locThumb)].filter(Boolean).slice(0, 3) : [];
       const cells = [0, 1, 2].map((i) => `<i>${imgs[i] ? `<img src="${imgs[i]}" loading="lazy" alt="">` : ""}</i>`).join("");
-      return `<a class="sheet" href="#/s/${esc(s.id)}"><div class="strip">${cells}</div><h3>${esc(s.name)}</h3>
-        <div class="muted small">${d ? `${pl(d.episodes.length, "episode")}, ${pl(Object.keys(d.bible.characters).length, "character")}, ${pl(Object.keys(d.bible.locations).length, "location")}` : ""}</div></a>`;
+      return `<div class="project-card"><a class="sheet" href="#/s/${esc(s.id)}"><div class="strip">${cells}</div><h3>${esc(s.name)}</h3>
+        <div class="muted small">${d ? `${pl(d.episodes.length, "episode")}, ${pl(Object.keys(d.bible.characters).length, "character")}, ${pl(Object.keys(d.bible.locations).length, "location")}` : ""}</div></a>
+        <div class="project-order" aria-label="Project position">
+          <button type="button" data-project-move="${k}" data-direction="-1" aria-label="Move ${esc(s.name)} up" title="Move up" ${k === 0 ? "disabled" : ""}>↑</button>
+          <span>${k + 1}</span>
+          <button type="button" data-project-move="${k}" data-direction="1" aria-label="Move ${esc(s.name)} down" title="Move down" ${k === list.length - 1 ? "disabled" : ""}>↓</button>
+        </div></div>`;
     }).join("")}</div>
     <div class="addrow" style="margin-top:34px"><input id="new-series" placeholder="New project name, e.g. Summer Stories"><button class="primary" id="add-series">Create project</button></div>`;
   const create = async () => {
@@ -402,8 +531,125 @@ async function viewHome(view) {
       await api("DELETE", `/api/s/${sid}`); delete App.sd[sid];
     }
   }, route, "projects");
+  $$("[data-project-move]", view).forEach(button => {
+    button.onclick = async (event) => {
+      event.preventDefault(); event.stopPropagation();
+      const from = Number(button.dataset.projectMove), to = from + Number(button.dataset.direction);
+      if (to < 0 || to >= list.length) return;
+      const ids = list.map(item => item.id);
+      [ids[from], ids[to]] = [ids[to], ids[from]];
+      button.disabled = true;
+      try {
+        await PUT("/api/series/order", { ids });
+        toast("Project order saved");
+        await route();
+      } catch { await route(); }
+    };
+  });
   $("#add-series").onclick = create; onEnter("#new-series", create);
 }
+
+async function viewPlayground(view, sid) {
+  const d = await getSeries(sid), pg = await GET(`/api/s/${sid}/playground`);
+  const chars = pg.characters.filter(c => !c.draft), locs = pg.locations.filter(l => !l.draft);
+  crumbs([[d.series.name, `#/s/${sid}`], ["Playground", null]]);
+  const renderGallery = () => {
+    const root = $("#pg-renders", view); if (!root) return;
+    $("#pg-results-count", view).textContent = `${pg.renders.length} ${pg.renders.length === 1 ? "frame" : "frames"}`;
+    root.innerHTML = pg.renders.length ? `<div class="pg-gallery">${pg.renders.map(r => `<article class="pg-result"><button class="pg-result-image" data-zoom="${media(r.file)}" aria-label="View render"><img src="${media(r.file)}" loading="lazy" alt="Generated test frame"></button><div class="pg-result-info"><span class="chip">${esc(sourceLabel(r.source))}</span><time>${esc(r.created || "")}</time></div><details><summary>Prompt used</summary><p>${esc(r.prompt)}</p></details></article>`).join("")}</div>` : `<div class="pg-empty"><div class="pg-empty-mark">✳</div><b>No renders yet</b><span>Direct a scene in the viewport, then render a test frame.</span></div>`;
+    $$('[data-zoom]', root).forEach(img => img.onclick = () => zoom(img.dataset.zoom));
+  };
+  const locationPlate = l => l && ((l.plates || {})[$("#pg-time", view)?.value.trim()] || Object.values(l.plates || {})[0] || "");
+  view.innerHTML = `<div class="pg-page">
+    <header class="pg-heading"><div><div class="pg-eyebrow">${esc(d.series.name)} <span>/</span> DIRECTOR'S DESK</div><h1>Playground</h1><p>Build the shot yourself. Select a character, drag them into place, and orbit the scene.</p></div><a class="pg-back" href="#/s/${sid}">← Project</a></header>
+    ${!chars.length || !locs.length ? `<div class="notice">Add at least one saved character and one saved location to this project's Bible to build a scene.</div>` : ""}
+    <div class="pg3-workspace"><section class="pg3-main">
+      <div class="pg3-toolbar"><div class="pg3-tools"><button class="pg3-mode on" data-mode="move" title="Move object (W)">↔ <span>Move</span></button><button class="pg3-mode" data-mode="rotate" title="Rotate object (E)">⟳ <span>Rotate</span></button><button class="pg3-mode" data-mode="scale" title="Scale object (R)">⤢ <span>Scale</span></button></div><span class="pg3-toolbar-help">Drag an object to move · Drag empty space to orbit · Scroll to zoom</span><button id="pg3-reset" class="pg3-quiet">Reset view</button></div>
+      <div class="pg3-viewport" id="pg3-host"><div class="pg3-loading">Preparing the 3D scene…</div></div>
+      <div class="pg3-status"><span><i class="pg3-dot"></i> EDITOR VIEW</span><span id="pg3-selected">Select an object in the scene</span><span id="pg3-coords">—</span></div>
+      <section class="pg-results"><div class="pg-results-head"><div><span class="pg-eyebrow">GALLERY</span><h2>Test renders</h2></div><span class="pg-results-count" id="pg-results-count">${pg.renders.length} ${pg.renders.length === 1 ? "frame" : "frames"}</span></div><div id="pg-renders"></div></section>
+    </section><aside class="pg3-inspector">
+      <section class="pg3-panel"><div class="pg3-panel-head"><span>01</span><div><b>Environment</b><small>Set the scene location</small></div></div>
+        <label class="pg-field">Project location<select id="pg-location">${locs.map(l => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join("")}</select></label>
+        <div class="pg3-location-note" id="pg3-location-note"></div><label class="pg-field">Time / atmosphere<input id="pg-time" placeholder="Evening, rain, fog…"></label>
+      </section>
+      <section class="pg3-panel"><div class="pg3-panel-head"><span>02</span><div><b>Scene objects</b><small>Check to add to the 3D scene</small></div></div>
+        <div class="pg3-entity-list">${chars.map(c => `<label class="pg3-entity"><input type="checkbox" class="pg-char" value="${esc(c.id)}"><span class="pg-avatar">${charThumb(c) ? `<img src="${charThumb(c)}" alt="">` : `<span>${esc((c.name || "?").slice(0, 1))}</span>`}</span><span class="pg3-entity-name">${esc(c.name)}<small>${(c.refs || []).length ? "Reference photo ready" : "Description only"}</small></span><span class="pg3-add">+</span></label>`).join("") || `<div class="pg-no-cast">No saved characters in this project's Bible.</div>`}</div>
+        <div class="pg3-props" id="pg3-props"></div><div class="pg3-entity-tools"><button type="button" id="pg3-add-car">＋ Add car</button><button type="button" id="pg3-add-block">＋ Add prop</button></div>
+      </section>
+      <section class="pg3-panel"><div class="pg3-panel-head"><span>03</span><div><b>Camera</b><small>Adjust the view and shot</small></div></div>
+        <label class="pg-field">Shot size<select id="pg-framing">${["wide", "medium", "medium close-up", "close-up", "over-the-shoulder", "two-shot"].map(x => `<option>${x}</option>`).join("")}</select></label>
+        <label class="pg3-range">Orbit <output id="pg3-angle-out">0°</output><input id="pg3-angle" type="range" min="-180" max="180" value="0"></label>
+        <label class="pg3-range">Camera height <output id="pg3-height-out">5.5 m</output><input id="pg3-height" type="range" min="1.2" max="13" step="0.1" value="5.5"></label>
+        <label class="pg3-range">Distance <output id="pg3-distance-out">13 m</output><input id="pg3-distance" type="range" min="5" max="35" step="0.5" value="13"></label>
+        <label class="pg3-range">Lens <output id="pg3-lens-out">50 mm</output><input id="pg3-lens" type="range" min="18" max="100" step="1" value="50"></label>
+      </section>
+      <section class="pg3-panel"><div class="pg3-panel-head"><span>04</span><div><b>Render</b><small>Generate a still from this setup</small></div></div>
+        <label class="pg-field">Image model<select id="pg-model" ${pg.models.length ? "" : "disabled"}>${pg.models.map(m => `<option value="${esc(m.source)}">${esc(m.label)}</option>`).join("")}</select></label>
+        <label class="pg-field">Action / direction <textarea id="pg-action" placeholder="Optional: describe what happens in the shot…"></textarea></label>
+        <label class="pg-field">Visual notes <textarea id="pg-extra" placeholder="Optional: lighting, weather, mood…"></textarea></label>
+        ${pg.models.length ? "" : `<div class="pg-model-empty">No ready image models are configured.</div>`}
+        <button class="primary pg3-render" id="pg-render" ${pg.models.length && locs.length ? "" : "disabled"}>Render test frame <b>↗</b></button><p class="pg3-render-note">Scene objects, layout, and camera are included in the prompt. Renders stay in this project's gallery.</p>
+      </section>
+    </aside></div></div>`;
+  renderGallery();
+  const { DirectorViewport } = await import("/static/playground3d.js");
+  const initialLoc = locs[0];
+  const selectedChars = () => $$(".pg-char:checked", view).map((box, i) => {
+    const c = chars.find(ch => ch.id === box.value), old = viewport?.getState().entities.find(e => e.id === box.value);
+    return { id: c.id, name: c.name, appearance: c.appearance, refs: c.refs, position: old?.position || [((i - (box.parentElement.parentElement.querySelectorAll(".pg-char:checked").length - 1) / 2) * 2.4), 0, 1.5], rotation: old?.rotation || [0, 0, 0], scale: old?.scale || 1 };
+  });
+  let viewport;
+  let propSignature = "";
+  const paintState = state => {
+    $$(".pg3-mode", view).forEach(button => button.classList.toggle("on", button.dataset.mode === state.mode));
+    const chosen = state.entities.find(e => e.id === state.selectedId), name = chosen && (chars.find(c => c.id === chosen.id)?.name || chosen.id);
+    $("#pg3-selected", view).textContent = chosen ? `${name} · ${state.selectedId}` : "Select an object in the scene";
+    $("#pg3-coords", view).textContent = chosen ? `X ${chosen.position[0].toFixed(1)}  Y ${chosen.position[1].toFixed(1)}  Z ${chosen.position[2].toFixed(1)}` : "—";
+    $("#pg3-angle", view).value = Math.round(state.camera.azimuth); $("#pg3-angle-out", view).textContent = `${Math.round(state.camera.azimuth)}°`;
+    $("#pg3-height", view).value = state.camera.height; $("#pg3-height-out", view).textContent = `${state.camera.height.toFixed(1)} m`;
+    $("#pg3-distance", view).value = state.camera.distance; $("#pg3-distance-out", view).textContent = `${state.camera.distance.toFixed(1)} m`;
+    $("#pg3-lens", view).value = state.camera.lens; $("#pg3-lens-out", view).textContent = `${Math.round(state.camera.lens)} mm`;
+    $$(".pg3-entity", view).forEach(row => row.classList.toggle("active", $(".pg-char", row).checked));
+    const propList = $("#pg3-props", view);
+    const props = state.entities.filter(e => e.kind === "prop"), signature = `${state.selectedId}|${props.map(e => e.id).join(",")}`;
+    if (signature !== propSignature) {
+      propSignature = signature;
+      propList.innerHTML = props.map(e => `<div class="pg3-prop-row ${e.id === state.selectedId ? "active" : ""}"><button type="button" class="pg3-prop-name" data-focus="${esc(e.id)}">▰ ${esc(e.name)}</button><button type="button" class="pg3-prop-remove" data-remove="${esc(e.id)}" aria-label="Remove ${esc(e.name)}">×</button></div>`).join("");
+      $$('[data-focus]', propList).forEach(button => button.onclick = () => viewport.focus(button.dataset.focus));
+      $$('[data-remove]', propList).forEach(button => button.onclick = () => viewport.removeEntity(button.dataset.remove));
+    }
+  };
+  viewport = new DirectorViewport($("#pg3-host", view), { characters: [], onChange: paintState });
+  if (initialLoc) viewport.setLocation(initialLoc.name, locationPlate(initialLoc) ? media(locationPlate(initialLoc)) : "");
+  $("#pg3-location-note", view).textContent = initialLoc?.description || "Project location blockout";
+  $$(".pg-char", view).forEach(box => box.addEventListener("change", () => viewport.setCharacters(selectedChars())));
+  $$(".pg3-mode", view).forEach(button => button.onclick = () => { $$(".pg3-mode", view).forEach(b => b.classList.toggle("on", b === button)); viewport.setMode(button.dataset.mode); });
+  $("#pg3-reset", view).onclick = () => { viewport.cameraState = { azimuth: 0, height: 5.5, distance: 13, lens: 50 }; viewport.updateCamera(); paintState(viewport.getState()); };
+  $("#pg3-host", view).addEventListener("contextmenu", e => e.preventDefault());
+  const syncEnvironment = () => { const l = locs.find(x => x.id === $("#pg-location", view).value); const plate = locationPlate(l); viewport.setLocation(l?.name || "Location", plate ? media(plate) : ""); $("#pg3-location-note", view).textContent = l?.description || "Project location blockout"; };
+  $("#pg-location", view).onchange = syncEnvironment;
+  $("#pg-time", view).addEventListener("change", syncEnvironment);
+  const cameraInputs = [["#pg3-angle", "azimuth"], ["#pg3-height", "height"], ["#pg3-distance", "distance"], ["#pg3-lens", "lens"]];
+  cameraInputs.forEach(([sel, key]) => $(sel, view).addEventListener("input", e => viewport.setCameraState(key, e.target.value)));
+  $("#pg3-add-car", view).onclick = () => viewport.addProp("car");
+  $("#pg3-add-block", view).onclick = () => viewport.addProp("prop");
+  const refreshGallery = async () => { try { pg.renders = (await GET(`/api/s/${sid}/playground`)).renders; renderGallery(); } catch { /* keep current gallery */ } };
+  App.refreshers.push(refreshGallery);
+  $("#pg-render", view).onclick = async () => {
+    const state = viewport.getState(), camera = state.camera;
+    const cameraText = `${camera.height.toFixed(1)} m high, ${camera.azimuth.toFixed(0)}° azimuth (fixed viewpoint), ${camera.distance.toFixed(1)} m from the scene, ${Math.round(camera.lens)} mm lens`;
+    const body = { source: $("#pg-model", view).value, location_id: $("#pg-location", view).value,
+      time_of_day: $("#pg-time", view).value, framing: $("#pg-framing", view).value, camera: cameraText,
+      camera_state: camera, action: $("#pg-action", view).value, extra: $("#pg-extra", view).value,
+      character_ids: state.entities.filter(e => e.kind === "character").map(e => e.id),
+      positions: Object.fromEntries(state.entities.filter(e => e.kind === "character").map(e => [e.id, { position: e.position, rotation: e.rotation, scale: e.scale }])),
+      scene_props: state.entities.filter(e => e.kind === "prop").map(e => ({ name: e.name, position: e.position, rotation: e.rotation, scale: e.scale })) };
+    await startJob(`/api/s/${sid}/playground/render`, body);
+  };
+  App.pgViewport = viewport;
+}
+
 
 // ── series overview ─────────────────────────────────────────────────────
 async function viewSeries(view, sid) {
@@ -414,7 +660,7 @@ async function viewSeries(view, sid) {
     <div class="page-head"><div><h1>${esc(d.series.name)}</h1>
       <p class="sub">${pl(d.episodes.length, "episode")}, ${pl(d.episodes.reduce((a, e) => a + e.shots, 0), "shot")}, ${pl(chars.length, "character")}, ${pl(locs.length, "location")}. <a href="#/s/${sid}/style">Style &amp; props</a></p></div></div>
     <div class="section-head"><h2>Episodes</h2></div>
-    ${d.episodes.length ? `<div class="eplist">${d.episodes.map((e, k) => `<a class="eprow" href="#/s/${sid}/e/${e.id}/story"><span class="n">EP ${String(k + 1).padStart(2, "0")}</span><span class="t">${esc(e.title)}</span><span class="muted small">${pl(e.shots, "shot")}</span></a>`).join("")}</div>` : `<div class="empty"><b>No episodes yet</b>Name one below to start writing.</div>`}
+    ${d.episodes.length ? `<div class="eplist">${d.episodes.map((e, k) => `<a class="eprow" href="#/s/${sid}/e/${e.id}/story"><span class="n">EP ${String(k + 1).padStart(2, "0")}</span><span class="t">${esc(e.title)}</span><span class="muted small">${pl(e.shots, "shot")}</span><button type="button" class="link ep-clone" data-clone="${esc(e.id)}" data-title="${esc(e.title)}">Clone</button></a>`).join("")}</div>` : `<div class="empty"><b>No episodes yet</b>Name one below to start writing.</div>`}
     ${addCard("new-ep", "Episode title", "add-ep", "New episode", true)}
     <div class="section-head"><h2>Characters</h2></div>
     <div class="prints">${chars.map((c) => printFig(charThumb(c), c.name, `#/s/${sid}/c/${c.id}`, `${c.draft ? "draft, " : ""}${c.image_lora?.name ? "LoRA" : "no LoRA"}, ${pl((c.refs || []).length, "photo")}`)).join("")}</div>
@@ -422,13 +668,11 @@ async function viewSeries(view, sid) {
     <div class="section-head"><h2>Locations</h2></div>
     <div class="prints wide">${locs.map((l) => printFig(locThumb(l), l.name, `#/s/${sid}/l/${l.id}`, `${l.draft ? "draft, " : ""}${Object.keys(l.variants || {}).join(", ") || "no variants"}`)).join("")}</div>
     ${addCard("new-loc", "Location name", "add-loc", "Add location")}`;
-  const deleteProject = document.createElement("button"); deleteProject.className = "danger";
-  deleteProject.textContent = "Delete project"; $(".page-head", view).append(deleteProject);
-  deleteProject.onclick = async () => {
+  pageMenu(view, [["Style & props", () => { location.hash = `#/s/${sid}/style`; }], ["Delete project…", async () => {
     if (await ask(`Delete ${d.series.name} and all its episodes? Files are kept in a .deleted folder.`, "Delete project", true)) {
       await api("DELETE", `/api/s/${sid}`); delete App.sd[sid]; location.hash = "#/";
     }
-  };
+  }, true]]);
   bulkSelect(view, ".eprow, .prints a", async targets => {
     for (const target of targets) {
       const parts = target.getAttribute("href").split("/");
@@ -441,6 +685,13 @@ async function viewSeries(view, sid) {
   const addLoc = async () => { const l = await POST(`/api/s/${sid}/locations`, { name: $("#new-loc").value || "New location" }); location.hash = `#/s/${sid}/l/${l.id}`; };
   $("#add-ep").onclick = addEp; $("#add-char").onclick = addChar; $("#add-loc").onclick = addLoc;
   onEnter("#new-ep", addEp); onEnter("#new-char", addChar); onEnter("#new-loc", addLoc);
+  view.onclick = (ev) => {
+    const b = ev.target.closest("[data-clone]");
+    if (!b) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    cloneEpisode(sid, b.dataset.clone, b.dataset.title);
+  };
 }
 
 // ── helpers for key: value textareas ────────────────────────────────────
@@ -455,12 +706,16 @@ function textToKv(t) {
   return o;
 }
 function loraSelect(id, value) {
-  const opts = [""].concat(App.loras || []);
+  const presets = Object.keys(App.status?.image_lora_presets || {});
+  const opts = [""].concat([...new Set([...(App.loras || []), ...presets])]);
   if (value && !opts.includes(value)) opts.push(value);
   return `<select id="${id}">${opts.map((o) => `<option value="${esc(o)}" ${o === value ? "selected" : ""}>${o ? esc(o) : "- none -"}</option>`).join("")}</select>`;
 }
-const sourceSelect = (id, value, allowInherit = true) =>
-  `<select id="${id}">${(allowInherit ? [""] : []).concat(["flux_lora", "zimage", "qwen_refs", "auto", "upload"]).map((o) => `<option value="${o}" ${o === (value || "") ? "selected" : ""}>${o ? sourceLabel(o) : "inherit"}</option>`).join("")}</select>`;
+const sourceSelect = (id, value, allowInherit = true) => {
+  const opts = (allowInherit ? [""] : []).concat(["flux_lora", "zimage", "qwen_refs", "qwen_2511"], (App.ai?.choices.image || []).map((c) => c.source), ["auto", "upload"]);
+  if (value && !opts.includes(value)) opts.push(value);
+  return `<select id="${id}">${opts.map((o) => `<option value="${esc(o)}" ${o === (value || "") ? "selected" : ""}>${o ? esc(sourceLabel(o)) : "inherit"}</option>`).join("")}</select>`;
+};
 
 // ── character ───────────────────────────────────────────────────────────
 async function viewCharacter(view, sid, cid) {
@@ -473,54 +728,104 @@ async function viewCharacter(view, sid, cid) {
       <div><h1>${esc(c.name)}</h1><div class="row sub"><span class="chip">v${c.version}</span><span class="chip ${c.image_lora?.name ? "accent" : ""}">${c.image_lora?.name ? "LoRA set" : "no LoRA"}</span><span class="chip">${(c.refs || []).length} reference photos</span></div></div></div>
     ${c.draft ? `<div class="notice">Drafted from the story - review the description, pick a LoRA, then save.</div>` : ""}
     <div class="card form-grid">
+      <h3 class="form-sec full">Identity</h3>
       <div><label>Name</label><input id="f-name" value="${esc(c.name)}"></div>
-      <div><label>Trigger token (from LoRA training, e.g. ohwx_sam)</label><input id="f-trigger" value="${esc(c.trigger)}"></div>
+      <div><label>Trigger token (auto-filled for registered LoRAs)</label><input id="f-trigger" value="${esc(c.trigger)}" ${App.status?.image_lora_presets?.[c.image_lora?.name] ? "readonly" : ""}></div>
       <div class="full"><label>Locked appearance (50-80 words, copied verbatim into every prompt)</label><textarea id="f-app">${esc(c.appearance)}</textarea></div>
+      <h3 class="form-sec full">Wardrobe &amp; acting</h3>
       <div class="full"><label>Outfits - one per line, "name: description"</label><textarea id="f-outfits">${esc(kvToText(c.outfits))}</textarea></div>
       <div><label>Default outfit</label><input id="f-defout" value="${esc(c.default_outfit)}"></div>
       <div><label>Never change (comma separated)</label><input id="f-never" value="${esc((c.never_change || []).join(", "))}"></div>
       <div class="full"><label>Acting notes</label><textarea id="f-acting" style="min-height:44px">${esc(c.acting_notes)}</textarea></div>
-      <div><label>Image LoRA (Flux 1)</label>${loraSelect("f-ilora", c.image_lora?.name)}</div>
+      <h3 class="form-sec full">Models</h3>
+      <div><label>Image LoRA</label>${loraSelect("f-ilora", c.image_lora?.name)}</div>
       <div><label>Image LoRA strength</label><input id="f-ilora-s" type="number" step="0.05" value="${c.image_lora?.strength ?? 0.9}"></div>
+      <div><label>Image LoRA base (must match training)</label><select id="f-ilora-family">
+        <option value="flux1" ${(c.image_lora?.model_family || "flux1") === "flux1" ? "selected" : ""}>FLUX.1</option>
+        <option value="flux2_klein" ${c.image_lora?.model_family === "flux2_klein" ? "selected" : ""}>FLUX.2 Klein Base 4B</option>
+      </select></div>
       <div><label>Video LoRA (Wan 2.2, optional)</label>${loraSelect("f-vlora", c.video_lora?.name)}</div>
       <div><label>Video LoRA strength</label><input id="f-vlora-s" type="number" step="0.05" value="${c.video_lora?.strength ?? 0.8}"></div>
       <div><label>First-frame source</label>${sourceSelect("f-src", c.frame_source)}</div>
+      <h3 class="form-sec full">Voice</h3>
       <div><label>Speaking rate (words per minute)</label><input id="f-wpm" type="number" value="${c.voice?.wpm ?? 140}"></div>
-      <div class="full"><label>Voice description (goes into the video prompt)</label><input id="f-voice" value="${esc(c.voice?.description)}"></div>
-      <div class="full row" style="margin-top:12px"><button class="primary" id="save">Save</button><span class="grow"></span><button class="danger" id="del">Delete character</button></div>
+      <div class="full"><label>Voice description (how the character sounds, e.g. "a cheerful four-year-old boy, high-pitched child voice"; also goes into the video prompt)</label><input id="f-voice" value="${esc(c.voice?.description)}"></div>
+      <div class="full row save-bar"><button class="primary" id="save">Save character</button><span class="grow"></span><button class="danger" id="del">Delete character…</button></div>
     </div>
-    <h2>Voice sample (5 s .wav for LTX voice identity)</h2>
-    <div class="card row">${c.voice?.file ? `<audio controls src="${media(c.voice.file)}"></audio>` : `<span class="muted">none</span>`}
-      <input type="file" id="voice-file" accept="audio/*"><button id="voice-up">Upload voice</button></div>
+    <h2>Voice <span class="muted small">(the reference every dialogue line is cloned from)</span></h2>
+    <div class="card row">${c.voice?.file ? `<audio controls src="${media(c.voice.file)}"></audio><span class="chip">${c.voice.profile ? `VoiceStudio: ${esc(c.voice.profile.name)}` : c.voice.designed ? "designed" : "recorded"}</span>` : `<span class="muted">none yet</span>`}
+      <input type="file" id="voice-file" accept="audio/*"><button id="voice-up">Upload a recording (5-20 s)</button>
+      <button id="voice-design" title="Uses the voice description above">Design voice from description</button></div>
+    <div class="card row" style="margin-top:8px"><label for="voice-profile" class="small">VoiceStudio voice library</label>
+      <select id="voice-profile" aria-label="VoiceStudio voice"><option value="">Loading voices…</option></select>
+      <button id="voice-profile-use">Use this voice</button>
+      <span class="muted small">Clone or design voices in VoiceStudio; they appear here.</span></div>
     <h2>References <span class="muted small">(approved identity images)</span></h2>
     <div class="cards">${(c.refs || []).map((r) => `<div class="card"><img class="thumb square" src="${media(r)}" data-zoom="${media(r)}"><button class="link danger" data-unref="${esc(r)}">remove</button></div>`).join("") || `<p class="muted">None yet. Render a character sheet below and approve the best images, or upload your own.</p>`}</div>
     <div class="row" style="margin-top:8px"><input type="file" id="ref-file" accept="image/*"><button id="ref-up">Upload reference</button></div>
     <h2>Character sheet</h2>
-    <div class="row"><button class="primary" id="sheet-flux">Render sheet with Flux + LoRA</button><button id="sheet-z">Render with Z-Image</button>
+    <div class="row"><button class="primary" id="sheet-qwen" title="Redraws the first reference photo in each view, so the sheet keeps the real face">Render from photo (Qwen Edit)</button><button id="sheet-flux">Render with Flux + LoRA</button><button id="sheet-z">Render with Z-Image</button>${imageOptions() ? `<span class="row"><select id="sheet-cloud" aria-label="Cloud image model">${imageOptions()}</select><button id="sheet-cloud-go" title="Keeps the face of the first reference photo">Render with this model</button></span>` : ""}
       <span class="muted small">Front, three-quarter, full body, profile. Save first if you changed the description.</span></div>
     <div class="cards" style="margin-top:12px">${(c.sheet || []).slice().reverse().map((s) => `<div class="card"><img class="thumb square" src="${media(s.file)}" data-zoom="${media(s.file)}">
-      <div class="row small muted" style="margin-top:6px"><span class="grow">${esc(s.view)} · ${sourceLabel(s.source)}</span>
+      <div class="row small muted" style="margin-top:6px"><span class="grow">${esc(s.view)} · ${sourceLabel(s.source)}${s.likeness != null ? ` · <span title="Face match with the photo (detector). Below 0.3 may not read as this person; 0.8+ looks copied.">likeness ${s.likeness}</span>` : ""}</span>
       ${(c.refs || []).includes(s.file) ? `<span class="chip good">reference</span>` : `<button data-ref="${esc(s.file)}">Use as reference</button>`}</div></div>`).join("")}</div>`;
   const collect = () => ({
     name: $("#f-name").value, trigger: $("#f-trigger").value.trim(), appearance: $("#f-app").value.trim(),
     outfits: textToKv($("#f-outfits").value), default_outfit: $("#f-defout").value.trim() || "default",
     never_change: $("#f-never").value.split(",").map((x) => x.trim()).filter(Boolean),
     acting_notes: $("#f-acting").value,
-    image_lora: { name: $("#f-ilora").value, strength: parseFloat($("#f-ilora-s").value) || 0.9 },
+    image_lora: { name: $("#f-ilora").value, strength: parseFloat($("#f-ilora-s").value) || 0.9,
+      model_family: $("#f-ilora-family").value || "flux1" },
     video_lora: { name: $("#f-vlora").value, strength: parseFloat($("#f-vlora-s").value) || 0.8 },
     frame_source: $("#f-src").value,
     voice: { ...(c.voice || {}), wpm: parseInt($("#f-wpm").value) || 140, description: $("#f-voice").value },
   });
+  const imageLoraPresets = App.status?.image_lora_presets || {};
+  let activeImageLoraPreset = imageLoraPresets[c.image_lora?.name];
+  $("#f-ilora").addEventListener("change", () => {
+    const preset = imageLoraPresets[$("#f-ilora").value];
+    if (preset) {
+      $("#f-trigger").value = preset.trigger;
+      $("#f-trigger").readOnly = true;
+      $("#f-ilora-family").value = preset.model_family;
+    } else {
+      if (activeImageLoraPreset && $("#f-trigger").value.trim() === activeImageLoraPreset.trigger) {
+        $("#f-trigger").value = "";
+      }
+      $("#f-trigger").readOnly = false;
+      $("#f-ilora-family").value = "flux1";
+    }
+    activeImageLoraPreset = preset;
+  });
   $("#save").onclick = async () => { await PUT(`/api/s/${sid}/characters/${cid}`, collect()); toast("Saved. Shots using this character are now marked stale."); route(); };
   $("#del").onclick = async () => { if (await ask(`Delete ${c.name}? Files are kept in a .deleted folder.`, "Delete", true)) { await api("DELETE", `/api/s/${sid}/characters/${cid}`); location.hash = `#/s/${sid}`; } };
+  $("#sheet-qwen").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: "qwen_refs" });
   $("#sheet-flux").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: "flux_lora" });
   $("#sheet-z").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: "zimage" });
+  if ($("#sheet-cloud-go")) $("#sheet-cloud-go").onclick = () => startJob(`/api/s/${sid}/characters/${cid}/sheet`, { source: $("#sheet-cloud").value });
   const upload = async (kind, input) => {
     const f = $(input).files[0]; if (!f) return toast("Choose a file first", true);
     const fd = new FormData(); fd.append("kind", kind); fd.append("file", f);
     await FORM(`/api/s/${sid}/characters/${cid}/upload`, fd); route();
   };
   $("#voice-up").onclick = () => upload("voice", "#voice-file");
+  GET("/api/voices/profiles").then((list) => {
+    const sel = $("#voice-profile"); if (!sel) return;
+    sel.innerHTML = list.length ? list.map((p) => `<option value="${esc(p.id)}" ${c.voice?.profile?.id === p.id ? "selected" : ""}>${esc(p.name)}${p.own_voice ? " (own voice)" : ""}${p.kind === "design" ? " (designed)" : ""}${p.demo ? " (demo)" : ""}</option>`).join("")
+      : `<option value="">No voices in VoiceStudio yet</option>`;
+  }).catch(() => { const sel = $("#voice-profile"); if (sel) sel.innerHTML = `<option value="">VoiceStudio offline</option>`; });
+  $("#voice-profile-use").onclick = async () => {
+    const profile_id = $("#voice-profile").value;
+    if (!profile_id) return toast("Choose a VoiceStudio voice first.", true);
+    await POST(`/api/s/${sid}/characters/${cid}/voice/profile`, { profile_id });
+    toast("Voice assigned. Re-voice the dialogue to hear it in the film."); route();
+  };
+  $("#voice-design").onclick = async () => {
+    const description = $("#f-voice").value.trim();
+    if (!description) return toast("Write a voice description first.", true);
+    await PUT(`/api/s/${sid}/characters/${cid}`, collect()); App.dirty = false;
+    startJob(`/api/s/${sid}/characters/${cid}/voice`, { description });
+  };
   $("#ref-up").onclick = () => upload("ref", "#ref-file");
   view.onclick = async (e) => {
     const t = e.target;
@@ -549,11 +854,11 @@ async function viewLocation(view, sid, lid) {
       <div class="full"><label>Description (layout, materials, key objects)</label><textarea id="f-desc">${esc(l.description)}</textarea></div>
       <div class="full"><label>Time-of-day variants - one per line, "name: lighting description"</label><textarea id="f-var">${esc(kvToText(l.variants))}</textarea></div>
       <div class="full"><label>Ambient sound</label><input id="f-amb" value="${esc(l.ambience)}"></div>
-      <div class="full row" style="margin-top:12px"><button class="primary" id="save">Save</button><span class="grow"></span><button class="danger" id="del">Delete location</button></div>
+      <div class="full row save-bar"><button class="primary" id="save">Save location</button><span class="grow"></span><button class="danger" id="del">Delete location…</button></div>
     </div>
     <h2>Establishing plates</h2>
     <div class="row"><select id="p-var">${variants.map((v) => `<option>${esc(v)}</option>`).join("")}</select>
-      <button class="primary" id="gen-z">Render 4 with Z-Image</button><button id="gen-f">Render 4 with Flux</button>
+      <button class="primary" id="gen-z">Render 4 with Z-Image</button><button id="gen-f">Render 4 with Flux</button>${imageOptions() ? `<select id="gen-cloud" aria-label="Cloud image model">${imageOptions()}</select><button id="gen-cloud-go">Render 4 with this model</button>` : ""}
       <input type="file" id="p-file" accept="image/*"><button id="p-up">Upload</button></div>
     <h3>Approved</h3>
     <div class="cards">${Object.entries(l.plates || {}).map(([v, f]) => `<div class="card"><img class="thumb" src="${media(f)}" data-zoom="${media(f)}"><div class="small muted">${esc(v)}</div></div>`).join("") || `<p class="muted">none</p>`}</div>
@@ -567,6 +872,7 @@ async function viewLocation(view, sid, lid) {
   $("#del").onclick = async () => { if (await ask(`Delete ${l.name}?`, "Delete", true)) { await api("DELETE", `/api/s/${sid}/locations/${lid}`); location.hash = `#/s/${sid}`; } };
   $("#gen-z").onclick = () => startJob(`/api/s/${sid}/locations/${lid}/plates`, { variant: $("#p-var").value, source: "zimage" });
   $("#gen-f").onclick = () => startJob(`/api/s/${sid}/locations/${lid}/plates`, { variant: $("#p-var").value, source: "flux_lora" });
+  if ($("#gen-cloud-go")) $("#gen-cloud-go").onclick = () => startJob(`/api/s/${sid}/locations/${lid}/plates`, { variant: $("#p-var").value, source: $("#gen-cloud").value });
   $("#p-up").onclick = async () => {
     const f = $("#p-file").files[0]; if (!f) return toast("Choose a file first", true);
     const fd = new FormData(); fd.append("variant", $("#p-var").value); fd.append("file", f);
@@ -595,7 +901,7 @@ async function viewStyle(view, sid) {
       <div><label>Default video engine</label><select id="f-eng">${engineOptions(st.default_engine)}</select></div>
       <div class="full"><label>Music policy (notes)</label><input id="f-music" value="${esc(st.music_policy)}"></div>
       <div class="full"><label>Props - one per line, "id: description"</label><textarea id="f-props">${esc((d.bible.props || []).map((p) => `${p.id}: ${p.description}`).join("\n"))}</textarea></div>
-      <div class="full" style="margin-top:12px"><button class="primary" id="save">Save</button></div>
+      <div class="full row save-bar"><button class="primary" id="save">Save style</button></div>
     </div>
     <p class="muted small">Shots without any LoRA character use Z-Image automatically when the default is Flux + LoRA.</p>`;
   $("#save").onclick = async () => {
@@ -606,19 +912,183 @@ async function viewStyle(view, sid) {
 }
 
 // ── settings ────────────────────────────────────────────────────────────
+// Common options as a form; everything else stays editable as JSON under "Advanced".
+const SETTING_FIELDS = [
+  ["Connections", "Where Studio finds its helpers.", [
+    ["comfy_host", "ComfyUI address", "text", "127.0.0.1:8188"],
+    ["ollama_host", "Ollama address", "text", "http://localhost:11434"],
+    ["ffmpeg", "ffmpeg path", "text", "Leave blank to auto-detect"],
+    ["ffprobe", "ffprobe path", "text", "Leave blank to auto-detect"]]],
+  ["Ollama models (this PC)", "Local models used when Ollama is chosen. Choose ChatGPT, Gemini and other cloud models, API keys and the defaults on the AI models page.", [
+    ["planner_model", "Ollama planner model", "model"],
+    ["vision_model", "Ollama vision model", "model"],
+    ["vision_check", "Check frames with the vision model after rendering", "bool"]]],
+  ["Rendering", "How many candidates to make, and at what size.", [
+    ["candidates_per_shot", "First-frame candidates per render", "int", "", 1, 12],
+    ["takes_per_shot", "Takes per shot", "int", "", 1, 8],
+    ["image.width", "Image width (px)", "int", "", 64, 4096],
+    ["image.height", "Image height (px)", "int", "", 64, 4096],
+    ["video.width", "Video width (px)", "int", "", 64, 4096],
+    ["video.height", "Video height (px)", "int", "", 64, 4096],
+    ["video.fps", "Video frame rate", "int", "", 1, 120],
+    ["loudness_lufs", "Target loudness (LUFS)", "num", "", -40, 0]]],
+  ["Lip-sync", "LatentSync 1.6. Higher guidance articulates the mouth more clearly; more steps are slower for little gain.", [
+    ["lipsync.steps", "Steps", "int", "", 1, 100],
+    ["lipsync.guidance", "Guidance (1 to 3)", "num", "", 1, 3]]],
+];
+const getPath = (o, p) => p.split(".").reduce((x, k) => (x == null ? undefined : x[k]), o);
+function setPath(o, p, v) {
+  const ks = p.split("."), last = ks.pop();
+  const parent = ks.reduce((x, k) => (x[k] && typeof x[k] === "object" ? x[k] : (x[k] = {})), o);
+  parent[last] = v;
+}
 async function viewSettings(view) {
   crumbs([["Settings", null]]);
   const d = await GET("/api/settings");
-  view.innerHTML = `
-    <h1>Settings</h1>
-    <p class="muted">Your overrides (JSON). Anything not listed uses the default shown on the right. Model names must match ComfyUI's lists exactly.</p>
-    <div class="form-grid"><div><label>Your overrides</label><textarea id="user" style="min-height:420px;font-family:monospace">${esc(JSON.stringify(d.user, null, 2))}</textarea>
-      <div style="margin-top:8px"><button class="primary" id="save">Save</button></div></div>
-      <div><label>Effective settings</label><pre class="prompt" style="max-height:470px;overflow:auto">${esc(JSON.stringify(d.effective, null, 2))}</pre></div></div>`;
-  $("#save").onclick = async () => {
-    let obj; try { obj = JSON.parse($("#user").value || "{}"); } catch (e) { return toast("Invalid JSON: " + e.message, true); }
-    await PUT("/api/settings", obj); toast("Saved."); refreshStatus(); route();
+  const models = (App.status && App.status.ollama_models) || [];
+  const field = ([path, label, type, hint, min, max]) => {
+    const id = "set-" + path.replace(/\./g, "-"), v = getPath(d.effective, path);
+    if (type === "select") return `<div><label for="${id}">${esc(label)}</label><select id="${id}">${hint.map(([o, t]) => `<option value="${esc(o)}" ${o === (v ?? "") ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></div>`;
+    if (type === "bool") return `<label class="row check full"><input type="checkbox" id="${id}" ${v ? "checked" : ""}> ${esc(label)}</label>`;
+    const attrs = type === "model" ? `list="set-models" autocomplete="off"` : type === "text" ? "" : `type="number" ${type === "int" ? 'step="1"' : 'step="any"'} min="${min}" max="${max}"`;
+    return `<div><label for="${id}">${esc(label)}</label><input id="${id}" ${attrs} value="${esc(v ?? "")}" placeholder="${esc(hint || "")}"></div>`;
   };
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Settings</h1><p class="sub">Saved to <code>studio_data/settings.json</code>. Changes apply to the next job.</p></div></div>
+    <datalist id="set-models">${models.map((m) => `<option value="${esc(m)}">`).join("")}</datalist>
+    ${SETTING_FIELDS.map(([title, sub, fields]) => `<div class="card form-grid"><h3 class="form-sec full">${esc(title)}</h3><p class="muted small full" style="margin:-4px 0 0">${esc(sub)}</p>${fields.map(field).join("")}</div>`).join("")}
+    <details class="card adv"><summary>Advanced: all overrides as JSON</summary>
+      <p class="muted small">Model file names, workflow options and anything not shown above. Model names must match ComfyUI's lists exactly. Fields above win over the same keys here only if you changed them.</p>
+      <div class="form-grid"><div><label for="user">Your overrides</label><textarea id="user" class="mono" spellcheck="false" style="min-height:360px">${esc(JSON.stringify(d.user, null, 2))}</textarea></div>
+      <div><label>Effective settings (read only)</label><pre class="prompt" style="max-height:392px;overflow:auto">${esc(JSON.stringify(d.effective, null, 2))}</pre></div></div></details>
+    <div class="row save-bar page-save"><button class="primary" id="save">Save settings</button><span class="muted small" id="save-note"></span></div>`;
+  $("#save").onclick = async () => {
+    let obj; try { obj = JSON.parse($("#user").value || "{}"); } catch (e) { return toast("Advanced JSON is invalid: " + e.message, true); }
+    const bad = [];
+    for (const [, , fields] of SETTING_FIELDS) for (const [path, label, type, hint, min, max] of fields) {
+      const el = $("#set-" + path.replace(/\./g, "-")); let v;
+      if (type === "bool") v = el.checked;
+      else if (type === "int" || type === "num") {
+        v = el.value.trim() === "" ? NaN : Number(el.value);
+        if (!Number.isFinite(v) || (type === "int" && !Number.isInteger(v)) || v < min || v > max) { bad.push(`${label}: enter ${type === "int" ? "a whole number" : "a number"} from ${min} to ${max}`); el.setAttribute("aria-invalid", "true"); continue; }
+      } else v = el.value.trim();
+      el.removeAttribute("aria-invalid");
+      if (v !== getPath(d.effective, path) && !(v === "" && getPath(d.effective, path) == null)) setPath(obj, path, v);
+    }
+    if (bad.length) return toast(bad.join("\n"), true);
+    await PUT("/api/settings", obj); App.dirty = false; toast("Settings saved."); refreshStatus(); route();
+  };
+}
+
+// ── AI models page: connections (keys, models) and default choices ─────────
+async function viewAI(view) {
+  crumbs([["AI models", null]]);
+  const ai = await loadAI();
+  if (!ai) { view.innerHTML = `<p class="muted">Could not load the AI settings.</p>`; return; }
+  let conns = ai.connections.map((c) => ({ ...c }));
+  const keys = {};                 // typed, not yet saved keys (never echoed back by the server)
+  const listed = {};               // model lists from "List models"
+  const opt = (v, t, cur) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(t)}</option>`;
+  const textChoices = (role) => {
+    const opts = ai.choices.text.slice(), def = ai.defaults[role];
+    if (def && !opts.some((o) => o.ref === def)) opts.unshift({ ref: def, label: ai.labels[role] });
+    return opts.map((o) => opt(o.ref, o.label + (o.ready === false ? " · no key yet" : ""), def)).join("");
+  };
+  const keyChip = (c) => c.key === "env" ? `<span class="chip good">key from ${esc(c.api_key_env)}</span>`
+    : c.key === "saved" ? `<span class="chip good">key saved</span>` : `<span class="chip warn">no key</span>`;
+  const card = (c, i) => {
+    const f = (k, label, extra = "") => `<div><label for="c${i}-${k}">${label}</label><input id="c${i}-${k}" data-i="${i}" data-k="${k}" value="${esc(c[k] ?? "")}" ${extra}></div>`;
+    return `<div class="card form-grid" data-conn="${i}">
+      <h3 class="form-sec full row" style="gap:8px">${esc(c.name || c.id)} <span class="chip">${esc(ai.types[c.type] || c.type)}</span> ${c._new ? `<span class="chip warn">not saved yet</span>` : keyChip(c)}
+        <span class="grow"></span><label class="row check" style="margin:0"><input type="checkbox" data-i="${i}" data-k="enabled" ${c.enabled !== false ? "checked" : ""}> Show in pickers</label></h3>
+      ${f("name", "Name")}
+      <div><label for="c${i}-id">ID <span class="muted small">(used in model choices)</span></label><input id="c${i}-id" data-i="${i}" data-k="id" value="${esc(c.id)}" ${c._new ? "" : "readonly"}></div>
+      <div><label for="c${i}-type">Type</label><select id="c${i}-type" data-i="${i}" data-k="type" ${c._new ? "" : "disabled"}>${Object.entries(ai.types).map(([v, t]) => opt(v, t, c.type)).join("")}</select></div>
+      ${f("base_url", "Address (API base URL)")}
+      <div class="full"><label for="c${i}-key">API key</label><div class="row"><input id="c${i}-key" class="grow" type="password" autocomplete="off" data-key="${i}"
+        placeholder="${c.key === "env" ? "Set by " + esc(c.api_key_env) + " on the server (that wins)" : c.key === "saved" ? "Saved. Paste a new key to replace it" : "Paste your API key"}" value="${esc(keys[i] || "")}">
+        ${c.key === "saved" && !c._new ? `<button type="button" class="danger" data-delkey="${i}">Remove key</button>` : ""}</div>
+        <p class="muted small" style="margin:4px 0 0">Stored in studio_data/secrets.json (owner-only), never shown again. Or set the environment variable below on the server.</p></div>
+      ${f("api_key_env", "Environment variable (optional)", 'placeholder="e.g. OPENROUTER_API_KEY"')}
+      ${f("max_refs", "Max reference photos sent", 'type="number" min="0" max="16"')}
+      ${f("text_model", "Default text model (writing, checks)", `list="ml-${i}" autocomplete="off"`)}
+      ${f("image_model", "Default image model (blank: none)", `list="ml-${i}" autocomplete="off"`)}
+      <div class="full"><label for="c${i}-extra_models">More models to offer in the pickers <span class="muted small">(comma separated; names containing "image" go to image pickers)</span></label>
+        <input id="c${i}-extra_models" data-i="${i}" data-k="extra_models" value="${esc(c.extra_models || "")}"></div>
+      ${c.type === "openai" ? `<div><label for="c${i}-q">Image quality</label><select id="c${i}-q" data-i="${i}" data-k="image_quality">${[["", "Default"], ["low", "Low"], ["medium", "Medium"], ["high", "High"]].map(([v, t]) => opt(v, t, c.image_quality || "")).join("")}</select></div>` : ""}
+      <datalist id="ml-${i}">${(listed[i] || []).map((m) => `<option value="${esc(m)}">`).join("")}</datalist>
+      <div class="full row">
+        <button type="button" data-list="${i}" ${c._new ? "disabled title=\"Save first\"" : ""}>List models</button>
+        <button type="button" data-test="${i}" ${c._new ? "disabled title=\"Save first\"" : ""}>Test connection</button>
+        <span class="muted small grow" id="c${i}-msg" role="status">${listed[i] ? listed[i].length + " models found: pick one in the model fields" : ""}</span>
+        <button type="button" class="link danger" data-remove="${i}">Remove connection</button></div>
+    </div>`;
+  };
+  const render = () => {
+    view.innerHTML = `
+      <div class="page-head"><div><h1>AI models</h1><p class="sub">Connect ChatGPT, Gemini or any OpenAI-compatible service with an API key. Choose the defaults here; every Plan, Render and Check button also lets you pick a model for that run.</p></div></div>
+      <div class="card form-grid"><h3 class="form-sec full">Defaults</h3>
+        <div><label for="def-planner">Write the bible draft, scenes and shots with</label><select id="def-planner">${textChoices("planner")}</select></div>
+        <div><label for="def-vision">Check rendered frames with</label><select id="def-vision">${textChoices("vision")}</select></div>
+        <p class="muted small full" style="margin:0">Images: pick a cloud image model as a shot's frame source, in "Force…" when rendering frames, or on a character's or location's page. Cloud models receive your prompts and reference photos and bill your account with that provider. A ChatGPT or Gemini app subscription does not include API use.</p></div>
+      <h2>Connections</h2>
+      ${conns.map(card).join("")}
+      <div class="card row"><label for="preset" style="margin:0">Add a connection</label><select id="preset">${ai.presets.map((p, k) => `<option value="${k}">${esc(p.label)}</option>`).join("")}</select><button id="add">Add</button></div>
+      <div class="row save-bar page-save"><button class="primary" id="save-ai">Save</button><span class="muted small" id="ai-note"></span></div>`;
+    bind();
+  };
+  const collect = () => {
+    view.querySelectorAll("[data-k]").forEach((el) => {
+      const c = conns[+el.dataset.i]; if (!c) return;
+      c[el.dataset.k] = el.type === "checkbox" ? el.checked : el.dataset.k === "max_refs" ? Number(el.value) : el.value.trim();
+    });
+    view.querySelectorAll("[data-key]").forEach((el) => { keys[+el.dataset.key] = el.value.trim(); });
+  };
+  const save = async () => {
+    collect();
+    const body = { connections: conns.map(({ key, _new, ...c }) => c), defaults: { planner: $("#def-planner").value, vision: $("#def-vision").value } };
+    let next = await PUT("/api/ai", body);
+    for (const [i, k] of Object.entries(keys)) if (k && conns[i]) next = await PUT(`/api/ai/${encodeURIComponent(conns[i].id)}/key`, { key: k });
+    for (const k of Object.keys(keys)) delete keys[k];
+    App.ai = next; App.dirty = false; toast("AI models saved."); refreshStatus(); return viewAI(view);
+  };
+  function bind() {
+    view.querySelectorAll("input,select").forEach((el) => el.addEventListener("input", () => { App.dirty = true; }));
+    $("#add").onclick = () => {
+      collect();
+      const p = { ...ai.presets[+$("#preset").value] }, ids = new Set(conns.map((c) => c.id));
+      let id = p.id, n = 2; while (ids.has(id)) id = `${p.id}${n++}`;
+      conns.push({ id, name: p.name, type: p.type, base_url: p.base_url, api_key_env: p.api_key_env || "", text_model: "", image_model: "",
+        image_quality: "", max_refs: 6, extra_models: "", enabled: true, key: "", _new: true });
+      App.dirty = true; render(); view.querySelector(`[data-conn="${conns.length - 1}"]`)?.scrollIntoView({ behavior: "smooth" });
+    };
+    view.querySelectorAll("[data-remove]").forEach((b) => b.onclick = async () => {
+      const c = conns[+b.dataset.remove];
+      if (!(await ask(`Remove ${c.name}? Its saved key is deleted when you save.`, "Remove", true))) return;
+      collect(); conns.splice(+b.dataset.remove, 1); App.dirty = true; render();
+    });
+    view.querySelectorAll("[data-delkey]").forEach((b) => b.onclick = async () => {
+      const c = conns[+b.dataset.delkey];
+      if (!(await ask(`Delete the saved API key for ${c.name}?`, "Delete key", true))) return;
+      App.ai = await PUT(`/api/ai/${encodeURIComponent(c.id)}/key`, { key: "" }); toast("Key deleted."); viewAI(view);
+    });
+    view.querySelectorAll("[data-list]").forEach((b) => b.onclick = async () => {
+      const i = +b.dataset.list; collect();
+      if (keys[i]) return toast("Save first to use the new key.", true);
+      try { listed[i] = (await GET(`/api/ai/${encodeURIComponent(conns[i].id)}/models`)).models; render(); }
+      catch (e) { $(`#c${i}-msg`).textContent = String(e.message || e); }
+    });
+    view.querySelectorAll("[data-test]").forEach((b) => b.onclick = async () => {
+      const i = +b.dataset.test; collect();
+      if (keys[i]) return toast("Save first to use the new key.", true);
+      const msg = $(`#c${i}-msg`); msg.textContent = "Testing…"; b.disabled = true;
+      try { const r = await POST(`/api/ai/${encodeURIComponent(conns[i].id)}/test`, { model: conns[i].text_model }); msg.textContent = (r.ok ? "✓ " : "✗ ") + r.message; }
+      catch (e) { msg.textContent = "✗ " + String(e.message || e); }
+      b.disabled = false;
+    });
+    $("#save-ai").onclick = () => save().catch((e) => toast(String(e.message || e), true));
+  }
+  render();
 }
 
 async function viewModels(view) {
@@ -626,8 +1096,9 @@ async function viewModels(view) {
   const [settings, models] = await Promise.all([GET("/api/settings"), GET("/api/models")]);
   const cfg = settings.effective, face = cfg.face_correction;
   view.innerHTML = `<h1>Models</h1><h2>Video generation</h2>
-    <p>Choose a model when rendering in Takes, or set a default engine in Style &amp; props.</p>
-    <div class="card">${models.map(m => `<p>${esc(m.name)}</p>`).join("")}</div>
+    <p>Choose a model when rendering in Takes, or set a project's default engine in its Style &amp; props.</p>
+    <div class="card form-grid"><div><label for="new-engine">Default video engine for new projects</label><select id="new-engine">${engineOptions(cfg.style_defaults?.default_engine || "infinitetalk")}</select></div></div>
+    <div class="card model-list">${models.map(m => { const [nm, ...rest] = String(m.name).split(" · "); return `<div class="model-row"><b>${esc(nm)}</b><span class="grow"></span>${rest.join(" · ").split(", ").filter(Boolean).map(t => `<span class="chip ${/cloud/.test(t) ? "warn" : /silent/.test(t) ? "" : "good"}">${esc(t)}</span>`).join("")}</div>`; }).join("")}</div>
     <h2>Lip-sync · local</h2><p>LatentSync 1.6 synchronizes existing shots to an uploaded music or voice recording. Optional Demucs vocal isolation separates the singing voice for guidance while keeping the full music mix in the export. Upload audio in Cut, choose the character and shots, then review the new version. Runs in ComfyUI on this PC with no paid API.</p>
     <h2>MiniMax H3 · local</h2><p>Generates video and sound on this PC through ComfyUI, with no API key or per-generation API fee. Uses quantized open weights and 4-step Turbo sampling. Local clips are at least 4 seconds; trim shorter shots in Takes. Model weight license: <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE" target="_blank" rel="noopener">MiniMax H3 Community License</a>.</p>
     <h2>MiniMax cloud (optional, paid)</h2><p>Cloud generation sends your first frame and prompt to MiniMax and uses your paid API account. Set <code>${esc(cfg.minimax.api_key_env)}</code> in the server environment, then restart Studio.</p>
@@ -646,6 +1117,7 @@ async function viewModels(view) {
     <button class="primary" id="save-models">Save model settings</button>`;
   $("#save-models").onclick = async () => {
     const user = {...settings.user,
+      style_defaults: {...(settings.user.style_defaults || {}), default_engine: $("#new-engine").value},
       minimax: {...(settings.user.minimax || {}), model: $("#mm-model").value, resolution: $("#mm-resolution").value},
       face_correction: {...(settings.user.face_correction || {}), model: $("#face-model").value,
         python: $("#face-python").value.trim(), keep_dir: $("#keep-dir").value.trim(),
@@ -656,8 +1128,19 @@ async function viewModels(view) {
   };
 }
 
-refreshStatus();
 setInterval(refreshStatus, 15000);
 pollJobs();
 setInterval(pollJobs, 2000);
-window.addEventListener("load", route);
+// The character model pickers need both the AI choices and ComfyUI LoRAs before first render.
+window.addEventListener("load", () => Promise.race([
+  Promise.all([loadAI(), refreshStatus()]),
+  new Promise((r) => setTimeout(r, 2500)),
+]).finally(route));
+
+// Visible "unsaved changes" state (App.dirty is set by edits and cleared on save).
+(() => {
+  const chip = document.createElement("span");
+  chip.className = "chip warn dirty-chip"; chip.textContent = "Unsaved changes"; chip.hidden = true; chip.setAttribute("role", "status");
+  $("#crumbs").after(chip);
+  setInterval(() => { chip.hidden = !App.dirty; }, 400);
+})();

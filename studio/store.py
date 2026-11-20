@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import uuid
 
@@ -40,6 +41,28 @@ def series_dir(sid: str) -> str:
     return os.path.join(root(), sid)
 
 
+def _series_order_path() -> str:
+    return os.path.join(root(), ".project-order.json")
+
+
+def _series_updated(sid: str, fallback: str) -> tuple[str, float]:
+    """Return the newest project-metadata modification time without scanning generated media."""
+    latest = 0.0
+    ignored_dirs = {"backups", "frames", "out", "plates", "refs", "sheet", "takes", "uploads", "voice"}
+    for current, dirs, files in os.walk(series_dir(sid)):
+        dirs[:] = [name for name in dirs if name not in ignored_dirs and not name.startswith(".")]
+        for name in files:
+            if not name.endswith(".json"):
+                continue
+            try:
+                latest = max(latest, os.path.getmtime(os.path.join(current, name)))
+            except OSError:
+                continue
+    if not latest:
+        return fallback, 0.0
+    return _dt.datetime.fromtimestamp(latest).isoformat(timespec="microseconds"), latest
+
+
 def bible_dir(sid: str) -> str:
     return os.path.join(series_dir(sid), "bible")
 
@@ -54,6 +77,22 @@ def loc_dir(sid: str, lid: str) -> str:
 
 def ep_dir(sid: str, eid: str) -> str:
     return os.path.join(series_dir(sid), "episodes", eid)
+
+
+def playground_dir(sid: str) -> str:
+    return os.path.join(series_dir(sid), "playground")
+
+
+def playground_renders(sid: str) -> list[dict]:
+    return _read(os.path.join(playground_dir(sid), "renders.json"), [])
+
+
+def add_playground_render(sid: str, render: dict) -> None:
+    path = os.path.join(playground_dir(sid), "renders.json")
+    with _lock:
+        rows = _read(path, [])
+        rows.insert(0, render)
+        _write(path, rows[:60])
 
 
 def _read(path: str, default=None):
@@ -88,8 +127,8 @@ DEFAULT_STYLE = {
     "aspect": "16:9",
     "negative": "photorealistic, text, watermark, logo, subtitles, deformed hands, extra fingers",
     "music_policy": "no music in shots; score added at the cut",
-    "default_frame_source": "flux_lora",
-    "default_engine": "ltx",
+    "default_frame_source": "qwen_2511",     # falls back to Z-Image text for shots with no visible face
+    "default_engine": "infinitetalk",
     "version": 1,
 }
 
@@ -102,8 +141,29 @@ def list_series() -> list[dict]:
                 continue
             s = _read(os.path.join(series_dir(sid), "series.json"))
             if s:
+                updated, updated_ts = _series_updated(sid, s.get("created", ""))
+                s = {**s, "updated": updated, "_updated_ts": updated_ts}
                 out.append(s)
+    order = _read(_series_order_path())
+    if isinstance(order, list):
+        rank = {sid: index for index, sid in enumerate(order) if isinstance(sid, str)}
+        out.sort(key=lambda s: (s["id"] not in rank, rank.get(s["id"], 0), -s["_updated_ts"]))
+    else:
+        out.sort(key=lambda s: (s["_updated_ts"], s.get("created", ""), s["id"]), reverse=True)
+    for series in out:
+        series.pop("_updated_ts", None)
     return out
+
+
+def save_series_order(ids: list[str]) -> list[str]:
+    if not isinstance(ids, list) or not all(isinstance(sid, str) for sid in ids):
+        raise ValueError("Project order must be a list of project IDs.")
+    with _lock:
+        existing = {series["id"] for series in list_series()}
+        if len(ids) != len(existing) or len(set(ids)) != len(ids) or set(ids) != existing:
+            raise ValueError("Project order must include every project exactly once.")
+        _write(_series_order_path(), ids)
+    return ids
 
 
 def create_series(name: str) -> dict:
@@ -115,6 +175,9 @@ def create_series(name: str) -> dict:
         _write(os.path.join(bible_dir(sid), "style.json"),
                {**DEFAULT_STYLE, **_settings.load().get("style_defaults", {})})
         _write(os.path.join(bible_dir(sid), "props.json"), [])
+        order = _read(_series_order_path())
+        if isinstance(order, list):
+            _write(_series_order_path(), [sid, *(item for item in order if item != sid)])
         return s
 
 
@@ -149,7 +212,7 @@ def new_character(name: str, **fields) -> dict:
         "id": slug(name, "character"), "name": name, "trigger": "",
         "appearance": "", "outfits": {"default": ""}, "default_outfit": "default",
         "acting_notes": "", "never_change": [],
-        "image_lora": {"name": "", "strength": 0.9},
+        "image_lora": {"name": "", "strength": 0.9, "model_family": "flux1"},
         "video_lora": {"name": "", "strength": 0.8},
         "voice": {"file": "", "wpm": 140, "description": ""},
         "frame_source": "",          # "" = inherit series default
@@ -225,6 +288,72 @@ def save_location(sid: str, loc: dict, bump: bool = True) -> dict:
         return loc
 
 
+def resolve_character_id(chars: dict, key) -> str | None:
+    """Map a shot/scene character reference to a live bible id.
+
+    Exact id first, then a case-insensitive id, then the one character whose name (or its slug)
+    matches. So 'Sam' from the planner, or a 'sam' left behind after that character was deleted and
+    another one renamed to Sam, still finds the character now called Sam."""
+    if not key:
+        return None
+    if key in chars:
+        return key
+    k = str(key).strip().lower()
+    for cid in chars:
+        if cid.lower() == k:
+            return cid
+    ks = slug(k, "")
+    hits = [cid for cid, c in chars.items()
+            if (c.get("name") or "").strip().lower() == k or (ks and slug(c.get("name"), "") == ks)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def find_character(chars: dict, key) -> dict | None:
+    cid = resolve_character_id(chars, key)
+    return chars.get(cid) if cid else None
+
+
+def normalize_cast(chars: dict, item: dict) -> bool:
+    """Rewrite a scene's or shot's character ids and dialogue speakers to live bible ids and drop
+    duplicate cast entries. Unknown ids are kept so a character re-created later can still match.
+    Returns True when anything changed."""
+    changed = False
+    if isinstance(item.get("characters"), list):
+        seen, cast = set(), []
+        for ch in item["characters"]:
+            cid = resolve_character_id(chars, ch.get("id")) or ch.get("id")
+            if cid != ch.get("id"):
+                ch["id"], changed = cid, True
+            if cid in seen:
+                changed = True
+                continue
+            seen.add(cid)
+            cast.append(ch)
+        item["characters"] = cast
+    for d in item.get("dialogue") or []:
+        cid = resolve_character_id(chars, d.get("speaker")) if isinstance(d, dict) else None
+        if cid and cid != d.get("speaker"):
+            d["speaker"], changed = cid, True
+    return changed
+
+
+def relink_characters(sid: str) -> int:
+    """After characters are created, renamed or deleted, point every episode's scenes and shots at
+    the live bible ids. Returns the number of scenes/shots that changed."""
+    chars = {c["id"]: c for c in list_characters(sid)}
+    total = 0
+    for ep in list_episodes(sid):
+        with _lock:
+            e = get_episode(sid, ep["id"])
+            if e is None:
+                continue
+            n = sum(normalize_cast(chars, item) for item in (e.get("scenes") or []) + (e.get("shots") or []))
+            if n:
+                _write(os.path.join(ep_dir(sid, ep["id"]), "episode.json"), e)
+        total += n
+    return total
+
+
 def bible(sid: str) -> dict:
     return {
         "style": get_style(sid),
@@ -235,15 +364,19 @@ def bible(sid: str) -> dict:
 
 
 def bible_signature(b: dict, shot: dict) -> str:
-    """Hash of the bible versions a shot depends on (for stale detection)."""
+    """Hash the bible dependencies and the shot's actual prompt inputs for stale detection."""
     parts = [f"style:{b['style'].get('version', 1)}"]
     loc = b["locations"].get(shot.get("location_id") or "")
     if loc:
         parts.append(f"loc:{loc['id']}:{loc.get('version', 1)}")
     for ch in shot.get("characters", []):
-        c = b["characters"].get(ch.get("id"))
+        c = find_character(b["characters"], ch.get("id"))
         if c:
             parts.append(f"char:{c['id']}:{c.get('version', 1)}")
+    inputs = {key: shot.get(key) for key in (
+        "first_frame", "screen_text", "framing", "camera", "characters", "location_id", "time_of_day",
+        "action", "image_prompt_override", "image_prompt_extra")}
+    parts.append(json.dumps(inputs, sort_keys=True, ensure_ascii=False))
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
 
 
@@ -262,6 +395,59 @@ def list_episodes(sid: str) -> list[dict]:
     return out
 
 
+def _rewrite_prefix(node, old: str, new: str) -> None:
+    """Rewrite media paths that belong to one episode. Bible paths must be left alone."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                if old in value:
+                    node[key] = value.replace(old, new)
+            else:
+                _rewrite_prefix(value, old, new)
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            if isinstance(value, str):
+                if old in value:
+                    node[i] = value.replace(old, new)
+            else:
+                _rewrite_prefix(value, old, new)
+
+
+def _clone_ignore(_directory, names):
+    return [n for n in names if n in ("episode.json", "backups") or n.endswith(".tmp") or n.startswith(".deleted")]
+
+
+def clone_episode(sid: str, eid: str, title: str | None = None) -> dict:
+    """Copy an episode, including frames, takes and the cut, under a new id.
+
+    Paths that point into this episode are rewritten. Bible references are not.
+    Internal backups are not copied."""
+    with _lock:
+        src = get_episode(sid, eid)
+        if src is None:
+            raise KeyError(eid)
+        existing = {e["id"] for e in list_episodes(sid)}
+        title = (title or f"{src.get('title') or eid} copy").strip() or f"{eid} copy"
+        new_id = _unique(slug(title, "episode"), existing)
+        data = copy.deepcopy(src)
+        data["id"] = new_id
+        data["title"] = title
+        data["created"] = now()
+        old = f"series/{sid}/episodes/{eid}/"
+        new = f"series/{sid}/episodes/{new_id}/"
+        _rewrite_prefix(data, old, new)
+        _rewrite_prefix(data, old.replace("/", os.sep), new.replace("/", os.sep))
+        dst = ep_dir(sid, new_id)
+        try:
+            shutil.copytree(ep_dir(sid, eid), dst, ignore=_clone_ignore)
+            _write(os.path.join(dst, "episode.json"), data)
+        except Exception:
+            if os.path.isdir(dst):
+                shutil.rmtree(dst, ignore_errors=True)
+            raise
+        return data
+
+
 def create_episode(sid: str, title: str) -> dict:
     with _lock:
         existing = {e["id"] for e in list_episodes(sid)}
@@ -269,7 +455,7 @@ def create_episode(sid: str, title: str) -> dict:
         e = {
             "id": eid, "title": title or eid, "created": now(), "story": "",
             "scenes": [], "shots": [],
-            "gates": {"shots": False, "frames": False, "animatic": False, "takes": False},
+            "gates": {"shots": False, "previz": False, "frames": False, "animatic": False, "takes": False},
             "stats": {"spf": {}}, "music": {"file": "", "volume": 0.25, "duck": True},
             "outputs": {},
         }

@@ -6,8 +6,10 @@ import os
 import shutil
 import threading
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_ROOT = os.environ.get("STUDIO_DATA", os.path.join(REPO_ROOT, "studio_data"))
+from . import paths
+
+REPO_ROOT = str(paths.REPO_ROOT)
+DATA_ROOT = str(paths.data_root())
 SETTINGS_PATH = os.path.join(DATA_ROOT, "settings.json")
 LEGACY_SETTINGS = os.path.join(REPO_ROOT, "video_director_agent", "user_settings.json")
 
@@ -16,7 +18,15 @@ DEFAULTS = {
     "ollama_host": "http://localhost:11434",
     "planner_model": "bonsai-2",
     "vision_model": "bonsai-2",
-    "vision_check": True,
+    # Default models for writing (bible draft, scenes, shots) and frame checks, as "<connection>:<model>"
+    # ("ollama:<model>" = this PC). Empty: the Ollama planner/vision model above. See studio/cloud.py.
+    "planner": "",
+    "vision": "",
+    # Dialogue voices: VoiceStudio running headless (service reelwright-voice). engine voices each line with an
+    # acting direction; design_engine creates a character's reference voice from its description.
+    "voices": {"host": "http://127.0.0.1:3900", "engine": "indextts2", "design_engine": "omnivoice",
+               "language": "en", "emo_alpha": 0.75, "emotion": True, "min_match": 0.75, "tries": 3},
+    # "ai_connections": the AI models page writes the list here (default: OpenAI and Gemini in cloud.py)
     "ffmpeg": "",
     "ffprobe": "",
     "candidates_per_shot": 4,
@@ -35,6 +45,24 @@ DEFAULTS = {
         "scheduler": "simple",
         "second_lora_scale": 0.75,
     },
+    "flux2_klein": {
+        "unet": "flux-2-klein-base-4b.safetensors",
+        "clip": "qwen_3_4b.safetensors",
+        "vae": "flux2-vae.safetensors",
+        "steps": 30,
+        "sampler": "euler",
+        "guidance": 1.0,
+    },
+    "image_lora_presets": {
+        "maryam_movie_actor_v1.safetensors": {
+            "trigger": "mrvxwoman",
+            "model_family": "flux2_klein",
+        },
+        "maryam_movie_actor_v2.safetensors": {
+            "trigger": "mrvxwoman",
+            "model_family": "flux2_klein",
+        },
+    },
     "zimage": {
         "unet": "z_image_turbo_bf16.safetensors",
         "clip": "qwen_3_4b.safetensors",
@@ -43,7 +71,8 @@ DEFAULTS = {
         "shift": 3.0,
     },
     "qwen_edit": {
-        # "Reference photos" frame source: Qwen Image Edit takes up to 3 images (the shot's characters' refs)
+        # First frames: Z-Image composition, then Qwen identity. Each Qwen pass reserves
+        # one input for the composition; max_refs (up to 3 total inputs) includes it.
         "unet": "qwen_image_edit_2509_fp8_e4m3fn.safetensors",
         "clip": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
         "vae": "qwen_image_vae.safetensors",
@@ -51,6 +80,18 @@ DEFAULTS = {
         "steps": 4,
         "shift": 3.0,
         "max_refs": 3,
+    },
+    "qwen_2511": {
+        # First frames drawn straight from the characters' photos (source "qwen_2511"). Settings from ComfyUI's
+        # official Qwen-Image-Edit-2511 template; the default model has the 4-step Lightning LoRA fused in, so
+        # lora stays empty. With the plain bf16/fp8 model set lora to the 2511 Lightning LoRA (or steps 40, cfg 4).
+        "unet": "qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_comfyui_4steps_v1.0.safetensors",
+        "clip": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "vae": "qwen_image_vae.safetensors",
+        "lora": "",
+        "steps": 4, "cfg": 1.0, "shift": 3.1,
+        "reference_method": "index_timestep_zero",
+        "max_refs": 3,              # Qwen Edit reads at most three input images
     },
     "ltx": {
         "template": "video_director_agent/i2v_template.json",
@@ -63,6 +104,15 @@ DEFAULTS = {
         "negative": "blurry, low quality, still frame, frozen motion, watermark, subtitles, "
                     "text on screen, deformed hands, extra fingers, background music, scene cut, jump cut, "
                     "camera cut, transition, new scene, different location, different person, reframing",
+    },
+    "infinitetalk": {                 # Wan 2.1 + InfiniteTalk: one face, mouth driven by the shot's voice
+        "unet": "wan2.1_i2v_480p_14B_fp8_scaled.safetensors",
+        "patch": "wan2.1_infiniteTalk_multi_fp16.safetensors",
+        "lora": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+        "clip": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "vae": "wan_2.1_vae.safetensors",
+        "clip_vision": "clip_vision_h.safetensors", "audio_encoder": "wav2vec2-chinese-base_fp16.safetensors",
+        "pixels": 399360,             # ~480x832 portrait / 832x480 landscape (the 480p model)
+        "steps": 6, "shift": 8.0, "chunk": 81, "motion_frames": 9, "fps": 25, "max_seconds": 15,
     },
     "wan": {
         "high": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
@@ -78,6 +128,13 @@ DEFAULTS = {
         "shift": 5.0,
         "max_seconds": 5,
         "negative": "blurry, static, deformed, extra fingers, watermark, subtitles, text",
+    },
+    "ltx_lipsync": {
+        "template": "workflows/ltx2.3_ia2v_api.json",
+        "max_seconds": 10.5,
+        "pixels": 983040,             # ~1536x640 at 2.4:1, ~720x1280 portrait
+        "first_frame_strength": 1.0,
+        "negative": "",               # "" = built-in: no scene cuts, no new people, no fades
     },
     "minimax_local": {
         "unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
@@ -99,7 +156,12 @@ DEFAULTS = {
         "identity_lora": "h3_character_swap_v1.5.safetensors",
         "identity_turbo_lora": "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
     },
+    # LatentSync 1.6. Guidance 2.0 scored clearly better lip-sync than the upstream 1.5 on A/B tests of this project's
+    # clips (SyncNet confidence +33..72%) at the same speed; more steps cost ~60% more time for little gain.
+    "lipsync": {"steps": 20, "guidance": 2.0, "seed": 1247},
     "loudness_lufs": -16,
+    # Blender MCP (previz). The BlenderMCP server runs inside Blender on this PC.
+    "blender": {"host": "127.0.0.1", "port": 9876, "fps": 24, "seconds": 6},
     "continuity": {
         "punch_in_denoise": 0.32,   # low: keep the master's face, age and clothes; only re-sharpen
         # LTX tends to hard-cut to a new wide shot ~1 s into close-ups. Re-using the first frame as the
@@ -108,6 +170,10 @@ DEFAULTS = {
         "crop": {"medium": 0.62, "medium close-up": 0.46, "close-up": 0.34, "extreme close-up": 0.22,
                  "over-the-shoulder": 0.55, "two-shot": 0.7},
     },
+    # Cloud first frames (Gemini/OpenAI accept several reference images). "views": up to per_character approved views
+    # of each person as separate images, picked by framing; "turnaround": those views stitched into ONE image per
+    # person (saves slots in crowded shots); "single": the old behaviour, one photo per person.
+    "cloud_refs": {"mode": "views", "per_character": 3},
     "location_ref": {
         "enabled": True,
         "denoise": 0.82,
@@ -162,8 +228,14 @@ def load() -> dict:
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(user, f, indent=2)
         s = _deep_merge(DEFAULTS, user)
-    s["ffmpeg"] = s["ffmpeg"] or shutil.which("ffmpeg") or "ffmpeg"
-    s["ffprobe"] = s["ffprobe"] or shutil.which("ffprobe") or "ffprobe"
+    s["ffmpeg"] = paths.find_tool("ffmpeg", s["ffmpeg"])
+    s["ffprobe"] = paths.find_tool("ffprobe", s["ffprobe"])
+    # a bundled Linux ffmpeg needs its own libraries; children (ffmpeg, workers) inherit this
+    os.environ.update(paths.tool_environment(s["ffmpeg"]))
+    # the desktop supervisor picks the ports at start-up; these are never written to settings.json
+    for key, variable in (("comfy_host", "REELWRIGHT_COMFY_HOST"), ("ollama_host", "REELWRIGHT_OLLAMA_HOST")):
+        if os.environ.get(variable):
+            s[key] = os.environ[variable]
     return s
 
 
@@ -171,8 +243,14 @@ def save(user_values: dict) -> dict:
     """Persist only what the user set (the defaults stay in code)."""
     with _lock:
         os.makedirs(DATA_ROOT, exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        # may hold cloud API keys: owner-only
+        fd = os.open(SETTINGS_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(user_values, f, indent=2)
+        try:
+            os.chmod(SETTINGS_PATH, 0o600)
+        except OSError:
+            pass
     return load()
 
 
@@ -183,19 +261,47 @@ def raw_user() -> dict:
     return {}
 
 
+def lipsync_params(cfg: dict) -> dict:
+    """The LatentSync settings, each clamped to what the ComfyUI node accepts (bad values fall back to the defaults)."""
+    import math
+    raw = (cfg or {}).get("lipsync")
+    if not isinstance(raw, dict):
+        raw = {}
+    defaults = DEFAULTS["lipsync"]
+
+    def pick(key, kind, low, high):
+        try:
+            value = kind(raw.get(key, defaults[key]))
+            if isinstance(raw.get(key), bool) or not math.isfinite(value):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            value = defaults[key]
+        return max(low, min(high, value))
+    return {"steps": pick("steps", int, 1, 100), "guidance": round(pick("guidance", float, 1.0, 3.0), 1),
+            "seed": pick("seed", int, 0, 2**32 - 1)}
+
+
 def for_episode(s: dict, episode: dict) -> dict:
-    """Apply a project's portrait/landscape output sizes without changing other projects."""
-    if not episode.get('video') and not episode.get('image'):
+    """Apply a project's portrait/landscape output sizes (and its dialogue-voice engine/language, e.g. a Persian
+    film voiced with OmniVoice) without changing other projects."""
+    if not episode.get('video') and not episode.get('image') and not episode.get('voices'):
         return s
     import math
     result = copy.deepcopy(s)
+    if episode.get('voices'):
+        result['voices'].update(episode['voices'])
     for key in ('video', 'image'):
         if episode.get(key):
             result[key].update(episode[key])
     if episode.get('video'):
         ratio = result['video']['width'] / result['video']['height']
-        h3 = result['minimax_local']
-        pixels = h3['width'] * h3['height']
-        h3['width'] = max(32, round(math.sqrt(pixels * ratio) / 32) * 32)
-        h3['height'] = max(32, round(math.sqrt(pixels / ratio) / 32) * 32)
+        # Engines with their own render size keep their pixel budget but take the project's shape
+        # (Wan needs multiples of 16, MiniMax H3 multiples of 32).
+        for engine, step in (('minimax_local', 32), ('wan', 16)):
+            size = result.get(engine)
+            if not size or not size.get('width') or not size.get('height'):
+                continue
+            pixels = size['width'] * size['height']
+            size['width'] = max(step, round(math.sqrt(pixels * ratio) / step) * step)
+            size['height'] = max(step, round(math.sqrt(pixels / ratio) / step) * step)
     return result

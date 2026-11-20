@@ -29,6 +29,53 @@ def project(client):
     return sid, eid, sh
 
 
+def test_clone_episode_copies_story_shots_and_media(client):
+    sid, eid, _ = project(client)
+    frame = f"series/{sid}/episodes/{eid}/frames/S01_SH01/c001.png"
+    bible_ref = f"series/{sid}/bible/characters/sam/refs/a.png"
+
+    def attach(e):
+        e["story"] = "Once upon"
+        e["title"] = "Pilot"
+        e["gates"]["shots"] = True
+        e["shots"][0]["frame"]["candidates"][0]["file"] = frame
+        e["shots"][0]["frame"]["candidates"][0]["refs"] = [bible_ref]
+        e["outputs"] = {"final": f"series/{sid}/episodes/{eid}/out/final.mp4"}
+        e["dialogue_takes"] = {"L1": {"file": f"series/{sid}/episodes/{eid}/uploads/line.wav", "text": "Hi"}}
+
+    store.update_episode(sid, eid, attach)
+    src = store.ep_dir(sid, eid)
+    os.makedirs(os.path.join(src, "frames", "S01_SH01"), exist_ok=True)
+    os.makedirs(os.path.join(src, "backups"), exist_ok=True)
+    with open(os.path.join(src, "frames", "S01_SH01", "c001.png"), "wb") as f:
+        f.write(b"png")
+    with open(os.path.join(src, "backups", "old.json"), "w", encoding="utf-8") as f:
+        f.write("{}")
+
+    copied = client.post(f"/api/s/{sid}/e/{eid}/clone", json={"title": "Pilot copy"}).json()
+    assert copied["id"] != eid and copied["title"] == "Pilot copy" and copied["story"] == "Once upon"
+    assert copied["gates"]["shots"] is True
+    assert copied["shots"][0]["frame"]["candidates"][0]["file"] == f"series/{sid}/episodes/{copied['id']}/frames/S01_SH01/c001.png"
+    assert copied["shots"][0]["frame"]["candidates"][0]["refs"] == [bible_ref]
+    assert copied["outputs"]["final"] == f"series/{sid}/episodes/{copied['id']}/out/final.mp4"
+    assert copied["dialogue_takes"]["L1"]["file"].endswith(f"{copied['id']}/uploads/line.wav")
+    assert os.path.isfile(os.path.join(store.ep_dir(sid, copied["id"]), "frames", "S01_SH01", "c001.png"))
+    assert not os.path.exists(os.path.join(store.ep_dir(sid, copied["id"]), "backups"))
+    assert store.get_episode(sid, eid)["id"] == eid
+    again = client.post(f"/api/s/{sid}/e/{eid}/clone", json={"title": "Pilot copy"})
+    assert again.status_code == 200 and again.json()["id"] not in (eid, copied["id"])
+    assert client.post(f"/api/s/{sid}/e/missing/clone", json={}).status_code == 404
+    listed = client.get(f"/api/s/{sid}").json()["episodes"]
+    assert {e["id"] for e in listed} >= {eid, copied["id"], again.json()["id"]}
+
+
+def test_clone_rejects_active_job(client, monkeypatch):
+    sid, eid, _ = project(client)
+    monkeypatch.setattr(jobs.QUEUE, "list", lambda: [{"status": "running", "params": {"sid": sid, "eid": eid}}])
+    assert client.post(f"/api/s/{sid}/e/{eid}/clone", json={"title": "Copy"}).status_code == 409
+    assert [e["id"] for e in store.list_episodes(sid)] == [eid]
+
+
 def test_project_and_episode_deletion_is_recoverable(client):
     sid, eid, _ = project(client)
     base = f"/api/s/{sid}"
@@ -243,6 +290,26 @@ def test_status_checks_shot_overrides_and_selected_missing_models(client, monkey
     assert set(client.get('/api/status').json()['missing']) == set(missing)
 
 
+def test_status_uses_klein_models_for_klein_character_lora(client):
+    sid = client.post("/api/series", json={"name": "Klein project"}).json()["id"]
+    character = client.post(f"/api/s/{sid}/characters", json={"name": "Maryam"}).json()
+    client.put(
+        f"/api/s/{sid}/characters/{character['id']}",
+        json={
+            "frame_source": "flux_lora",
+            "image_lora": {"name": "maryam_movie_actor_v2.safetensors"},
+        },
+    )
+
+    from studio.app import _required_model_options
+    required = _required_model_options(settings.load())
+    assert settings.DEFAULTS["flux2_klein"]["unet"] in required[("UNETLoader", "unet_name")]
+    assert settings.DEFAULTS["flux2_klein"]["clip"] in required[("CLIPLoader", "clip_name")]
+    assert "maryam_movie_actor_v2.safetensors" in required[("LoraLoaderModelOnly", "lora_name")]
+    assert settings.DEFAULTS["flux"]["unet"] not in required.get(("UNETLoader", "unet_name"), set())
+    assert ("DualCLIPLoader", "clip_name1") not in required
+
+
 def test_local_h3_workflow_has_native_audio_and_end_frame(client):
     from studio import workflows
     s = settings.load()
@@ -367,6 +434,9 @@ def test_portrait_episode_upload_keeps_its_own_dimensions(client):
     before=settings.load()
     context=settings.for_episode(before,store.get_episode(sid,eid))
     assert context['minimax_local']['height'] > context['minimax_local']['width']
+    assert context['wan']['height'] > context['wan']['width']
+    assert context['wan']['width'] % 16 == 0 and context['wan']['height'] % 16 == 0
+    assert before['wan']['width'] > before['wan']['height']      # landscape projects keep the default
     assert before['video']['width']==1024 and before['video']['height']==576
     response=client.get(f'/api/s/{sid}/e/{eid}').json()
     assert response['_settings']['video']=={'width':512,'height':910,'fps':30}
@@ -517,3 +587,240 @@ def test_reference_identity_edit_preserves_source_soundtrack(client, monkeypatch
         return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-map', '0:a:0',
                                        '-c:a', 'copy', '-f', 'hash', '-hash', 'sha256', '-'])
     assert audio_hash(source) == audio_hash(destination)
+
+
+def test_shots_follow_a_replaced_character(client):
+    """Delete 'Sam', rename another character to Sam: shots that said 'sam'/'Sam' must use the new
+    one (its refs), not silently drop the character from the frame."""
+    sid, eid, _ = project(client)
+    base = f"/api/s/{sid}"
+    old = client.post(f"{base}/characters", json={"name": "Sam"}).json()
+    new = client.post(f"{base}/characters", json={"name": "Spider Man"}).json()
+    assert (old["id"], new["id"]) == ("sam", "spider_man")
+
+    def cast(e):
+        sh = e["shots"][0]
+        sh["characters"] = [{"id": "Sam", "position": "center"}, {"id": "sam", "position": "right"}]
+        sh["dialogue"] = [{"speaker": "sam", "line": "I can help!"}, {"speaker": "Voice", "line": "Help!"}]
+        e["scenes"] = [{"id": "S01", "characters": [{"id": "sam", "outfit": "default"}]}]
+    store.update_episode(sid, eid, cast)
+
+    assert client.delete(f"{base}/characters/sam").status_code == 200
+    assert client.put(f"{base}/characters/spider_man", json={**new, "name": "Sam"}).status_code == 200
+
+    e = store.get_episode(sid, eid)
+    sh = e["shots"][0]
+    assert sh["characters"] == [{"id": "spider_man", "position": "center"}]
+    assert [d["speaker"] for d in sh["dialogue"]] == ["spider_man", "Voice"]
+    assert e["scenes"][0]["characters"][0]["id"] == "spider_man"
+    b = store.bible(sid)
+    assert [c["id"] for c, _ in jobs.prompts.characters_in(sh, b)] == ["spider_man"]
+
+
+def test_character_lookup_tolerates_case_and_names():
+    chars = {"spider_man": {"id": "spider_man", "name": "Sam"}, "mia": {"id": "mia", "name": "Mia Lee"}}
+    assert store.resolve_character_id(chars, "spider_man") == "spider_man"
+    assert store.resolve_character_id(chars, "Spider_Man") == "spider_man"
+    assert store.resolve_character_id(chars, "Sam") == "spider_man"
+    assert store.resolve_character_id(chars, "mia_lee") == "mia"
+    assert store.resolve_character_id(chars, "the_child") is None
+    twins = {"a": {"id": "a", "name": "Sam"}, "b": {"id": "b", "name": "Sam"}}
+    assert store.resolve_character_id(twins, "sam") is None      # ambiguous: don't guess
+
+
+def test_wan_character_lora_pair_and_trigger():
+    from studio import prompts, workflows
+    b = {"style": {"look": "film"}, "locations": {}, "characters": {
+        "sam": {"id": "sam", "name": "Sam", "appearance": "a boy", "outfits": {"default": "red suit"},
+                "video_lora": {"name": "sam_s4m_wan22_high_noise.safetensors", "strength": 1.0, "trigger": "s4m"}}}}
+    sh = {"characters": [{"id": "sam", "position": "center"}], "action": "waves"}
+    assert prompts.motion_prompt(sh, b, "wan").startswith("film. s4m, Sam (")
+    assert "s4m" not in prompts.motion_prompt(sh, b, "ltx")
+    s = settings.load()
+    wf = workflows.wan_i2v(s, "p", "first.png", 81, 1, prompts.video_loras(sh, b))
+    names = {n["inputs"]["lora_name"] for n in wf.values() if n["class_type"] == "LoraLoaderModelOnly"}
+    assert {"sam_s4m_wan22_high_noise.safetensors", "sam_s4m_wan22_low_noise.safetensors"} <= names
+    # each half of Wan gets its own file
+    high_chain = [n for k, n in wf.items() if n["class_type"] == "LoraLoaderModelOnly" and 30 <= int(k) < 50]
+    low_chain = [n for k, n in wf.items() if n["class_type"] == "LoraLoaderModelOnly" and int(k) >= 50]
+    assert any("high_noise" in n["inputs"]["lora_name"] and "sam" in n["inputs"]["lora_name"] for n in high_chain)
+    assert any("low_noise" in n["inputs"]["lora_name"] and "sam" in n["inputs"]["lora_name"] for n in low_chain)
+
+
+def test_continuity_master_is_the_first_shot_with_characters():
+    """An empty establishing shot opening a scene must not become the master the close-ups punch in on
+    (the frame renderer only accepts a master with characters, so every punch-in failed)."""
+    shot = lambda i, framing, chars: planner.new_shot(id=f"S01_SH0{i}", scene_id="S01", order=i, framing=framing,
+                                                      characters=[{"id": c} for c in chars])
+    shots = [shot(1, "wide", []), shot(2, "medium", ["hakon2"]), shot(3, "close-up", ["hakon2"]),
+             shot(4, "wide", ["hakon2"]), shot(5, "insert", [])]
+    planner.assign_continuity(shots)
+    assert [s["start_mode"] for s in shots] == ["new", "new", "punch_in", "reuse", "new"]
+    e = {"shots": shots}
+    assert jobs._scene_master(e, shots[2])["id"] == "S01_SH02" and jobs._scene_master(e, shots[3])["id"] == "S01_SH02"
+
+
+def test_continuity_master_falls_back_when_scene_opens_on_chained_shots():
+    """A scene that starts with chained shots has no 'new' master; punch-ins must still find one
+    (they used to get None and could never render a first frame)."""
+    shot = lambda i, mode, chars: planner.new_shot(id=f"S02_SH0{i}", scene_id="S02", order=i, start_mode=mode,
+                                                   characters=[{"id": c} for c in chars])
+    shots = [shot(1, "chain", ["runar"]), shot(2, "chain", ["runar"]), shot(3, "punch_in", ["runar"])]
+    e = {"shots": shots}
+    assert jobs._scene_master(e, shots[2])["id"] == "S02_SH01"
+    assert jobs._scene_master(e, shots[0]) is None
+    shots[1]["start_mode"] = "new"
+    assert jobs._scene_master(e, shots[2])["id"] == "S02_SH02"
+
+
+def test_outfit_reference_wins_over_main_photo(client):
+    sid, eid, sh = project(client)
+    cid = client.post(f"/api/s/{sid}/characters", json={"name": "Hakon"}).json()["id"]
+    folder = os.path.join(store.char_dir(sid, cid), "refs"); os.makedirs(folder, exist_ok=True)
+    for name in ("main.png", "suit.png"):
+        open(os.path.join(folder, name), "wb").write(b"x")
+    main, suit = (store.rel(os.path.join(folder, n)) for n in ("main.png", "suit.png"))
+    body = {"refs": [main], "outfits": {"suit": "charcoal suit", "street": "old jacket"}, "default_outfit": "street",
+            "outfit_refs": {"suit": suit, "street": "missing/file.png"}}
+    store.save_character(sid, {**store.get_character(sid, cid), **body}, bump=False)
+    b = store.bible(sid)
+    def refs_for(outfit):
+        shot = {**sh, "characters": [{"id": cid, "position": "center", "outfit": outfit}]}
+        return [rel for _, rel in jobs._character_refs(shot, b)]
+    assert refs_for("suit") == [suit]
+    assert refs_for("street") == [main]       # outfit ref missing on disk -> main photo
+    assert refs_for("") == [main]             # default outfit has no usable ref
+
+
+def test_lipsync_layout_times_lines_with_pauses_and_hold():
+    from studio import lipsync_engine
+    ep = {"dialogue_takes": {"a": {"text": "Hello there.", "duration": 1.0}, "b": {"text": "Hi.", "duration": 0.5}},
+          "shots": [{"id": "S01_SH01", "order": 0, "duration_s": 2.0, "action_seconds": 1.5,
+                     "dialogue": [{"speaker": "x", "line": "Hello there.", "pause": 1.2}, {"speaker": "y", "line": "Hi.", "pause": 0.4}]},
+                    {"id": "S01_SH02", "order": 1, "duration_s": 6.0, "dialogue": []},
+                    {"id": "S01_SH03", "order": 2, "duration_s": 3.0, "dialogue": [{"speaker": "x", "line": "Not voiced"}]}]}
+    rows = lipsync_engine.layout(ep, 10.5)
+    assert rows[0]["lines"] == [["x", "Hello there.", 1.2, 1.0], ["y", "Hi.", 2.6, 0.5]]
+    assert rows[0]["len"] == 4.6                      # 1.2 + 1.0 + 0.4 + 0.5 + hold 1.5
+    assert rows[1] == {"id": "S01_SH02", "start": 4.6, "len": 6.0, "lines": []}
+    assert rows[2]["lines"] == [] and rows[2]["len"] == 3.0
+    assert lipsync_engine.layout({**ep, "shots": [{**ep["shots"][1], "duration_s": 30}]}, 10.5)[0]["len"] == 10.5
+    assert lipsync_engine.frames_for(4.6, 24) == 113 and (lipsync_engine.frames_for(4.6, 24) - 1) % 8 == 0
+
+
+def test_lipsync_workflow_uses_project_shape_and_keeps_prompt():
+    from studio import lipsync_engine
+    s = settings.load()
+    s = {**s, "video": {"width": 1280, "height": 544, "fps": 24}}
+    w, h = lipsync_engine.size(s)
+    assert w % 64 == 0 and h % 64 == 0 and w > h
+    wf = lipsync_engine.workflow(s, "first.png", "voice.wav", "PROMPT", 4.0, 7, "studio/x")
+    assert wf["269"]["inputs"]["image"] == "first.png" and wf["276"]["inputs"]["audio"] == "voice.wav"
+    assert wf["340:319"]["inputs"]["value"] == "PROMPT" and wf["340:306"]["inputs"]["text"] == ["340:319", 0]
+    assert "340:346" not in wf and wf["340:323"]["inputs"]["value"] == 24 and wf["340:331"]["inputs"]["value"] == 4.0
+    assert (wf["340:330"]["inputs"]["value"], wf["340:324"]["inputs"]["value"]) == (w, h)
+    portrait = lipsync_engine.size({**s, "video": {"width": 576, "height": 1024, "fps": 25},
+                                    "ltx_lipsync": {**s["ltx_lipsync"], "portrait_square": False}})
+    assert portrait[1] > portrait[0]
+
+
+def test_lipsync_prompt_names_speakers_and_silent_listeners():
+    from studio import lipsync_engine
+    b = {"characters": {"ann": {"id": "ann", "name": "Ann Lee"}, "bo": {"id": "bo", "name": "Bo"}}}
+    shot = {"framing": "medium", "camera": "static", "action": "They talk.",
+            "characters": [{"id": "ann"}, {"id": "bo"}], "dialogue": [{"speaker": "ann", "line": "Hello."}]}
+    text = lipsync_engine.prompt(shot, b)
+    assert 'Ann speaks' in text and '"Hello."' in text and "Bo does not speak" in text and "Only Ann and Bo are" in text
+
+
+def test_lipsync_engine_is_listed_and_pipeline_endpoints_queue_jobs(client, monkeypatch):
+    from studio import app as app_module
+    models = {m["engine"]: m for m in client.get("/api/models").json()}
+    assert models["ltx_lipsync"]["available"] is True
+    sid, eid, _ = project(client)
+    queued = []
+    monkeypatch.setattr(app_module, "_submit", lambda kind, title, fn, **params: queued.append((kind, fn.__name__, params)) or {"id": "j"})
+    for path in ("dialogue_elevenlabs", "sfx", "lipsync_cut"):
+        assert client.post(f"/api/s/{sid}/e/{eid}/{path}", json={}).status_code == 200
+    assert [q[1] for q in queued] == ["job_dialogue_elevenlabs", "job_sfx", "job_lipsync_cut"]
+
+
+def test_body_parts_only_shots_do_not_describe_the_face():
+    from studio import prompts
+    assert prompts.body_parts_only("Only the shoes and lower legs are in frame.")
+    assert prompts.body_parts_only("Only his hands are visible, typing.")
+    assert prompts.body_parts_only("Close on his fist, no face.")
+    assert not prompts.body_parts_only("Only Hirad is in frame, smiling.")
+    assert not prompts.body_parts_only("Hirad waves his hands at the camera.")
+    b = {"style": {}, "locations": {}, "characters": {"h": {"id": "h", "name": "Hirad", "appearance": "brown eyes",
+                                                            "outfits": {"default": "navy hoodie"}}}}
+    shot = {"framing": "close-up", "action": "Only the shoes are in frame.", "characters": [{"id": "h"}]}
+    p = prompts.image_prompt(shot, b)
+    assert "brown eyes" not in p and "Hirad" not in p and "no face" in p
+    assert "brown eyes" in prompts.image_prompt({**shot, "framing": "wide"}, b)
+
+
+def test_flux2_klein_character_lora_routes_to_compatible_graph():
+    from studio import prompts, workflows
+
+    lora = {"name": "maryam_movie_actor_v1.safetensors", "strength": 0.9,
+            "model_family": "flux2_klein"}
+    bible = {"characters": {"maryam": {"id": "maryam", "image_lora": lora}}}
+    shot = {"characters": [{"id": "maryam"}]}
+    assert prompts.image_loras(shot, bible, 0.75) == [lora]
+
+    graph = workflows.flux2_klein_image(
+        settings.DEFAULTS, "mrvxwoman portrait", 123, 1024, 1024, loras=[lora])
+    assert graph["1"]["inputs"]["unet_name"] == "flux-2-klein-base-4b.safetensors"
+    assert graph["2"]["inputs"] == {
+        "clip_name": "qwen_3_4b.safetensors", "type": "flux2", "device": "default"
+    }
+    assert graph["30"]["class_type"] == "LoraLoaderModelOnly"
+    assert graph["30"]["inputs"]["lora_name"] == lora["name"]
+    assert graph["11"]["class_type"] == "SamplerCustomAdvanced"
+
+    edit_graph = workflows.flux2_klein_image(
+        settings.DEFAULTS, "mrvxwoman portrait", 123, 1024, 1024,
+        loras=[lora], init_image="frame.png", denoise=0.3)
+    assert edit_graph["42"]["class_type"] == "VAEEncode"
+    assert edit_graph["8"]["inputs"]["denoise"] == 0.3
+
+
+def test_registered_image_lora_selects_its_trigger_and_base_family(client):
+    sid = client.post("/api/series", json={"name": "Other project"}).json()["id"]
+    character = client.post(f"/api/s/{sid}/characters", json={"name": "Maryam"}).json()
+    saved = client.put(
+        f"/api/s/{sid}/characters/{character['id']}",
+        json={
+            "image_lora": {
+                "name": "maryam_movie_actor_v2.safetensors",
+                "strength": 0.85,
+                "model_family": "flux1",
+            },
+            "trigger": "wrong_manual_token",
+        },
+    ).json()
+    assert saved["trigger"] == "mrvxwoman"
+    assert saved["image_lora"] == {
+        "name": "maryam_movie_actor_v2.safetensors",
+        "strength": 0.85,
+        "model_family": "flux2_klein",
+    }
+
+
+def test_image_lora_trigger_is_inserted_even_for_prompt_overrides_and_inserts():
+    from studio import prompts
+    character = {
+        "id": "maryam", "name": "Maryam", "trigger": "mrvxwoman",
+        "image_lora": {"name": "maryam_movie_actor_v1.safetensors"},
+        "appearance": "dark wavy hair", "outfits": {"default": "dark dress"},
+    }
+    bible = {"style": {}, "locations": {}, "characters": {"maryam": character}}
+    override = {"characters": [{"id": "maryam"}], "image_prompt_override": "A medium shot in a garden."}
+    assert prompts.image_prompt(override, bible).startswith("mrvxwoman, ")
+    insert = {
+        "characters": [{"id": "maryam"}], "framing": "close-up",
+        "action": "Only her hands are visible, holding a cup.",
+    }
+    prompt = prompts.image_prompt(insert, bible)
+    assert "mrvxwoman" in prompt and "no face" in prompt

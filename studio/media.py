@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+from functools import lru_cache
 
 from PIL import Image, ImageOps
 
@@ -158,6 +159,22 @@ def qc_video(path: str, expected_seconds: float, actual_seconds: float) -> list[
 
 # ── Cut ─────────────────────────────────────────────────────────────────
 
+def audio_peaks(ffmpeg, path):
+    stat = os.stat(path)
+    return _audio_peaks(ffmpeg, path, stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=32)
+def _audio_peaks(ffmpeg, path, modified, size):
+    import numpy as np
+    result = subprocess.run([ffmpeg, '-v', 'error', '-i', path, '-vn', '-ac', '1', '-ar', '2000',
+                             '-f', 's16le', '-'], capture_output=True)
+    if result.returncode:
+        raise MediaError('Could not read the audio waveform')
+    samples = np.abs(np.frombuffer(result.stdout, dtype='<i2').astype(np.float32))
+    peaks = np.array([part.max() if part.size else 0 for part in np.array_split(samples, 512)])
+    return np.round(peaks / max(1, float(peaks.max())), 4).tolist()
+
 def normalize_clip(ffmpeg: str, ffprobe: str, src: str, dst: str, trim_in: float, trim_out: float,
                    width: int, height: int, fps: int, lufs: float) -> float:
     """Re-encode one take to the common format (size, fps, stereo 48 kHz, loudness). Returns duration."""
@@ -271,3 +288,14 @@ def image_preview(data: bytes) -> bytes:
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=90)
         return output.getvalue()
+
+
+def to_frame_rate(fps, source_fps=None):
+    """ffmpeg filter that brings video to `fps` frames per second.
+
+    A source slower than the project (a 24 fps take, LatentSync's 25 fps result) used to reach 30 fps by repeating
+    frames, which makes motion stutter several times a second; it is interpolated (motion compensated) instead.
+    A source at the project rate or faster keeps the exact frame-picking `fps` filter."""
+    if source_fps and source_fps < fps - .01:
+        return f'setpts=PTS-STARTPTS,minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'
+    return f'fps={fps}:start_time=0'

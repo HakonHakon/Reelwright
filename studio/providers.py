@@ -10,11 +10,31 @@ import requests
 VIDEO_MODELS = [
     {"engine": "minimax_local", "id": "MiniMax-H3", "name": "MiniMax H3 · local, audio, no API fees"},
     {"engine": "ltx", "id": "ltx", "name": "LTX-2.3 · local, audio"},
+    {"engine": "ltx_lipsync", "id": "ltx_lipsync", "name": "LTX-2.3 lip-sync · local, mouths follow the voiced lines"},
+    {"engine": "infinitetalk", "id": "infinitetalk", "name": "InfiniteTalk · local, the speaker's mouth follows the voiced lines"},
     {"engine": "wan", "id": "wan", "name": "Wan 2.2 · local, silent"},
     {"engine": "minimax", "id": "MiniMax-Hailuo-2.3", "name": "MiniMax Hailuo 2.3 · cloud"},
     {"engine": "minimax", "id": "MiniMax-Hailuo-2.3-Fast", "name": "MiniMax Hailuo 2.3 Fast · cloud"},
     {"engine": "minimax", "id": "MiniMax-Hailuo-02", "name": "MiniMax Hailuo 02 · cloud"},
 ]
+
+
+def engine_problem(s, engine):
+    """Why an engine cannot run on this install (a readable sentence), or "" when it can."""
+    if engine == "ltx_lipsync":
+        from . import lipsync_engine
+        if not os.path.isfile(lipsync_engine.template(s)):
+            return (f"LTX-2.3 lip-sync is not set up: its workflow file is missing ({s['ltx_lipsync']['template']}).")
+        return ""
+    if engine == "ltx":
+        from . import settings as settings_mod
+        template = s["ltx"]["template"]
+        path = template if os.path.isabs(template) else os.path.join(settings_mod.REPO_ROOT, template)
+        if not os.path.isfile(path):
+            return (f"LTX-2.3 is not set up: its ComfyUI workflow file is missing ({template}). "
+                    "Choose Wan 2.2 or MiniMax H3, or export your LTX image-to-video workflow from ComfyUI "
+                    "(API format) to that path.")
+    return ""
 
 
 def validate_model(engine, model=""):

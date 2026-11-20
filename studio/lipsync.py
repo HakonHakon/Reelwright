@@ -7,6 +7,15 @@ import uuid
 from . import comfy, media, settings, store, workflows
 
 
+# LatentSync always returns 25 fps. Plain `fps=30` repeats every 5th frame, so the mouth freezes for a frame
+# six times a second (visible judder); motion-compensated interpolation makes the in-between frames instead.
+RETIME_VERSION = 'mci2'  # mci2: the takes fed to lip-sync are interpolated to the project rate too
+
+
+def to_project_rate(fps):
+    return media.to_frame_rate(fps, 25)
+
+
 def plan_episode(episode, shot_ids, cfg):
     if not isinstance(shot_ids, list) or not shot_ids or any(not isinstance(x, str) for x in shot_ids):
         raise ValueError('Choose at least one single-character shot to lip-sync')
@@ -43,6 +52,25 @@ def plan_episode(episode, shot_ids, cfg):
     if not timeline:
         raise ValueError('Choose video takes first')
     return timeline
+
+
+def correct_clip(job, cfg, client, source, voice, destination, frames, width, height, fps, prefix):
+    """Apply the installed ComfyUI mouth correction to a precisely trimmed clip."""
+    import tempfile
+    job.check()
+    with tempfile.TemporaryDirectory(prefix='reelwright_clip_sync_') as work:
+        video_name = client.upload(source, prefix + '.mp4')
+        audio_name = client.upload(voice, prefix + '.wav')
+        result = client.run(workflows.lipsync_video(video_name, audio_name, **settings.lipsync_params(cfg)), cancel=lambda: job.cancel_flag)
+        if not result['videos']:
+            raise RuntimeError('Lip-sync produced no video')
+        rendered = str(Path(work) / 'model.mp4')
+        client.download(result['videos'][0], rendered)
+        job.check()
+        media._run([cfg['ffmpeg'], '-y', '-v', 'error', '-i', rendered, '-an', '-vf',
+                    f'scale={width}:{height},{to_project_rate(fps)},tpad=stop_mode=clone:stop_duration=1,setpts=N/({fps}*TB),format=yuv420p',
+                    '-frames:v', str(frames), '-c:v', 'libx264', '-crf', '16', destination])
+    return destination
 
 
 def render(job, sid, eid, timeline, audio_file, audio_offset=0, isolate_vocals=True):
@@ -91,14 +119,14 @@ def render(job, sid, eid, timeline, audio_file, audio_offset=0, isolate_vocals=T
                         '-t', str(clip['duration']), '-ar', '16000', '-ac', '1', str(voice)])
             video_name = client.upload(str(source), f'lipsync_{token}_{i}.mp4')
             audio_name = client.upload(str(voice), f'lipsync_{token}_{i}.wav')
-            result = client.run(workflows.lipsync_video(video_name, audio_name), cancel=lambda: job.cancel_flag)
+            result = client.run(workflows.lipsync_video(video_name, audio_name, **settings.lipsync_params(cfg)), cancel=lambda: job.cancel_flag)
             if not result['videos']:
                 raise RuntimeError(f"{clip['shot_id']}: lip-sync produced no video")
             rendered = out / f'{i:03d}_model.mp4'
             client.download(result['videos'][0], str(rendered))
             chosen = out / f'{i:03d}_synced.mp4'
             media._run([cfg['ffmpeg'], '-y', '-v', 'error', '-i', str(rendered), '-an', '-vf',
-                        f'scale={width}:{height},fps={fps},tpad=stop_mode=clone:stop_duration=1,format=yuv420p',
+                        f'scale={width}:{height},{to_project_rate(fps)},tpad=stop_mode=clone:stop_duration=1,setpts=N/({fps}*TB),format=yuv420p',
                         '-frames:v', str(clip['frames']), '-c:v', 'libx264', '-crf', '16', str(chosen)])
         clips.append(str(chosen))
         job.progress = [i + 1, len(timeline)]
@@ -113,7 +141,7 @@ def render(job, sid, eid, timeline, audio_file, audio_offset=0, isolate_vocals=T
     if abs(info['video_duration'] - duration) > 1 / fps:
         raise RuntimeError('Lip-sync changed the timeline duration; original final retained')
     job.check()
-    item = {'file': store.rel(str(final)), 'created': store.now(), 'model': 'LatentSync 1.6',
+    item = {'file': store.rel(str(final)), 'created': store.now(), 'model': 'LatentSync 1.6', 'params': settings.lipsync_params(cfg),
             'audio_file': audio_file, 'audio_offset': audio_offset, 'isolated_vocals': isolate_vocals,
             'runtime': duration, 'timeline': timeline, 'source_final': episode.get('outputs', {}).get('final')}
     (out / 'workflow_report.json').write_text(json.dumps(item, indent=2))

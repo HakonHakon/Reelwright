@@ -1,7 +1,10 @@
 """Single-GPU job queue and the job implementations for every stage."""
 
+import copy
+import math
 import os
 import random
+import re
 import shutil
 import threading
 import time
@@ -10,7 +13,7 @@ import uuid
 from collections import deque
 
 from . import comfy as comfy_mod
-from . import llm, media, planner, prompts, store, workflows, providers
+from . import blocking, cloud, llm, media, planner, prompts, store, workflows, providers, lipsync_engine, lipsync, blender
 from . import settings as settings_mod
 
 
@@ -104,6 +107,28 @@ class Queue:
 QUEUE = Queue()
 
 
+def job_reference_rebuild(job, sid, eid, shot_ids=None, recover_prompt="", recover_shot=""):
+    """Keep the entire reference render in the shared, cancellable Studio queue."""
+    from . import reference_rebuild
+    try:
+        if recover_prompt:
+            reference_rebuild.recover_frame(job, sid, eid, recover_shot, recover_prompt)
+        reference_rebuild.render(job, sid, eid, shot_ids or None)
+        job.check()
+        if store.get_episode(sid, eid)["reference_rebuild"].get("status") == "rendered_pending_visual_review":
+            job.say("Checking rendered frame counts and original soundtrack...")
+            reference_rebuild.verify(job, sid, eid)
+    except Cancelled:
+        store.update_episode(sid, eid, lambda ep: ep["reference_rebuild"].update(status="cancelled"))
+        raise
+    except Exception as exc:
+        status = "cancelled" if job.cancel_flag else "error"
+        store.update_episode(sid, eid, lambda ep: ep["reference_rebuild"].update(status=status, error=str(exc)))
+        if job.cancel_flag:
+            raise Cancelled() from exc
+        raise
+
+
 # ── helpers ─────────────────────────────────────────────────────────────
 
 def _ctx():
@@ -114,12 +139,20 @@ def _ctx():
 def _gpu_prepare(job: Job, s: dict, c: comfy_mod.Comfy):
     if not c.alive():
         raise RuntimeError(f"ComfyUI is not running at {s['comfy_host']}. Start Comfy Desktop first.")
-    job.say("Unloading Ollama models to free VRAM...")
+    job.say("Unloading Ollama and VoiceStudio models to free VRAM...")
     llm.unload(s["ollama_host"], [s["planner_model"], s["vision_model"]])
+    from . import voices
+    voices.unload(s)
 
 
 def _seed() -> int:
     return random.randint(1, 2**48)
+
+
+def _next_name(dest_dir, stem, ext=".png"):
+    """The name _save_outputs would give the next file with this stem."""
+    os.makedirs(dest_dir, exist_ok=True)
+    return os.path.join(dest_dir, f"{stem}{len([f for f in os.listdir(dest_dir) if f.startswith(stem)]) + 1:03d}{ext}")
 
 
 def _save_outputs(c, items, dest_dir, stem):
@@ -127,6 +160,12 @@ def _save_outputs(c, items, dest_dir, stem):
     os.makedirs(dest_dir, exist_ok=True)
     existing = len([f for f in os.listdir(dest_dir) if f.startswith(stem)])
     for i, item in enumerate(items):
+        if "data" in item:          # cloud image bytes
+            dest = os.path.join(dest_dir, f"{stem}{existing + i + 1:03d}.png")
+            with open(dest, "wb") as f:
+                f.write(item["data"])
+            paths.append(dest)
+            continue
         ext = os.path.splitext(item["filename"])[1] or ".png"
         dest = os.path.join(dest_dir, f"{stem}{existing + i + 1:03d}{ext}")
         c.download(item, dest)
@@ -136,10 +175,13 @@ def _save_outputs(c, items, dest_dir, stem):
 
 def _character_refs(sh, b) -> list[tuple[dict, str]]:
     """(character, media path) for each character in the shot that has a reference photo on disk.
-    Uploaded refs win over generated sheet images."""
+    A reference for the shot's outfit (character["outfit_refs"][outfit]) wins, so costume changes
+    are not overridden by the clothes in the main photo; then uploaded refs, then sheet images."""
     out = []
-    for c, _ in prompts.characters_in(sh, b):
-        cands = list(c.get("refs") or []) + [x.get("file") for x in (c.get("sheet") or [])]
+    for c, ch in prompts.characters_in(sh, b):
+        outfit = (ch or {}).get("outfit") or c.get("default_outfit") or ""
+        cands = [(c.get("outfit_refs") or {}).get(outfit)] + list(c.get("refs") or []) \
+            + [x.get("file") for x in (c.get("sheet") or [])]
         for rel in cands:
             if rel and os.path.exists(store.abs_media(rel)):
                 out.append((c, rel))
@@ -147,34 +189,318 @@ def _character_refs(sh, b) -> list[tuple[dict, str]]:
     return out
 
 
+_FACE_SIZE: dict = {}
+
+
+def _face_size(rel: str) -> int:
+    """Width in px of the largest face in a reference photo (0: none, e.g. a photo from behind). Cached."""
+    from . import detect
+    path = store.abs_media(rel)
+    key = (path, os.path.getmtime(path))
+    if key not in _FACE_SIZE:
+        try:
+            import cv2
+            img = cv2.imread(path)
+            found = detect.faces(img) if img is not None else []
+            _FACE_SIZE[key] = int(max((f[2] for f in found), default=0))
+        except Exception:                       # detector models unavailable offline: keep upload order
+            _FACE_SIZE[key] = 1
+    return _FACE_SIZE[key]
+
+
+# Reference crops per framing, as multiples of the face box (width, height, space above the face). Full-body photos
+# made Qwen 2511 draw every close-up as a full-body copy of the photo's pose (Broken Angel S01_SH02); a photo cropped
+# to the shot's framing makes it frame the person the same way.
+_REF_CROP = {"extreme close-up": (2.4, 2.6, 0.7), "close-up": (3.2, 3.6, 0.9), "medium close-up": (4.2, 5.2, 1.1),
+             "medium": (5.5, 7.5, 1.3), "two-shot": (5.5, 7.5, 1.3), "over-the-shoulder": (5.5, 7.5, 1.3)}
+FRAMING_TEXT = {
+    "extreme close-up": "Extreme close-up: only the face fills the frame",
+    "close-up": "Close-up: the head and shoulders fill the frame, the face large and sharp",
+    "medium close-up": "Medium close-up: framed from the chest up, the face large in the frame",
+    "medium": "Medium shot: framed from the waist up",
+    "two-shot": "Two-shot: both people framed from the waist up, close together",
+    "medium wide": "Medium wide shot: framed from the knees up with the surroundings visible",
+    "wide": "Wide shot: the whole body small in the frame, the location fills most of the picture",
+    "extreme wide": "Extreme wide shot: tiny figures in a vast landscape",
+}
+
+
+def _framed_ref(rel: str, framing: str) -> str:
+    """The photo cropped around the face to the shot's framing (cached); the photo itself for wide shots."""
+    box = _REF_CROP.get((framing or "").lower())
+    if not box:
+        return rel
+    from . import detect
+    import cv2
+    import hashlib
+    from PIL import Image, ImageOps
+    path = store.abs_media(rel)
+    key = hashlib.sha1(f"{rel}|{os.path.getmtime(path)}|{box}".encode()).hexdigest()[:16]
+    out = os.path.join(os.path.dirname(os.path.dirname(path)), "crops", f"{key}.png")
+    if os.path.exists(out):
+        return store.rel(out)
+    try:
+        found = detect.faces(cv2.imread(path))
+    except Exception:
+        return rel
+    if not len(found):
+        return rel
+    x, y, w, h = [float(v) for v in max(found, key=lambda f: f[2])[:4]]
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        cw, ch, above = w * box[0], h * box[1], h * box[2]
+        left = max(0, x + w / 2 - cw / 2)
+        top = max(0, y - above)
+        crop = im.crop((int(left), int(top), int(min(im.width, left + cw)), int(min(im.height, top + ch))))
+        if crop.width < 64 or crop.height < 64:
+            return rel
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        crop.save(out)
+    return store.rel(out)
+
+
+def _qwen2511_refs(sh, b, max_refs: int = 3) -> list[tuple[dict, str]]:
+    """(character, photo) pairs for a Qwen 2511 frame, at most max_refs images in total.
+    Only people whose face the shot shows get photos (an insert of shoes, a back-of-head or offscreen person would
+    be drawn whole from a face photo). Per person: the outfit reference first, then approved photos with the
+    largest face; photos without a face are skipped. Everyone gets one photo before anyone gets a second."""
+    people = []
+    parts_only = (sh.get("framing") or "").lower() in prompts.CLOSE_FRAMINGS and \
+        prompts.body_parts_only(sh.get("action", ""))
+    if parts_only:
+        return []
+    for c, ch in prompts.characters_in(sh, b):
+        subject = blocking.subject_for(sh, c["id"]) if sh.get("first_frame") is not None else None
+        if subject and subject["visibility"] in ("offscreen", "partial", *blocking.FACELESS):
+            continue
+        outfit = (ch or {}).get("outfit") or c.get("default_outfit") or ""
+        outfit_ref = (c.get("outfit_refs") or {}).get(outfit)
+        photos = [r for r in (c.get("refs") or []) if r and os.path.exists(store.abs_media(r))]
+        if not photos:
+            photos = [x["file"] for x in (c.get("sheet") or []) if os.path.exists(store.abs_media(x.get("file", "")))]
+        photos = sorted((r for r in photos if _face_size(r) > 0), key=lambda r: -_face_size(r))
+        if outfit_ref and os.path.exists(store.abs_media(outfit_ref)):
+            photos = [outfit_ref] + [r for r in photos if r != outfit_ref]
+        if photos:
+            people.append((c, photos))
+    people = people[:max_refs]
+    if not people:
+        return []
+    per = max(1, min(2, max_refs // len(people)))
+    framing = sh.get("framing") or ""
+    return [(c, _framed_ref(rel, framing)) for c, photos in people for rel in photos[:per]]
+
+
+_LOWER = re.compile(r"\b(trousers|pants|jeans|cargo|shorts|skirt|leggings|belt|shoes?|sneakers?|trainers|boots?|heels|"
+                    r"sandals|socks)\b", re.I)
+_FEET = re.compile(r"\b(shoes?|sneakers?|trainers|boots?|heels|sandals|socks)\b", re.I)
+
+
+def _visible_outfit(outfit: str, framing: str) -> str:
+    """Only the clothes the framing shows: naming trousers and sneakers made Qwen 2511 draw close-ups full length."""
+    f = (framing or "").lower()
+    cut = _LOWER if f in ("extreme close-up", "close-up", "medium close-up") else \
+        _FEET if f in ("medium", "two-shot", "over-the-shoulder") else None
+    if not cut:
+        return outfit
+    parts = [p for p in re.split(r",\s*", outfit) if p and not cut.search(p)]
+    return ", ".join(parts)
+
+
+def _identity_check(path: str, sh, b) -> dict:
+    """Detector check of a frame drawn from photos: the same person twice (two photos of one person sometimes give
+    a second, smaller copy) or more faces than the cast is a fail; ranks the rest by likeness to the photos."""
+    from . import detect
+    cast = [c for c, _ in prompts.characters_in(sh, b)]
+    refs = {c["id"]: [store.abs_media(r) for r in c.get("refs") or []] for c in cast}
+    try:
+        measured = detect.analyze(path, refs)
+    except Exception as exc:
+        return {"matches": None, "score": None, "issues": [f"(minor) detector unavailable: {exc}"]}
+    names = {c["id"]: c.get("name") or c["id"] for c in cast}
+    critical, best = [], {}
+    owners = []
+    for f in measured["faces"]:
+        if f["sims"]:
+            cid, sim = max(f["sims"].items(), key=lambda kv: kv[1])
+            owners.append(cid if sim >= detect.SAME else None)
+            best[cid] = max(best.get(cid, -1), sim)
+    for cid in set(o for o in owners if o):
+        if owners.count(cid) > 1:
+            critical.append(f"detector: {names[cid]} appears {owners.count(cid)} times")
+    if len(measured["faces"]) > len(cast):
+        critical.append(f"detector: {len(measured['faces'])} faces, the shot has {len(cast)} people")
+    vals = [v for v in best.values() if v > 0]
+    # A face-identity detector cannot establish eyeline. Leave gaze unverified so
+    # these candidates cannot be auto-selected before a composition check.
+    return {"matches": not critical, "score": max(0, 10 - 4 * len(critical)), "looks_at_camera": None,
+            "camera_gaze_allowed": False, "issues": critical + ["(minor) camera gaze not checked"], "critical": critical,
+            "resemblance": round(sum(vals) / len(vals), 3) if vals else None, "detector": measured}
+
+
+def qwen2511_prompt(sh, b, refs) -> str:
+    """Framing first, image-to-person mapping, the 'new picture, not a copy' rules, then the shot's prompt with only
+    the clothes the framing shows (measured on Broken Angel S03_SH02: with trousers and sneakers named, every
+    close-up came out full length)."""
+    lines, seen = [], set()
+    framing = FRAMING_TEXT.get((sh.get("framing") or "").lower())
+    if framing:
+        lines.append(framing + ".")
+    for i, (c, _) in enumerate(refs):
+        name = c.get("name") or c["id"]
+        lines.append(f"Image {i + 1} is {'another photo of ' if c['id'] in seen else 'a photo of '}{name}.")
+        seen.add(c["id"])
+    cast = list({c["id"]: c for c, _ in prompts.characters_in(sh, b)}.values())
+    if cast:
+        names = ", ".join(c.get("name") or c["id"] for c in cast)
+        lines.append(f"Scene cast: exactly {len(cast)} {'person' if len(cast) == 1 else 'people'} ({names}); "
+                     "each appears once. Reference images supply identity only, not additional people or panels. "
+                     "Do not reproduce reference portraits, inset photos, duplicates or reflected copies.")
+    lines.append("Create a brand-new cinematic film still: one single continuous photograph, not a collage, not a "
+                 "split screen. Each person keeps the exact face, facial features, ears, hair, skin tone and age from "
+                 "their photos and appears exactly once, in a new pose that fits the scene; do not copy a photo's pose, "
+                 "framing or white background. Follow the scene's framing, lighting and clothes exactly. No "
+                 "microphone unless the scene names one.")
+    lines.append("Scene:")
+    scene = prompts.image_prompt(sh, b)
+    for c, ch in prompts.characters_in(sh, b):
+        outfit = (c.get("outfits") or {}).get(ch.get("outfit") or c.get("default_outfit") or "default", "")
+        if outfit:
+            scene = scene.replace(outfit, _visible_outfit(outfit, sh.get("framing")))
+    return " ".join(lines) + " " + scene
+
+
 def _resolve_source(sh, b) -> str:
     """prompts.frame_source plus the 'auto' choice: LoRA characters -> Flux, else reference photos
-    -> Qwen Edit, else Z-Image."""
+    -> Qwen 2511 drawing from the photos, else Z-Image."""
     src = prompts.frame_source(sh, b)
     if src == "auto":
         if prompts.image_loras(sh, b, 1.0):
             return "flux_lora"
-        return "qwen_refs" if _character_refs(sh, b) else "zimage"
+        return "qwen_2511" if _character_refs(sh, b) else "zimage"
     return src
 
 
-def _refs_prompt(base: str, names: list[str], has_plate: bool) -> str:
-    """Tell Qwen Edit which input image is which person, then append the shot's normal prompt."""
-    parts = [f"Image {i + 1} is {n}." for i, n in enumerate(names)]
+CLOSE_VIEWS = ("front", "three_quarter", "photo", "profile", "full_body")
+WIDE_VIEWS = ("full_body", "three_quarter", "front", "photo", "profile")
+TURNAROUND_HEIGHT, TURNAROUND_GAP = 768, 24
+
+
+def _character_views(c: dict, ch: dict, close: bool) -> list[str]:
+    """Every usable reference of one character, best first for this framing: the outfit reference (or else the first
+    approved photo) leads, then approved sheet views in the order the framing needs them. Unapproved sheet images are
+    only a fallback when nothing is approved. With an outfit reference, full-body views are left out: they would
+    show the default clothes."""
+    outfit = (ch or {}).get("outfit") or c.get("default_outfit") or ""
+    outfit_ref = (c.get("outfit_refs") or {}).get(outfit)
+    outfit_ref = outfit_ref if outfit_ref and os.path.exists(store.abs_media(outfit_ref)) else None
+    view_of = {x.get("file"): x.get("view") or "photo" for x in (c.get("sheet") or []) if x.get("file")}
+    pool = [r for r in (c.get("refs") or []) if r and os.path.exists(store.abs_media(r))]
+    if not pool and not outfit_ref:
+        pool = [r for r in view_of if os.path.exists(store.abs_media(r))]
+    order = CLOSE_VIEWS if close else WIDE_VIEWS
+    rank = {v: i for i, v in enumerate(order)}
+    lead = outfit_ref or (pool[0] if pool else None)
+    rest = [r for r in pool if r != lead and not (outfit_ref and view_of.get(r) == "full_body")]
+    rest.sort(key=lambda r: rank.get(view_of.get(r, "photo"), len(order)))     # stable: upload order within a view
+    return ([lead] if lead else []) + rest
+
+
+def _turnaround(sid: str, c: dict, rels: list[str]) -> str:
+    """The views side by side in one image (cached by file and modification time); media path."""
+    import hashlib
+    from PIL import Image, ImageOps
+    key = "|".join(f"{r}:{os.path.getmtime(store.abs_media(r))}" for r in rels)
+    out = os.path.join(store.char_dir(sid, c["id"]), "turnaround",
+                       hashlib.sha1(key.encode()).hexdigest()[:16] + ".png")
+    if not os.path.exists(out):
+        tiles = []
+        for r in rels:
+            with Image.open(store.abs_media(r)) as im:
+                im = ImageOps.exif_transpose(im).convert("RGB")
+                w = max(1, round(im.width * TURNAROUND_HEIGHT / im.height))
+                tiles.append(im.resize((w, TURNAROUND_HEIGHT), Image.LANCZOS))
+        width = sum(t.width for t in tiles) + TURNAROUND_GAP * (len(tiles) - 1)
+        sheet = Image.new("RGB", (width, TURNAROUND_HEIGHT), "white")
+        x = 0
+        for t in tiles:
+            sheet.paste(t, (x, 0))
+            x += t.width + TURNAROUND_GAP
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        sheet.save(out)
+    return store.rel(out)
+
+
+def _cloud_refs(s, sid, sh, b, max_refs: int, want_plate: bool):
+    """Reference images for a cloud first frame: ([(character, [media paths], kind)], use_plate).
+    kind is "views" (separate images of one person) or "turnaround" (one stitched image).
+    The model's image limit is shared: every person gets at least one image before anyone gets a second,
+    and the location plate only goes in if a slot is left."""
+    cfg = s.get("cloud_refs") or {}
+    mode = cfg.get("mode", "views")
+    cap = max(1, int(cfg.get("per_character", 3)))
+    close = (sh.get("framing") or "").lower() in prompts.CLOSE_FRAMINGS
+    people = [(c, v) for c, ch in prompts.characters_in(sh, b) if (v := _character_views(c, ch, close))]
+    people = people[:max_refs]
+    if mode == "single" or not people:
+        groups = [(c, v[:1], "views") for c, v in people]
+    elif mode == "turnaround":
+        groups = [(c, [_turnaround(sid, c, v[:cap])] if len(v) > 1 else v[:1],
+                   "turnaround" if len(v) > 1 else "views") for c, v in people]
+    else:
+        slots = max_refs - (1 if want_plate and max_refs > len(people) else 0)
+        per = max(1, min(cap, slots // len(people)))
+        groups = [(c, v[:per], "views") for c, v in people]
+    used = sum(len(rels) for _, rels, _ in groups)
+    return groups, bool(want_plate) and used < max_refs
+
+
+def _refs_prompt(base: str, groups, has_plate: bool) -> str:
+    """Map cloud reference images to characters, followed by the shot's normal prompt.
+    groups: [(name, image count, kind)] in upload order (a bare list of names means one image each)."""
+    groups = [g if isinstance(g, tuple) else (g, 1, "views") for g in groups]
+    parts, i = [], 1
+    for name, count, kind in groups:
+        if kind == "turnaround":
+            parts.append(f"Image {i} is a reference sheet of {name}: several views of this one person side by side.")
+        elif count == 1:
+            parts.append(f"Image {i} is {name}.")
+        else:
+            parts.append(f"Images {i}-{i + count - 1} are {name}, the same person from different angles.")
+        i += count
     if has_plate:
-        parts.append(f"Image {len(names) + 1} is the room; keep this location.")
+        parts.append(f"Image {i} is the room; keep this location.")
     parts.append("Create a new picture of the following scene. Each person keeps the exact face, hair, skin tone "
-                 "and age of their reference image.")
+                 "and age of their reference images.")
+    if any(count > 1 or kind == "turnaround" for _, count, kind in groups):
+        parts.append("Draw each person exactly once, in the pose the scene describes; never copy a reference "
+                     "image's pose, layout or background.")
     return " ".join(parts) + " " + base
 
 
 def _render_images(job, s, c, source, prompt, seed, n, loras, prefix, init_image=None, denoise=1.0,
-                   ref_images=None):
+                   ref_images=None, ref_files=None):
+    """ComfyUI output items, or {"data": png bytes} items for the cloud sources (ref_files: local paths)."""
     w, h = s["image"]["width"], s["image"]["height"]
+    if cloud.is_image_source(source):
+        neg = (s.get("_negative") or "").strip()
+        full = prompt + (f" Avoid: {neg}." if neg else "")
+        try:
+            data = cloud.generate_images(s, source, full, n, w, h,
+                                         [store.abs_media(r) for r in (ref_files or [])], log=job.say)
+        except cloud.CloudError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return [{"data": d} for d in data]
     if source == "qwen_refs":
         wf = workflows.qwen_edit_image(s, prompt, seed, w, h, n, ref_images or [], prefix)
     elif source == "flux_lora":
-        wf = workflows.flux_image(s, prompt, seed, w, h, n, loras, prefix, init_image, denoise)
+        families = {item.get("model_family", "flux1") for item in loras}
+        if len(families) > 1:
+            raise RuntimeError("A shot cannot mix Flux 1 and Flux 2 Klein image LoRAs.")
+        if families == {"flux2_klein"}:
+            wf = workflows.flux2_klein_image(s, prompt, seed, w, h, n, loras, prefix, init_image, denoise)
+        else:
+            wf = workflows.flux_image(s, prompt, seed, w, h, n, loras, prefix, init_image, denoise)
     else:
         wf = workflows.zimage_image(s, prompt, seed, w, h, n, prefix, init_image, denoise)
     res = c.run(wf, cancel=lambda: job.cancel_flag)
@@ -185,19 +511,82 @@ def _render_images(job, s, c, source, prompt, seed, n, loras, prefix, init_image
 
 VISION_SCHEMA = {"type": "object", "properties": {
     "matches": {"type": "boolean"}, "score": {"type": "integer", "minimum": 0, "maximum": 10},
-    "issues": {"type": "array", "items": {"type": "string"}}}, "required": ["matches", "score", "issues"]}
+    "looks_at_camera": {"type": "boolean", "description": "true if anyone looks straight into the camera lens"},
+    "issues": {"type": "array", "items": {"type": "string"}}}, "required": ["matches", "score", "looks_at_camera", "issues"]}
 
 
-def _vision_check(s, image_path, shot, bible) -> dict:
+def _with_detector(result, image_path, shot, bible, source=""):
+    """Add the deterministic detector findings (people count, pasted portraits, duplicates, resemblance) to a
+    vision-model check. If the detector cannot run, the vision-model result stands and says so."""
+    from . import detect
+    try:
+        detect.ensure_models()
+        refs = {c["id"]: [store.abs_media(p) for p in c.get("refs") or []] for c, _ in prompts.characters_in(shot, bible)}
+        measured = detect.analyze(image_path, refs)
+        names = {cid: c.get("name") or cid for cid, c in bible["characters"].items()}
+        # Qwen 2511 draws the person FROM the photo: 0.8-0.92 is a faithful likeness there, not a pasted portrait
+        # (measured on Hirad S02_SH02, new pose and scene at 0.89-0.92). Only a near-identical face counts as pasted.
+        critical, soft = detect.compare(shot, names, measured,
+                                        pasted=detect.PASTED_FROM_PHOTO if source == "qwen_2511" else detect.PASTED)
+    except Exception as exc:                                  # never block a render on the detector itself
+        result.setdefault("issues", []).append(f"(minor) detector unavailable: {exc}")
+        return result
+    result["critical"] = list(result.get("critical") or []) + critical
+    result["soft"] = list(result.get("soft") or []) + soft
+    result["issues"] = result["critical"] + [f"(minor) {x}" for x in result["soft"]]
+    result["matches"] = not result["critical"] if result.get("matches") is not None else None
+    result["score"] = max(0, 10 - 3 * len(result["critical"]) - len(result["soft"]))
+    result["detector"] = measured
+    result["resemblance"] = detect.resemblance(shot, measured)
+    return result
+
+
+def _vision_check(s, image_path, shot, bible, source="") -> dict:
+    if shot.get("first_frame") is not None:
+        identities = []
+        for c, ch in prompts.characters_in(shot, bible):
+            planned = blocking.subject_for(shot, c["id"])
+            if planned and planned["visibility"] == "offscreen":
+                continue                 # an ID for someone who should be absent invites the model to find them
+            wear = (c.get("outfits") or {}).get(ch.get("outfit") or c.get("default_outfit") or "default", "")
+            identities.append(f"{c['id']}: {c['name']}, {blocking.composition_description(c)}, wearing {wear}")
+        question = (
+            "Describe ONLY visible facts in this image. Report EVERY visible person once, including extras as "
+            "unidentified. ID guide (appearance only, not intended locations): " + "; ".join(identities) + ". "
+            "For each actual person report space, relative depth, actual gaze target and physical evidence. "
+            "A person whose shoes stand on wet street pavement is OUTSIDE, even if a bakery is behind them. "
+            "Call someone INSIDE only when they are visibly behind the glass plane or inside the room. "
+            "People in photographs, posters, paintings, screens or reflections are pictures, not people: never "
+            "report them. Do not assume a woman is indoors because she wears an apron. A person standing in a room, at a counter "
+            "or table, is INSIDE even when the street is visible through windows behind them. Background people are visibly farther "
+            "away and smaller. Use unknown for facts you cannot see. Identify visible props from these ids: "
+            + ", ".join(p["id"] for p in shot["first_frame"]["props"]) + ". "
+            "Report each prop's actual holder (a PERSON holding it by hand, or none for scenery), actual state and visible evidence. "
+            "Do not infer intended staging, invent people, or supply a quality score.")
+        try:
+            observed = llm.chat(s, "vision", "You are a visual evidence recorder. Observe before judging.",
+                                question, blocking.observation_schema(shot), images=[image_path],
+                                temperature=0.1, num_predict=1800)
+            result = blocking.compare_observations(shot, observed)
+        except Exception as exc:
+            return {"matches": None, "score": None, "looks_at_camera": False, "issues": [f"check failed: {exc}"]}
+        return _with_detector(result, image_path, shot, bible, source)
     who = []
     for c, ch in prompts.characters_in(shot, bible):
         who.append(f"{c['name']} ({c.get('appearance', '')[:120]}) {ch.get('position', '')}")
+    expected = shot.get("image_prompt_override") or shot.get("action") or ""
     q = (f"This image is the first frame of a film shot. Expected: framing '{shot.get('framing')}'; "
          f"characters: {'; '.join(who) or 'none'}; action: {shot.get('action')}. "
-         "Check: are exactly the expected characters visible, roughly matching their descriptions and positions? "
-         "Is there any text, watermark or extra limb? Score 0-10 for how well it fits.")
+         f"Authoritative opening-frame plan: {expected}\n"
+         "Check the opening instant, not later actions. Verify exact people count, no duplicated identities, "
+         "inside/outside placement and barriers, depth, facing and gaze, props and holders, wardrobe and lighting. "
+         "Offscreen characters must not appear. Any violation makes matches false. "
+         "Check: are exactly the expected characters visible, matching their descriptions and positions? "
+         "Is there any text, watermark or extra limb? Is anyone looking straight into the camera lens, or posing as "
+         "for a photo (set looks_at_camera)? A person looking into the lens is a failure unless the shot asks for it. "
+         "Score 0-10 for how well it fits.")
     try:
-        return llm.chat_json(s["ollama_host"], s["vision_model"], "You are a strict film continuity checker.",
+        return llm.chat(s, "vision", "You are a strict film continuity checker.",
                              q, VISION_SCHEMA, images=[image_path], temperature=0.1, num_predict=512)
     except Exception as exc:
         return {"matches": None, "score": None, "issues": [f"check failed: {exc}"]}
@@ -205,9 +594,10 @@ def _vision_check(s, image_path, shot, bible) -> dict:
 
 # ── Bible jobs ──────────────────────────────────────────────────────────
 
-def job_draft_bible(job, sid, story):
+def job_draft_bible(job, sid, story, model=""):
     s, _ = _ctx()
-    llm.ensure_model(s["ollama_host"], s["planner_model"], job.say)
+    s = llm.with_choice(s, "planner", model)
+    llm.prepare(s, "planner", job.say)
     job.say("Extracting characters and locations from the story...")
     added = planner.draft_bible(s, sid, story)
     job.say(f"Added {len(added['characters'])} characters, {len(added['locations'])} locations (marked draft).")
@@ -215,21 +605,32 @@ def job_draft_bible(job, sid, story):
 
 def job_character_sheet(job, sid, cid, source="flux_lora"):
     s, c = _ctx()
-    _gpu_prepare(job, s, c)
+    if not cloud.is_image_source(source):
+        _gpu_prepare(job, s, c)
     b = store.bible(sid)
     ch = b["characters"][cid]
+    # Cloud models keep the face of the character's first uploaded photo.
+    refs = [r for r in (ch.get("refs") or [])[:1] if os.path.exists(store.abs_media(r))] \
+        if cloud.is_image_source(source) else []
     loras = []
     if source == "flux_lora" and (ch.get("image_lora") or {}).get("name"):
-        loras = [{"name": ch["image_lora"]["name"], "strength": float(ch["image_lora"].get("strength", 0.9))}]
+        image_lora = ch["image_lora"]
+        loras = [{"name": image_lora["name"], "strength": float(image_lora.get("strength", 0.9)),
+                  "model_family": image_lora.get("model_family", "flux1")}]
+    out_dir = os.path.join(store.char_dir(sid, cid), "sheet")
+    if source == "qwen_refs":
+        return _qwen_character_sheet(job, s, c, sid, ch, out_dir)
     views = prompts.character_sheet_prompts(ch, b)
     job.progress = [0, len(views)]
-    out_dir = os.path.join(store.char_dir(sid, cid), "sheet")
     new = []
     for i, (view, prompt) in enumerate(views):
         job.check()
         seed = _seed()
         job.say(f"Rendering {view} ({source})...")
-        items = _render_images(job, s, c, source, prompt, seed, 1, loras, f"studio/{sid}/{cid}_{view}")
+        if refs:
+            prompt = f"Image 1 is {ch.get('name')}; keep exactly this person's face, hair, skin tone and age. " + prompt
+        items = _render_images(job, s, c, source, prompt, seed, 1, loras, f"studio/{sid}/{cid}_{view}",
+                               ref_files=refs)
         for p in _save_outputs(c, items, out_dir, f"{view}_"):
             new.append({"file": store.rel(p), "view": view, "seed": seed, "source": source})
         job.progress = [i + 1, len(views)]
@@ -239,9 +640,50 @@ def job_character_sheet(job, sid, cid, source="flux_lora"):
     job.say(f"Done: {len(new)} sheet images. Approve the good ones as references.")
 
 
+def _qwen_character_sheet(job, s, c, sid, ch, out_dir):
+    """Local sheet FROM the character's photo: Qwen Image Edit redraws the same person in each view, so the sheet
+    has the photo's face (text-only Z-Image/Flux sheets invent a new one). Each view is scored against the photo
+    with the face detector; low scores are flagged rather than dropped (profiles score lower by nature)."""
+    from . import detect
+    photo = next((r for r in (ch.get("refs") or []) if os.path.exists(store.abs_media(r))), None)
+    if not photo:
+        raise ValueError(f"{ch.get('name')}: upload a photo first - the local sheet is drawn from it.")
+    name = c.upload(store.abs_media(photo), f"studio_sheet_{uuid.uuid4().hex[:8]}{os.path.splitext(photo)[1]}")
+    views = prompts.qwen_sheet_prompts(ch)
+    job.progress = [0, len(views)]
+    new = []
+    for i, (view, prompt, (w, h)) in enumerate(views):
+        job.check()
+        seed = _seed()
+        job.say(f"Rendering {view} from {os.path.basename(photo)} (Qwen Edit)...")
+        wf = workflows.qwen_edit_image(s, prompt, seed, w, h, 1, [name], f"studio/{sid}/{ch['id']}_{view}")
+        res = c.run(wf, cancel=lambda: job.cancel_flag)
+        for p in _save_outputs(c, res["images"], out_dir, f"{view}_"):
+            entry = {"file": store.rel(p), "view": view, "seed": seed, "source": "qwen_edit", "from": photo}
+            try:
+                sims = [f["sims"].get(ch["id"], 0) for f in detect.analyze(p, {ch["id"]: [store.abs_media(photo)]})["faces"]]
+                entry["likeness"] = round(max(sims), 3) if sims else None
+            except Exception as exc:          # detector models missing offline: the sheet is still usable
+                job.say(f"  likeness not measured: {exc}")
+            if entry.get("likeness") is not None and entry["likeness"] >= detect.PASTED:
+                job.say(f"  {view}: likeness {entry['likeness']} - looks like the photo copied, not redrawn")
+            elif entry.get("likeness") is not None and entry["likeness"] < detect.RESEMBLES:
+                job.say(f"  {view}: likeness {entry['likeness']} - may not read as {ch.get('name')}")
+            else:
+                job.say(f"  {view}: likeness {entry.get('likeness')}")
+            new.append(entry)
+        job.progress = [i + 1, len(views)]
+    c.free()
+    cur = store.get_character(sid, ch["id"])
+    cur["sheet"] = (cur.get("sheet") or []) + new
+    store.save_character(sid, cur, bump=False)
+    job.say(f"Done: {len(new)} sheet images drawn from the photo. Approve the good ones as references.")
+
+
 def job_location_plate(job, sid, lid, variant, source="zimage", count=4):
     s, c = _ctx()
-    _gpu_prepare(job, s, c)
+    if not cloud.is_image_source(source):
+        _gpu_prepare(job, s, c)
     b = store.bible(sid)
     loc = b["locations"][lid]
     prompt = prompts.location_plate_prompt(loc, variant, b)
@@ -256,14 +698,144 @@ def job_location_plate(job, sid, lid, variant, source="zimage", count=4):
     job.say("Done.")
 
 
+def job_playground(job, sid, body):
+    """Render one director's playground still, kept separate from episode frames and project canon."""
+    s, c = _ctx()
+    b = store.bible(sid)
+    source = str(body.get("source") or "")
+    if not cloud.is_image_source(source):
+        _gpu_prepare(job, s, c)
+    location_id = str(body.get("location_id") or "")
+    loc = b["locations"].get(location_id)
+    if not loc:
+        raise ValueError("Choose a location from this project's Bible")
+    selected = list(dict.fromkeys(str(x) for x in (body.get("character_ids") or [])))
+    chars = [b["characters"][cid] for cid in selected if cid in b["characters"]]
+    framing = str(body.get("framing") or "wide").strip()[:60]
+    camera = str(body.get("camera") or "eye level, static camera").strip()[:500]
+    camera = re.sub(r"\borbit\b", "azimuth (fixed viewpoint)", camera, flags=re.I)
+    action = str(body.get("action") or "").strip()[:3000]
+    if not action:
+        action = f"A cinematic still at {loc.get('name') or 'the selected location'}"
+    camera_state = body.get("camera_state") or {}
+    try:
+        camera_azimuth = float(camera_state.get("azimuth", 0))
+    except (TypeError, ValueError):
+        camera_azimuth = 0.0
+    az = math.radians(camera_azimuth)
+    target = camera_state.get("target") or [0, 0, 0]
+    try:
+        target_x, target_z = float(target[0]), float(target[2])
+    except (TypeError, ValueError, IndexError):
+        target_x, target_z = 0.0, 0.0
+
+    def frame_position(transform):
+        if not isinstance(transform, dict) or not isinstance(transform.get("position"), (list, tuple)):
+            return str(transform or "center")
+        try:
+            x, z = float(transform["position"][0]), float(transform["position"][2])
+        except (TypeError, ValueError, IndexError):
+            return "center"
+        x, z = x - target_x, z - target_z
+        horizontal = x * math.cos(az) - z * math.sin(az)
+        depth = x * math.sin(az) + z * math.cos(az)
+        side = "left" if horizontal < -0.8 else "right" if horizontal > 0.8 else "center"
+        plane = "foreground" if depth > 1.5 else "background" if depth < -1.5 else "midground"
+        rotation = transform.get("rotation") or [0, 0, 0]
+        try:
+            yaw = math.radians(float(rotation[1]) if isinstance(rotation, (list, tuple)) else 0)
+            facing_dot = math.sin(yaw) * math.sin(az) + math.cos(yaw) * math.cos(az)
+            facing = ", facing camera" if facing_dot > 0.45 else ", turned away from camera" if facing_dot < -0.45 else ", in profile"
+        except (TypeError, ValueError, IndexError):
+            facing = ""
+        return f"{side} {plane}{facing}"
+
+    transforms = body.get("positions") or {}
+    shot = {"location_id": location_id, "time_of_day": str(body.get("time_of_day") or ""),
+            "framing": framing, "camera": camera, "action": action,
+            "characters": [{"id": ch["id"], "position": frame_position(transforms.get(ch["id"])),
+                            "outfit": ch.get("default_outfit") or "default"} for ch in chars],
+            "image_prompt_extra": str(body.get("extra") or "")[:1500]}
+    props = body.get("scene_props") or []
+    if props:
+        prop_lines = []
+        for prop in props[:20]:
+            prop_lines.append(f"{str(prop.get('name') or 'prop')[:80]} at {frame_position(prop)}")
+        shot["image_prompt_extra"] = ". ".join(x for x in [shot["image_prompt_extra"], "Scene objects: " + "; ".join(prop_lines)] if x)
+    prompt = prompts.image_prompt(shot, b)
+    if camera:
+        prompt = f"{framing.capitalize()} shot. Camera: {camera}. " + prompt
+    refs = []
+    for ch in chars:
+        for rel in ch.get("refs") or []:
+            if os.path.isfile(store.abs_media(rel)):
+                refs.append(rel)
+                break
+    plates = loc.get("plates") or {}
+    plate = plates.get(shot["time_of_day"] or "") or next(iter(plates.values()), "")
+    if plate and os.path.isfile(store.abs_media(plate)):
+        refs.append(plate)
+    if cloud.is_image_source(source) and refs:
+        max_refs = cloud.max_refs(s, source)
+        refs = refs[:max_refs]
+        groups = [(ch.get("name") or ch["id"], 1, "views") for ch in chars if any(r in refs for r in (ch.get("refs") or []))]
+        prompt = _refs_prompt(prompt, groups, bool(plate and plate in refs))
+    seed = _seed()
+    job.say(f"Rendering director's test frame ({source})...")
+    ref_images = None
+    if source == "qwen_2511":
+        max_refs = int(s["qwen_2511"].get("max_refs", 3))
+        has_plate = bool(plate and os.path.isfile(store.abs_media(plate)))
+        reference_limit = max_refs - (1 if has_plate and len(chars) < max_refs else 0)
+        roles = {role["id"]: role for role in shot["characters"]}
+        found = []
+        for ch in chars:
+            if len(found) >= reference_limit:
+                break
+            found.extend(_qwen2511_refs({**shot, "characters": [roles[ch["id"]]]}, b, 1)[:1])
+        if not found:
+            raise ValueError("Qwen Image 2511 needs a selected character with a usable reference photo")
+        use_plate = has_plate and len(found) < max_refs
+        found = found[:max_refs - (1 if use_plate else 0)]
+        prompt = qwen2511_prompt(shot, b, found)
+        if camera:
+            prompt = f"{framing.capitalize()} shot. Camera: {camera}. " + prompt
+        local_refs = [rel for _, rel in found] + ([plate] if use_plate else [])
+        if use_plate:
+            prompt += f" Image {len(found) + 1} supplies only the location and layout; ignore any people in that reference."
+        names = [c.upload(store.abs_media(rel), f"playground_2511_{uuid.uuid4().hex[:8]}{os.path.splitext(rel)[1]}")
+                 for rel in local_refs]
+        job.say(f"Using {len(found)} character reference(s){' and a location plate' if use_plate else ''} with Qwen Image 2511...")
+        items = c.run(workflows.qwen2511_image(s, prompt, seed, s["image"]["width"], s["image"]["height"],
+                                               1, names, f"playground/{sid}"),
+                      cancel=lambda: job.cancel_flag)["images"]
+    elif source == "qwen_refs":
+        if not refs:
+            raise ValueError("Qwen Edit needs a saved character reference photo or an approved location plate")
+        refs = refs[:int(s["qwen_edit"].get("max_refs", 3))]
+        groups = [(ch.get("name") or ch["id"], 1, "views") for ch in chars if any(r in refs for r in (ch.get("refs") or []))]
+        prompt = _refs_prompt(prompt, groups, bool(plate and plate in refs))
+        ref_images = [c.upload(store.abs_media(rel), f"playground_{uuid.uuid4().hex[:8]}{os.path.splitext(rel)[1]}") for rel in refs]
+    if source != "qwen_2511":
+        items = _render_images(job, s, c, source, prompt, seed, 1, [], f"playground/{sid}",
+                               ref_files=refs if cloud.is_image_source(source) else None, ref_images=ref_images)
+    paths = _save_outputs(c, items, store.playground_dir(sid), "render_")
+    row = {"file": store.rel(paths[0]), "prompt": prompt, "source": source, "seed": seed,
+           "character_ids": [ch["id"] for ch in chars], "location_id": location_id,
+           "created": store.now()}
+    store.add_playground_render(sid, row)
+    job.say("Saved the test render to this project's Playground gallery.")
+
+
 # ── Episode planning ────────────────────────────────────────────────────
 
-def job_plan(job, sid, eid):
+def job_plan(job, sid, eid, model=""):
     s, _ = _ctx()
+    s = llm.with_choice(s, "planner", model)
     e = store.get_episode(sid, eid)
     if not (e.get("story") or "").strip():
         raise ValueError("Paste a story first.")
-    llm.ensure_model(s["ollama_host"], s["planner_model"], job.say)
+    llm.prepare(s, "planner", job.say)
     scenes, shots = planner.plan_episode(s, sid, e["story"], log=job.say)
 
     def apply(ep):
@@ -275,13 +847,110 @@ def job_plan(job, sid, eid):
     job.say(f"Planned {len(shots)} shots, runtime {planner.runtime_seconds(shots)} s.")
 
 
-def job_replan_scene(job, sid, eid, scene_id):
+def _series_context(sid):
+    """The series outline (if the project has one), so an episode is written knowing the whole show."""
+    for name in ("series-outline.md", "series_outline.md", "outline.md"):
+        p = os.path.join(store.series_dir(sid), "script", name)
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                return f.read()[:40000]
+    return ""
+
+
+def job_write_episode(job, sid, eid, number, ep_title, previous_eid="", model=""):
+    """Layer 0: write the episode's script from the series outline (continuing the previous episode)."""
+    from . import writer
     s, _ = _ctx()
+    s = llm.with_choice(s, "planner", model)
+    outline = _series_context(sid)
+    if not outline:
+        raise ValueError("This project has no series outline (script/series-outline.md).")
+    prev = store.get_episode(sid, previous_eid)["story"] if previous_eid else ""
+    llm.prepare(s, "planner", job.say)
+    job.say(f"Writing Episode {number} - {ep_title} from the series outline...")
+    data = writer.write_episode(s, store.bible(sid), outline, number, ep_title, prev)
+
+    def apply(ep):
+        ep["story"] = data["script"]
+        ep["writer_notes"] = data.get("notes", "")
+    store.update_episode(sid, eid, apply)
+    job.say(f"Script written ({len(data['script'].split())} words). Read it on the Story page, then write the spine and cards.")
+
+
+def job_plan_cards(job, sid, eid, model=""):
+    """Layers 1-2 of the writing pipeline: the story spine and the scene cards, for the user to approve."""
+    from . import writer
+    s, _ = _ctx()
+    s = llm.with_choice(s, "planner", model)
+    e = store.get_episode(sid, eid)
+    if not (e.get("story") or "").strip():
+        raise ValueError("Paste a story first.")
+    llm.prepare(s, "planner", job.say)
+    spine, cards = writer.plan_cards(s, sid, e["story"], _series_context(sid), log=job.say)
+
+    def apply(ep):
+        ep["spine"], ep["scenes"] = spine, cards
+        ep["cards_approved"] = False
+        ep["gates"] = {"shots": False, "frames": False, "animatic": False, "takes": False}
+    store.update_episode(sid, eid, apply)
+    job.say(f"Spine and {len(cards)} scene cards ready. Read them on the Story page, then plan the shots.")
+
+
+def job_plan_shots(job, sid, eid, model="", review=True):
+    """Layers 3-4: shot design from the approved cards, then the script-supervisor review."""
+    from . import writer
+    s, _ = _ctx()
+    s = llm.with_choice(s, "planner", model)
+    e = store.get_episode(sid, eid)
+    if not e.get("spine") or not e.get("scenes"):
+        raise ValueError("Write the spine and scene cards first.")
+    llm.prepare(s, "planner", job.say)
+    shots, notes = writer.plan_shots(s, sid, e["spine"], e["scenes"], log=job.say, review=review)
+
+    def apply(ep):
+        ep["shots"], ep["review"] = shots, notes
+        store.renumber_shots(ep)
+        ep["cards_approved"] = True
+        ep["gates"] = {"shots": False, "frames": False, "animatic": False, "takes": False}
+    store.update_episode(sid, eid, apply)
+    job.say(f"Planned {len(shots)} shots ({len(notes)} fixes from the script supervisor).")
+
+
+def job_block_shots(job, sid, eid, model=""):
+    """Add first-frame blocking to approved shots that have none, without redesigning them."""
+    from . import writer
+    s, _ = _ctx()
+    s = llm.with_choice(s, "planner", model)
+    e = store.get_episode(sid, eid)
+    if not e.get("spine") or not e.get("scenes"):
+        raise ValueError("Write the spine and scene cards first.")
+    llm.prepare(s, "planner", job.say)
+
+    def save(blocks):
+        def apply(ep):
+            for sh in ep["shots"]:
+                if sh["id"] in blocks and not sh.get("first_frame"):
+                    if sh.get("image_prompt_override"):      # blocking replaces the hand prompt; keep it for reference
+                        sh["image_prompt_override_before_blocking"] = sh["image_prompt_override"]
+                    sh["first_frame"], sh["image_prompt_override"] = blocks[sh["id"]], ""
+            ep["gates"]["shots"] = False
+        store.update_episode(sid, eid, apply)
+
+    blocks, failures = writer.block_shots(s, sid, e["spine"], e["scenes"], e["shots"], log=job.say, save=save)
+    job.say(f"Blocked {len(blocks)} shots. Review them on the Shots page, then render their first frames.")
+    if failures:
+        raise RuntimeError(f"{len(failures)} problem(s) left shots unblocked - run Add blocking again, or fix by hand: "
+                           + "; ".join(failures[:4]))
+
+
+def job_replan_scene(job, sid, eid, scene_id, model=""):
+    s, _ = _ctx()
+    s = llm.with_choice(s, "planner", model)
     e = store.get_episode(sid, eid)
     scene = next(sc for sc in e["scenes"] if sc["id"] == scene_id)
-    llm.ensure_model(s["ollama_host"], s["planner_model"], job.say)
+    llm.prepare(s, "planner", job.say)
     job.say(f"Re-planning shots for {scene_id}...")
-    new = planner.replan_scene(s, sid, scene)
+    new = planner.replan_scene(s, sid, scene, e["scenes"])
 
     def apply(ep):
         keep = [sh for sh in ep["shots"] if sh.get("scene_id") != scene_id]
@@ -295,12 +964,182 @@ def job_replan_scene(job, sid, eid, scene_id):
 
 # ── First frames ────────────────────────────────────────────────────────
 
+class CompositionRejected(RuntimeError):
+    """Every composition of a shot failed its blocking check; the batch moves on to the next shot."""
+
+
+def _place_of(sh, b, target):
+    """What a gaze target is, in words an image model can find: the person's look and screen place, or the prop."""
+    subject = blocking.subject_for(sh, target)
+    if subject:
+        look = blocking.composition_description(b["characters"].get(target) or {}) or "the person"
+        return f"the {look.split(',')[0]} at {subject['position']} ({subject['zone']})"
+    prop = next((p for p in sh["first_frame"]["props"] if p["id"] == target), None)
+    return f"the {target.replace('_', ' ')} ({prop['placement']})" if prop else target.replace("_", " ")
+
+
+def _reference_frame_candidates(job, s, c, sh, b, n, sig, out_dir, prefix):
+    """Compose without image references, then edit only identity in each candidate."""
+    found = _character_refs(sh, b)
+    faces_needed = [x for x in (sh.get("first_frame") or {}).get("subjects", [])
+                    if x["visibility"] not in ("offscreen", "partial", *blocking.FACELESS)]
+    if not found and (sh.get("characters") and (faces_needed or sh.get("first_frame") is None)):
+        job.say(f"{sh['id']}: no reference photo on its characters - add one on the Characters page "
+                "or pick another source.")
+        return []
+    layered = blocking.layered_subjects(sh)          # people in another space (behind glass) are added afterwards
+    plan_shot = blocking.composition_shot(sh, layered, {cid: c.get("name") for cid, c in b["characters"].items()}) \
+        if layered else sh
+    if layered:
+        job.say(f"{sh['id']}: {', '.join(x['id'] for x in layered)} in another space - composing without them, "
+                "adding them after the identity pass.")
+    prompt = prompts.image_prompt(plan_shot, b, composition=True)
+    allow_camera = any(subject["gaze_target"] == "camera" for subject in plan_shot["first_frame"]["subjects"]) \
+        if sh.get("first_frame") is not None else True
+    rounds = max(1, int(s.get("composition_rounds", 2)))
+    for round_no in range(rounds):      # a fresh seed batch before giving up: one bad batch is common, two is a plan
+        seed = _seed()
+        job.say(f"{sh['id']}: step 1/2 - {n} compositions via Z-Image Turbo (text only)"
+                + (f", retry {round_no + 1}/{rounds} with new seeds" if round_no else "") + "...")
+        items = _render_images(job, s, c, "zimage", prompt, seed, n, [], prefix + "/composition")
+        compositions = _save_outputs(c, items, out_dir, "layout_")
+        composition_indices = {path: index for index, path in enumerate(compositions)}
+        job.check()
+        composition_checks = {}
+        if sh.get("first_frame") is None:
+            break
+        # Identity editing cannot repair a bad layout. Check all compositions together so
+        # the local vision model is unloaded before loading Qwen Edit.
+        c.free()
+        try:
+            for composition in compositions:
+                job.check()
+                check = _vision_check(s, composition, plan_shot, b)
+                composition_checks[composition] = check
+                job.say(f"{sh['id']}: composition {os.path.basename(composition)} "
+                        f"check {check.get('score')}/10: {', '.join(check.get('issues') or []) or 'no issues'}")
+        finally:
+            llm.unload(s["ollama_host"], [llm.ollama_model(s, "vision")])
+        # Critical issues reject; minor ones only rank, best first, so the identity passes start with the best layout.
+        compositions = sorted([path for path in compositions if composition_checks[path].get("matches") is True
+                               and (allow_camera or composition_checks[path].get("looks_at_camera") is False)],
+                              key=lambda path: -(composition_checks[path].get("score") or 0))
+        if compositions:
+            break
+    if not compositions:
+        raise CompositionRejected(
+            f"{sh['id']}: no composition passed the first-frame blocking check in {rounds} batches. Layouts retained "
+            "for review; Qwen identity was not run. Correct the blocking or review the vision-check issues.")
+    # Reserve image 1 for the frame. Further passes handle additional characters without
+    # dropping their portraits or exceeding Qwen's three-image conditioning limit.
+    per_pass = max(1, min(2, int(s["qwen_edit"].get("max_refs", 3)) - 1))
+    roles = {character["id"]: dict(role) for character, role in prompts.characters_in(sh, b)}
+    for cid, role in roles.items():
+        subject = blocking.subject_for(sh, cid)
+        if subject:
+            role["position"] = f"{subject['position']}, {subject['depth']}, {subject['zone']}"
+    layered_ids = {x["id"] for x in layered}
+    inserts = [(ch, rel) for ch, rel in found if ch["id"] in layered_ids]
+    # No identity pass for offscreen people, or for people whose face is hidden (back of head, silhouette): with no
+    # face of theirs in the frame, Qwen paints their identity onto the nearest visible face instead.
+    found = [(ch, rel) for ch, rel in found if ch["id"] not in layered_ids and (
+             not blocking.subject_for(sh, ch["id"]) or blocking.subject_for(sh, ch["id"])["visibility"]
+             not in ("offscreen", *blocking.FACELESS))]
+    if not s.get("identity_pass", False):
+        # Measured on Ep2: the whole-frame and face-crop Qwen identity edits did not make faces more consistent
+        # with the cast portrait, and they produced pasted portraits. Consistency comes from the full appearance
+        # text plus picking the candidate closest to the cast (detector resemblance). Layered people are still
+        # inserted from their portrait.
+        found = []
+    token = uuid.uuid4().hex
+    references = [(ch, roles[ch["id"]], c.upload(store.abs_media(rel),
+                   f"studio_{token}_ref{i}{os.path.splitext(rel)[1]}"))
+                  for i, (ch, rel) in enumerate(found)]
+    c.free()
+    cands = []
+    for accepted_index, composition in enumerate(compositions):
+        k = composition_indices[composition]
+        current = composition
+        identity_prompts = []
+        for offset in range(0, len(references), per_pass):
+            job.check()
+            group = references[offset:offset + per_pass]
+            job.say(f"{sh['id']}: step 2/2 - Qwen identity, candidate {accepted_index + 1}/{len(compositions)} "
+                    f"({', '.join(ch['name'] for ch, _, _ in group)})...")
+            source = c.upload(current, f"studio_{token}_composition{k}_pass{offset}.png")
+            wf = workflows.qwen_frame_identity(s, source, group, s["image"]["width"],
+                                                s["image"]["height"], seed + k,
+                                                prefix + "/identity")
+            result = c.run(wf, cancel=lambda: job.cancel_flag)
+            job.check()
+            if len(result["images"]) != 1:
+                raise RuntimeError("Qwen identity pass must return exactly one image; composition retained")
+            final = offset + per_pass >= len(references)
+            current = _save_outputs(c, result["images"], out_dir, "c" if final and not inserts else "identity_")[0]
+            identity_prompts.append(wf["4"]["inputs"]["prompt"])
+        for n_ins, (ch, rel) in enumerate(inserts):
+            job.check()
+            subject = blocking.subject_for(sh, ch["id"])
+            role = roles.get(ch["id"], {})
+            clothes = (ch.get("outfits") or {}).get(role.get("outfit") or ch.get("default_outfit") or "default", "")
+            target = _place_of(sh, b, subject["gaze_target"])
+            job.say(f"{sh['id']}: adding {ch['name']} into the frame ({subject['zone']}), candidate {accepted_index + 1}...")
+            wf = workflows.qwen_frame_insert(s, c.upload(current, f"studio_{token}_insert{k}_{n_ins}.png"), ch, subject,
+                                             clothes, target, c.upload(store.abs_media(rel), f"studio_{token}_insref{n_ins}"
+                                             f"{os.path.splitext(rel)[1]}"), s["image"]["width"], s["image"]["height"],
+                                             seed + k + 100, prefix + "/insert")
+            result = c.run(wf, cancel=lambda: job.cancel_flag)
+            job.check()
+            if len(result["images"]) != 1:
+                raise RuntimeError("Qwen insert pass must return exactly one image")
+            current = _save_outputs(c, result["images"], out_dir, "insert_")[0]
+            identity_prompts.append(wf["4"]["inputs"]["prompt"])
+            if subject["gaze_target"] != "camera":
+                job.say(f"{sh['id']}: {ch['name']}'s expression and gaze, candidate {accepted_index + 1}...")
+                wf = workflows.qwen_frame_performance(
+                    s, c.upload(current, f"studio_{token}_perf{k}_{n_ins}.png"), _place_of(sh, b, ch["id"]), subject,
+                    target, s["image"]["width"], s["image"]["height"], seed + k + 200, prefix + "/performance")
+                result = c.run(wf, cancel=lambda: job.cancel_flag)
+                job.check()
+                if len(result["images"]) != 1:
+                    raise RuntimeError("Qwen performance pass must return exactly one image")
+                current = _save_outputs(c, result["images"], out_dir, "perf_")[0]
+                identity_prompts.append(wf["4"]["inputs"]["prompt"])
+        if inserts:                          # the finished frame always gets a candidate name
+            final = _next_name(out_dir, "c")
+            shutil.copy2(current, final)
+            current = final
+        if current == composition:          # nothing to edit: keep the layout as the candidate, under a frame name
+            current = _next_name(out_dir, "c")
+            shutil.copy2(composition, current)
+        cands.append({"file": store.rel(current), "source": "qwen_refs", "seed": seed,
+                      "batch_index": k, "sig": sig, "prompt": prompt, "loras": [], "plate": None,
+                      "refs": [rel for _, rel in found], "composition": store.rel(composition),
+                      "first_frame": copy.deepcopy(sh.get("first_frame")),
+                      "composition_check": composition_checks.get(composition),
+                      "identity_prompts": identity_prompts, "check": None})
+    # The next shot must be able to load Z-Image without holding Qwen's models in VRAM.
+    c.free()
+    if sh.get("first_frame") is not None and cands:
+        # Edits can drop a prop or turn a face to the lens: check each finished frame against the FULL plan.
+        try:
+            for cand in cands:
+                job.check()
+                cand["check"] = _vision_check(s, store.abs_media(cand["file"]), sh, b)
+                job.say(f"{sh['id']}: final {os.path.basename(cand['file'])} check {cand['check'].get('score')}/10: "
+                        f"{', '.join(cand['check'].get('issues') or []) or 'no issues'}")
+        finally:
+            llm.unload(s["ollama_host"], [llm.ollama_model(s, "vision")])
+    return cands
+
+
 def _ep_path(sid, eid, *parts):
     return os.path.join(store.ep_dir(sid, eid), *parts)
 
 
-def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
+def job_frames(job, sid, eid, shot_ids=None, force=False, source_override="", check_model=""):
     s, c = _ctx()
+    s = llm.with_choice(s, "vision", check_model)
     e = store.get_episode(sid, eid)
     s = settings_mod.for_episode(s, e)
     b = store.bible(sid)
@@ -314,13 +1153,15 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
         if sh.get("start_mode") == "chain":
             job.say(f"{sh['id']}: chained to previous shot - its frame comes from the previous take.")
             continue
+        if sh.get("frame_from") and not sh["frame"].get("candidates"):
+            job.say(f"{sh['id']}: uses the frame of {sh['frame_from']}.")
+            continue
         todo.append(sh)
     if not todo:
         job.say("Nothing to render.")
         return
-    _gpu_prepare(job, s, c)
     # Batch by source to keep one model family loaded.
-    order = {"flux_lora": 0, "zimage": 1, "qwen_refs": 2, "reuse": 3, "punch_in": 4}
+    order = {"flux_lora": 0, "zimage": 1, "qwen_refs": 2, "qwen_2511": 2.5, "reuse": 3, "punch_in": 4}
     plan = []
     for sh in todo:
         src = source_override or _resolve_source(sh, b)
@@ -329,15 +1170,22 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
         if src == "upload":
             job.say(f"{sh['id']}: source is 'upload' - upload an image on the Frames page.")
             continue
-        plan.append((order.get(src, 2), sh["order"], sh, src))
+        errors = blocking.validate(sh, b)
+        if errors:
+            raise ValueError(f"{sh['id']}: " + "; ".join(errors))
+        plan.append((order.get(src, 5), sh["order"], sh, src))
     plan.sort(key=lambda x: (x[0], x[1]))
+    if any(not cloud.is_image_source(p[3]) for p in plan):
+        _gpu_prepare(job, s, c)
+    s = {**s, "_negative": b["style"].get("negative", "")}
     n = int(s["candidates_per_shot"])
     job.progress = [0, len(plan)]
     last_src = None
     plate_uploads = {}
+    rejected = []
     for i, (_, _, sh, src) in enumerate(plan):
         job.check()
-        if last_src and src != last_src and src != "reuse":
+        if last_src and src != last_src and src != "reuse" and not cloud.is_image_source(src):
             c.free()
         last_src = src
         sig = store.bible_signature(b, sh)
@@ -373,28 +1221,59 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
                 paths = _save_outputs(c, items, out_dir, "p")
                 cands = [{"file": store.rel(p), "source": "punch_in", "from": sel["file"], "seed": seed,
                           "sig": sig, "prompt": prompt, "loras": loras, "check": None} for p in paths]
+        elif src == "qwen_2511":
+            found = _qwen2511_refs(sh, b, int(s["qwen_2511"].get("max_refs", 3)))
+            seed = _seed()
+            w, h = s["image"]["width"], s["image"]["height"]
+            t0 = time.time()
+            if found:
+                prompt = qwen2511_prompt(sh, b, found)
+                names = [c.upload(store.abs_media(rel), f"studio_2511_{uuid.uuid4().hex[:8]}{os.path.splitext(rel)[1]}")
+                         for _, rel in found]
+                job.say(f"{sh['id']}: {n} candidates via Qwen 2511 from {len(found)} photo(s) "
+                        f"({', '.join(ch['name'] for ch, _ in found)})...")
+                wf = workflows.qwen2511_image(s, prompt, seed, w, h, n, names, f"studio/{eid}/{sh['id']}")
+                items = c.run(wf, cancel=lambda: job.cancel_flag)["images"]
+                c.free()                        # the next shot may need Z-Image; Qwen 2511 fills the 3090
+            else:                               # nobody's face is in the shot (insert, back of head): text is enough
+                prompt = prompts.image_prompt(sh, b)
+                job.say(f"{sh['id']}: no visible face with a photo - {n} candidates via Z-Image (text)...")
+                items = _render_images(job, s, c, "zimage", prompt, seed, n, [], f"studio/{eid}/{sh['id']}")
+            paths = _save_outputs(c, items, out_dir, "c")
+            job.say(f"  {len(paths)} images in {time.time() - t0:.0f}s")
+            cands = [{"file": store.rel(p), "source": "qwen_2511" if found else "zimage", "seed": seed,
+                      "batch_index": k, "sig": sig, "prompt": prompt, "loras": [], "plate": None,
+                      "refs": [rel for _, rel in found], "check": _identity_check(p, sh, b) if found else None}
+                     for k, p in enumerate(paths)]
+            for cand in cands:
+                if cand["check"] and cand["check"]["issues"]:
+                    job.say(f"  {os.path.basename(cand['file'])}: {', '.join(cand['check']['issues'])}")
+        elif src == "qwen_refs" or (src == "zimage" and sh.get("first_frame") is not None):
+            # A planned frame always goes compose -> check -> retry, even with nobody's face in it.
+            try:
+                cands = _reference_frame_candidates(job, s, c, sh, b, n, sig, out_dir,
+                                                    f"studio/{eid}/{sh['id']}")
+            except CompositionRejected as exc:
+                rejected.append(sh["id"])
+                job.say(f"{exc} Continuing with the next shot.")
+                job.progress = [i + 1, len(plan)]
+                continue
         else:
             prompt = prompts.image_prompt(sh, b)
             loras = prompts.image_loras(sh, b, float(s["flux"]["second_lora_scale"])) if src == "flux_lora" else []
             seed = _seed()
             plate, init_name, denoise = _location_plate(s, b, sh), None, 1.0
-            ref_names, ref_files = [], []
-            if src == "qwen_refs":
-                max_refs = int(s["qwen_edit"].get("max_refs", 3))
-                found = _character_refs(sh, b)[:max_refs]
-                if not found:
-                    job.say(f"{sh['id']}: no reference photo on its characters - add one on the Characters page "
-                            f"or pick another source.")
-                    continue
-                for ch, rel in found:
-                    ref_files.append(rel)
-                    ref_names.append(c.upload(store.abs_media(rel), f"studio_ref_{os.path.basename(rel)}"))
-                names = [ch.get("name") or ch.get("id") for ch, _ in found]
-                use_plate = bool(plate) and len(ref_names) < max_refs
+            ref_files = []
+            is_cloud = cloud.is_image_source(src)
+            if is_cloud:
+                max_refs = cloud.max_refs(s, src)
+                found, use_plate = _cloud_refs(s, sid, sh, b, max_refs, bool(plate))
+                ref_files = [rel for _, rels, _ in found for rel in rels]
+                groups = [(ch.get("name") or ch.get("id"), len(rels), kind) for ch, rels, kind in found]
                 if use_plate:
-                    ref_names.append(c.upload(store.abs_media(plate), f"studio_plate_{os.path.basename(plate)}"))
                     ref_files.append(plate)
-                prompt = _refs_prompt(prompt, names, use_plate)
+                if found or use_plate:
+                    prompt = _refs_prompt(prompt, groups, use_plate)
                 plate = plate if use_plate else None
             elif plate:
                 if plate not in plate_uploads:
@@ -405,27 +1284,68 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override=""):
                     f"{f' on location plate (denoise {denoise})' if plate else ''}...")
             t0 = time.time()
             items = _render_images(job, s, c, src, prompt, seed, n, loras, f"studio/{eid}/{sh['id']}",
-                                   init_image=init_name, denoise=denoise, ref_images=ref_names)
+                                   init_image=init_name, denoise=denoise,
+                                   ref_files=ref_files)
             paths = _save_outputs(c, items, out_dir, "c")
             job.say(f"  {len(paths)} images in {time.time() - t0:.0f}s")
             cands = [{"file": store.rel(p), "source": src, "seed": seed, "batch_index": k, "sig": sig,
                       "prompt": prompt, "loras": loras, "plate": plate, "refs": ref_files, "check": None}
                      for k, p in enumerate(paths)]
         _add_candidates(sid, eid, sh["id"], cands)
+        if src in ("qwen_refs", "qwen_2511") and any(cand.get("check") for cand in cands):
+            auto_select_frames(sid, eid, [sh["id"]])        # only when nothing is selected yet
         job.progress = [i + 1, len(plan)]
     if s.get("vision_check"):
-        job_vision(job, sid, eid, [p[2]["id"] for p in plan], comfy=c)
+        job_vision(job, sid, eid, [p[2]["id"] for p in plan if p[2]["id"] not in rejected], comfy=c, model=check_model)
+    if rejected:
+        raise RuntimeError(f"No composition passed for {len(rejected)} shot(s): {', '.join(rejected)}. Their layouts "
+                           "are kept for review; every other shot rendered. Fix their blocking, then render them again.")
+
+
+def job_previz_blender(job, sid, eid, shot_id, seconds=6, fps=24, out_path=""):
+    """Render a Blender previz animation for one shot from its approved blockout state."""
+    s, c = _ctx()
+    s = settings_mod.for_episode(s, store.get_episode(sid, eid))
+    b = store.bible(sid)
+    e = store.get_episode(sid, eid)
+    shot = store.find_shot(e, shot_id)
+    if not out_path:
+        out_path = os.path.join(store.ep_dir(sid, eid), "previz", f"{shot_id}.mp4")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cfg = s.get("blender") or {}
+    client = blender.BlenderMCPClient(host=cfg.get("host", "127.0.0.1"), port=int(cfg.get("port", 9876)))
+    if not client.alive():
+        raise blender.BlenderMCPError(f"Blender MCP not reachable at {cfg.get('host', '127.0.0.1')}:{cfg.get('port', 9876)}. "
+                                      "Start Blender with the BlenderMCP server first.")
+    job.say(f"Blender MCP alive. Rendering previz for {shot_id} ({seconds}s @ {fps}fps)...")
+    result = blender.previz_blender(client, shot, b, out_path, fps=fps, seconds=seconds)
+    def apply(ep):
+        shot = store.find_shot(ep, shot_id)
+        shot["previz"] = dict(shot.get("previz") or {})
+        shot["previz"]["blender_file"] = store.rel(out_path)
+        shot["previz"]["blender_frames"] = result["frames"]
+        shot["previz"]["blender_seconds"] = result["seconds"]
+    store.update_episode(sid, eid, apply)
+    job.say(f"Blender previz rendered: {out_path}")
 
 
 def _scene_master(e, sh):
     """First shot of the shot's scene (the master angle the continuity pass assigned)."""
     same = [x for x in sorted(e["shots"], key=lambda x: x["order"]) if x.get("scene_id") == sh.get("scene_id")]
+    earlier = []
     for x in same:
         if x["id"] == sh["id"]:
-            return None
+            break
+        earlier.append(x)
+    for x in earlier:
         if x.get("start_mode") == "new" and x.get("characters"):
             return x
-    return same[0] if same and same[0]["id"] != sh["id"] else None
+    # A scene that opens on chained shots has no "new" master: use its first earlier shot with
+    # characters (its frame comes from the previous take), else its first earlier shot.
+    for x in earlier:
+        if x.get("characters"):
+            return x
+    return earlier[0] if earlier else None
 
 
 def _location_plate(s, b, sh) -> str | None:
@@ -449,8 +1369,10 @@ def _add_candidates(sid, eid, shot_id, cands):
     store.update_episode(sid, eid, apply)
 
 
-def job_vision(job, sid, eid, shot_ids, comfy=None):
+def job_vision(job, sid, eid, shot_ids, comfy=None, model="", force=False):
     s, c = _ctx()
+    s = llm.with_choice(s, "vision", model)
+    job.say(f"Checking frames with {llm.describe(s, 'vision')}.")
     (comfy or c).free()
     b = store.bible(sid)
     e = store.get_episode(sid, eid)
@@ -460,15 +1382,45 @@ def job_vision(job, sid, eid, shot_ids, comfy=None):
             continue
         for k, cand in enumerate(sh["frame"]["candidates"]):
             job.check()
-            if cand.get("check") is not None or cand.get("source") in ("upload", "reuse", "chain"):
+            if (cand.get("check") is not None and not force) or cand.get("source") in ("upload", "reuse", "chain"):
                 continue
-            res = _vision_check(s, store.abs_media(cand["file"]), sh, b)
+            res = _vision_check(s, store.abs_media(cand["file"]), sh, b, cand.get("source") or "")
 
             def apply(ep, sid_=sh["id"], k_=k, res_=res):
                 store.find_shot(ep, sid_)["frame"]["candidates"][k_]["check"] = res_
             store.update_episode(sid, eid, apply)
-    llm.unload(s["ollama_host"], [s["vision_model"]])
-    job.say("Vision check done.")
+    picked = auto_select_frames(sid, eid, shot_ids)
+    llm.unload(s["ollama_host"], [llm.ollama_model(s, "vision")])
+    job.say(f"Vision check done. {picked} shots got their best checked frame selected (nobody looking into the lens).")
+
+
+def best_candidate(cands):
+    """Only passing visual checks are eligible; a failed check must never become an automatic pick."""
+    scored = [(not (c.get("check") or {}).get("looks_at_camera", False), bool((c.get("check") or {}).get("matches")),
+               (c.get("check") or {}).get("score") or 0, (c.get("check") or {}).get("resemblance") or 0, -k, k)
+              for k, c in enumerate(cands)
+              if (c.get("check") or {}).get("matches") is True
+              and ((c.get("check") or {}).get("looks_at_camera") is False
+                   or (c.get("check") or {}).get("camera_gaze_allowed") is True)
+              and ((c.get("check") or {}).get("score") or 0) >= 5]
+    return max(scored)[-1] if scored else None
+
+
+def auto_select_frames(sid, eid, shot_ids):
+    """Select a passing candidate only when the user has not chosen a frame."""
+    n = 0
+
+    def apply(ep):
+        nonlocal n
+        for sh in ep["shots"]:
+            f = sh["frame"]
+            if sh["id"] not in shot_ids or f.get("locked") or f.get("selected") is not None:
+                continue
+            k = best_candidate(f.get("candidates") or [])
+            if k is not None:
+                f["selected"] = k; n += 1
+    store.update_episode(sid, eid, apply)
+    return n
 
 
 def job_refine(job, sid, eid, shot_id, cand_index, engine="flux_lora", denoise=0.3):
@@ -543,6 +1495,9 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
     engines = {engine_override or sh.get("engine") or b["style"].get("default_engine") or "ltx" for sh in todo}
     for engine in engines:
         providers.validate_model(engine, model_override if engine_override else "")
+        problem = providers.engine_problem(s, engine)
+        if problem:  # say so now, before any model is unloaded
+            raise ValueError(problem)
     if engines != {"minimax"}:
         _gpu_prepare(job, s, c)
     n_takes = int(takes or s["takes_per_shot"])
@@ -562,6 +1517,9 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
         if not first:
             done += n_takes
             continue
+        if engine == "ltx_lipsync" and lipsync_engine.square_portrait(s):
+            first = lipsync_engine.pad_square(s, first, os.path.join(store.ep_dir(sid, eid), "takes", sh["id"],
+                                                                     f"{sh['id']}_first_square.png"))
         first_name = None if engine == "minimax" else c.upload(first, f"studio_{eid}_{sh['id']}_first.png")
         end_name = None
         if engine != "minimax" and sh.get("end_frame"):
@@ -571,6 +1529,11 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
             job.say(f"{sh['id']}: end anchored to the first frame (hold the framing)")
         max_s = float(s[engine]["max_seconds"])
         seconds = min(float(sh.get("duration_s") or 3), max_s)
+        if engine in ("ltx_lipsync", "infinitetalk"):
+            row = next(r for r in lipsync_engine.layout(e, max_s) if r["id"] == sh["id"])
+            seconds = row["len"]
+            if any(d.get("line") for d in sh.get("dialogue") or []) and not row["lines"]:
+                job.say(f"{sh['id']}: its lines are not voiced yet - voice the dialogue first (Cut page); rendering it silent")
         out_dir = _ep_path(sid, eid, "takes", sh["id"])
         for t in range(n_takes):
             job.check()
@@ -595,6 +1558,28 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
                 frames = workflows.minimax_h3_frames(seconds)
                 wf = workflows.minimax_h3_i2v(s, prompts.motion_prompt(sh, b, engine), first_name,
                                              frames, seed, end_name, prefix)
+            elif engine == "infinitetalk":
+                it_fps = int(s["infinitetalk"]["fps"])
+                frames = math.ceil(seconds * it_fps)
+                os.makedirs(out_dir, exist_ok=True)
+                voice = os.path.join(out_dir, f"{sh['id']}_voice.wav")
+                heard = dict(sh)
+                if sh.get("face"):            # only the visible face's lines drive the mouth; the others are off-screen
+                    heard["characters"] = [ch for ch in sh.get("characters", []) if ch.get("id") == sh["face"]]
+                lipsync_engine.shot_audio(s, e, heard, row, seconds, voice)
+                voice16 = os.path.join(out_dir, f"{sh['id']}_voice16k.wav")
+                media._run([s["ffmpeg"], "-y", "-v", "error", "-i", voice, "-ar", "16000", "-ac", "1", voice16])
+                wf = workflows.infinitetalk(s, first_name, c.upload(voice16, f"studio_{eid}_{sh['id']}_voice16k.wav"),
+                                            prompts.infinitetalk_prompt(sh, b), frames, seed, prefix)
+            elif engine == "ltx_lipsync":
+                fps = int(s["video"]["fps"])
+                frames = lipsync_engine.frames_for(seconds, fps)
+                length = (frames - 1) / fps
+                voice = os.path.join(out_dir, f"{sh['id']}_voice.wav")
+                os.makedirs(out_dir, exist_ok=True)
+                lipsync_engine.shot_audio(s, e, sh, row, length, voice)
+                wf = lipsync_engine.workflow(s, first_name, c.upload(voice, f"studio_{eid}_{sh['id']}_voice.wav"),
+                                             lipsync_engine.prompt(sh, b), length, seed, prefix)
             elif engine == "wan":
                 frames = workflows.wan_frames(seconds, int(s["wan"]["fps"]))
                 wf = workflows.wan_i2v(s, prompts.motion_prompt(sh, b, "wan"), first_name, frames, seed,
@@ -614,14 +1599,30 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
             if not res["videos"]:
                 raise RuntimeError("ComfyUI returned no video")
             path = _save_outputs(c, res["videos"][:1], out_dir, f"{sh['id']}_t")[0]
+            raw_take = None
+            if engine == "infinitetalk" and row["lines"]:
+                # InfiniteTalk returns picture only: the voice drove the mouth but is not in the file, so the cut
+                # was silent. Put every line of the shot (off-screen speakers too) on the take.
+                track = os.path.join(out_dir, f"{sh['id']}_dialogue.wav")
+                lipsync_engine.dialogue_track(s, e, sh, row, seconds, track)
+                lipsync_engine.mux_audio(s, path, track, path)
+            if engine == "ltx_lipsync" and sh.get("post_sync") and row["lines"]:
+                job.say(f"  lip-sync pass (LatentSync) on the speaker's face...")
+                info0 = media.probe(s["ffprobe"], path)
+                synced = os.path.splitext(path)[0] + "_ls.mp4"
+                lipsync.correct_clip(job, s, c, path, voice, synced, round(info0["video_duration"] * fps),
+                                     info0["width"], info0["height"], fps, f"studio_{eid}_{sh['id']}_ls")
+                raw_take, path = path, synced
             info = media.probe(s["ffprobe"], path)
             flags = media.qc_video(path, seconds, info["duration"])
             spf = res["seconds"] / max(1, frames)
             job.say(f"  done in {res['seconds']:.0f}s ({spf:.2f} s/frame){' - flags: ' + ', '.join(flags) if flags else ''}")
-            item = {"file": store.rel(path), "engine": engine, "model": "MiniMax-H3" if engine == "minimax_local" else engine, "seed": seed, "frames": frames,
+            item = {"file": store.rel(path), "engine": engine, "model": {"minimax_local": "MiniMax-H3", "ltx_lipsync": "LTX-2.3 lip-sync"}.get(engine, engine), "seed": seed, "frames": frames,
                     "seconds": round(info["duration"], 2), "render_s": round(res["seconds"]),
                     "flags": flags, "first_frame": store.rel(first),
                     "sig": store.bible_signature(b, sh), "created": store.now()}
+            if raw_take:
+                item["raw"] = store.rel(raw_take); item["model"] += " + LatentSync"
 
             def apply(ep, sid_=sh["id"], item_=item, eng=engine, spf_=spf):
                 shot = store.find_shot(ep, sid_)
@@ -631,6 +1632,177 @@ def job_takes(job, sid, eid, shot_ids=None, takes=None, force=False, engine_over
             store.update_episode(sid, eid, apply)
             done += 1
             job.progress = [done, len(todo) * n_takes]
+
+
+# ── lip-sync to the song (music videos) ─────────────────────────────────
+
+def song_windows(e, fps):
+    """Each shot's planned [start, end) in timeline frames: shots play back to back in order from the song's start,
+    each for its planned duration_s."""
+    out, t = {}, 0.0
+    for sh in sorted(e["shots"], key=lambda x: x["order"]):
+        d = float(sh.get("duration_s") or 0)
+        out[sh["id"]] = (round(t * fps), round((t + d) * fps))
+        t += d
+    return out
+
+
+def song_shots(e):
+    """The shots a song lip-sync pass renders by default: InfiniteTalk shots with a face on screen."""
+    return [sh["id"] for sh in sorted(e["shots"], key=lambda x: x["order"])
+            if sh.get("engine") == "infinitetalk" and sh.get("face")]
+
+
+def song_file(e):
+    return (e.get("music") or {}).get("file") or ((e.get("timeline") or {}).get("music") or {}).get("file") or ""
+
+
+def slice_song(s, vocals, start, seconds, dst):
+    """Cut [start, start + seconds) of the isolated vocals as 16 kHz mono, the input InfiniteTalk's encoder wants."""
+    media._run([s["ffmpeg"], "-y", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", vocals,
+                "-ar", "16000", "-ac", "1", dst])
+    return dst
+
+
+def song_vocals(job, s, c, sid, eid, song):
+    """The song's isolated vocals as 16 kHz mono, separated once per song file (cached by its content hash)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(song, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    key = h.hexdigest()[:16]
+    cache = _ep_path(sid, eid, "out", "song_vocals")
+    os.makedirs(cache, exist_ok=True)
+    dst = os.path.join(cache, f"{key}_vocals16k.wav")
+    if os.path.exists(dst):
+        job.say("Using the song's isolated vocals from the cache")
+        return dst
+    job.say("Isolating the singer's vocals from the song (once per song)...")
+    uploaded = c.upload(song, f"studio_{eid}_song_{key}{os.path.splitext(song)[1]}")
+    res = c.run(workflows.separate_vocals(uploaded, f"studio/{eid}/song_vocals"), cancel=lambda: job.cancel_flag)
+    if not res.get("audios"):
+        raise RuntimeError("Vocal isolation produced no audio")
+    raw = os.path.join(cache, f"{key}_vocals_raw" + (os.path.splitext(res["audios"][0]["filename"])[1] or ".flac"))
+    c.download(res["audios"][0], raw)
+    tmp = dst + ".part.wav"
+    media._run([s["ffmpeg"], "-y", "-v", "error", "-i", raw, "-ar", "16000", "-ac", "1", tmp])
+    os.replace(tmp, dst)
+    return dst
+
+
+def place_song_clip(ep, cfg, shot_id, take_file, frames):
+    """Put a song-synced take on the timeline at its shot: the take as the source, its planned length, muted (the
+    song plays) and with LatentSync off (InfiniteTalk already moved the mouth). Returns the timeline body to save."""
+    from . import timeline
+    cur = timeline.view(ep, cfg)["edit"] if ep.get("timeline") else timeline.default_edit(ep, cfg, selected_takes=True)
+    edit = copy.deepcopy(cur)
+    edit["revision"] = (ep.get("timeline") or {}).get("revision", 0)
+    if not edit.get("music") and (ep.get("music") or {}).get("file"):  # the muted clips need the song under them
+        edit["music"] = timeline.default_edit(ep, cfg).get("music")
+    fps = edit["fps"]
+    try:
+        have = int(timeline.source_info(ep, take_file, cfg)["video_duration"] * fps + 1e-6)
+        frames = max(1, min(frames, have))
+    except Exception:  # noqa: BLE001 - an unreadable take keeps its planned length; save() validates it
+        pass
+    clip = next((x for x in edit["clips"] if x.get("shot_id") == shot_id), None)
+    if clip is None:
+        order = {sh["id"]: sh["order"] for sh in ep["shots"]}
+        clip = {"id": "clip_" + shot_id, "shot_id": shot_id, "volume": 1, "fade_in": 0, "fade_out": 0, "speed": 1,
+                "transition": 0, "reframe": dict(timeline.DEFAULT_REFRAME)}
+        mine = order.get(shot_id, 0)
+        at = next((i for i, x in enumerate(edit["clips"]) if order.get(x.get("shot_id"), -1) > mine), len(edit["clips"]))
+        if any(x["id"] == clip["id"] for x in edit["clips"]):
+            clip["id"] += "_" + uuid.uuid4().hex[:6]
+        edit["clips"].insert(at, clip)
+    clip.update(source=take_file, source_in=0.0, frames=frames, muted=True, lipsync=False, speed=1,
+                fade_in=min(clip.get("fade_in", 0), frames // 2), fade_out=min(clip.get("fade_out", 0), frames // 2))
+    if clip.get("transition") and clip["transition"] * 2 > frames:
+        clip["transition"] = 0
+    return edit
+
+
+def job_song_takes(job, sid, eid, shot_ids=None):
+    """Music video lip-sync: one InfiniteTalk take per singing shot, its mouth driven by the singer's isolated vocals
+    from that shot's exact window in the song; the take is selected and laid on the timeline at its planned length."""
+    from . import timeline
+    s, c = _ctx()
+    b = store.bible(sid)
+    e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
+    rel = song_file(e)
+    if not rel:
+        raise ValueError("This episode has no song. Upload the song on the Cut page (Music) first.")
+    song = store.abs_media(rel)
+    if not os.path.exists(song):
+        raise ValueError(f"The song file is missing: {rel}")
+    ids = list(shot_ids or []) or song_shots(e)
+    known = {sh["id"] for sh in e["shots"]}
+    if not ids:
+        raise ValueError("No shots to sing: give singing shots the InfiniteTalk engine and a face, or tick them.")
+    unknown = [i for i in ids if i not in known]
+    if unknown:
+        raise ValueError(f"Unknown shots: {', '.join(unknown)}")
+    problem = providers.engine_problem(s, "infinitetalk")
+    if problem:
+        raise ValueError(problem)
+    _gpu_prepare(job, s, c)
+    fps = int(s["video"]["fps"])
+    it_fps = int(s["infinitetalk"]["fps"])
+    max_s = float(s["infinitetalk"]["max_seconds"])
+    job.progress = [0, len(ids) + 1]
+    vocals = song_vocals(job, s, c, sid, eid, song)
+    song_len = media.probe(s["ffprobe"], vocals)["duration"]
+    job.progress = [1, len(ids) + 1]
+    done = 0
+    for n, shot_id in enumerate(ids, 1):
+        job.check()
+        e = store.get_episode(sid, eid)
+        sh = store.find_shot(e, shot_id)
+        a, z = song_windows(e, fps)[shot_id]
+        start, seconds = a / fps, (z - a) / fps
+        if seconds <= 0:
+            job.say(f"{shot_id}: no planned duration; skipped.")
+        elif start >= song_len:
+            job.say(f"{shot_id}: starts at {start:.2f}s, after the song ends ({song_len:.2f}s); skipped.")
+        elif seconds > max_s:
+            job.say(f"{shot_id}: its {seconds:.1f}s window is longer than InfiniteTalk's {max_s:.0f}s limit; "
+                    "split the shot. Skipped.")
+        else:
+            first = _first_frame_for(job, s, sid, eid, e, sh)
+            if first:
+                out_dir = _ep_path(sid, eid, "takes", shot_id)
+                os.makedirs(out_dir, exist_ok=True)
+                voice = slice_song(s, vocals, start, seconds, os.path.join(out_dir, f"{shot_id}_song_vocals16k.wav"))
+                frames = math.ceil(seconds * it_fps)
+                seed = _seed()
+                wf = workflows.infinitetalk(s, c.upload(first, f"studio_{eid}_{shot_id}_first.png"),
+                                            c.upload(voice, f"studio_{eid}_{shot_id}_song16k.wav"),
+                                            prompts.infinitetalk_sing_prompt(sh, b), frames, seed, f"studio/{eid}/{shot_id}")
+                job.say(f"[{n}/{len(ids)}] {shot_id}: {start:.2f}-{start + seconds:.2f}s of the song, {frames} frames...")
+                res = c.run(wf, cancel=lambda: job.cancel_flag)
+                if not res["videos"]:
+                    raise RuntimeError("ComfyUI returned no video")
+                path = _save_outputs(c, res["videos"][:1], out_dir, f"{shot_id}_t")[0]
+                info = media.probe(s["ffprobe"], path)
+                item = {"file": store.rel(path), "engine": "infinitetalk", "model": "InfiniteTalk · song vocals",
+                        "seed": seed, "frames": frames, "seconds": round(info["duration"], 2),
+                        "render_s": round(res["seconds"]), "flags": media.qc_video(path, seconds, info["duration"]),
+                        "first_frame": store.rel(first), "sig": store.bible_signature(b, sh), "created": store.now(),
+                        "song_window": [round(start, 3), round(start + seconds, 3)]}
+
+                def add(ep, item=item, shot_id=shot_id):
+                    t = store.find_shot(ep, shot_id)["takes"]
+                    t["items"].append(item)
+                    t["selected"] = len(t["items"]) - 1
+                store.update_episode(sid, eid, add)
+                e = store.get_episode(sid, eid)
+                timeline.save(sid, eid, place_song_clip(e, s, shot_id, item["file"], z - a), s)
+                job.say(f"  done in {res['seconds']:.0f}s, selected and placed on the timeline (muted, {z - a} frames)")
+        done += 1
+        job.progress = [done + 1, len(ids) + 1]
+    job.say("Song lip-sync finished. The song plays under the muted clips on the Cut page.")
 
 
 def _first_frame_for(job, s, sid, eid, e, sh):
@@ -651,6 +1823,13 @@ def _first_frame_for(job, s, sid, eid, e, sh):
         store.update_episode(sid, eid, apply)
         return dst
     sel = _selected_frame(sh)
+    if not sel and sh.get("frame_from"):
+        # Same setup as another shot (e.g. every OTS on one speaker): identical space, light and framing.
+        src = store.find_shot(e, sh["frame_from"])
+        sel = _selected_frame(src) if src else None
+        if not sel:
+            job.say(f"{sh['id']}: {sh['frame_from']} has no approved frame yet; skipped.")
+            return None
     if not sel:
         job.say(f"{sh['id']}: no approved first frame; skipped.")
         return None
@@ -702,7 +1881,7 @@ def job_cut(job, sid, eid):
         dur = media.normalize_clip(s["ffmpeg"], s["ffprobe"], src, out, tin, tout,
                                    v["width"], v["height"], v["fps"], float(s["loudness_lufs"]))
         clips.append(out)
-        lines = [f"{(b['characters'].get(d.get('speaker')) or {}).get('name', d.get('speaker'))}: {d.get('line', '')}"
+        lines = [f"{(store.find_character(b['characters'], d.get('speaker')) or {}).get('name', d.get('speaker'))}: {d.get('line', '')}"
                  for d in sh.get("dialogue", []) or [] if d.get("line")]
         if lines:
             subs.append((t + 0.1, t + max(0.5, dur - 0.1), "\n".join(lines)))
@@ -741,7 +1920,7 @@ def job_frame_correction(job, sid, eid, shot_id, source_file):
         raise ValueError("Source frame was removed")
     if len(sh.get("characters", [])) != 1:
         raise ValueError("Character reference correction needs a single-character shot")
-    character = store.get_character(sid, sh["characters"][0]["id"])
+    character = store.find_character(store.bible(sid)["characters"], sh["characters"][0]["id"])
     if not character:
         raise ValueError("The shot's character was removed")
     _gpu_prepare(job, s, c)
@@ -774,7 +1953,7 @@ def job_face_correction(job, sid, eid, shot_id, source_file, model="keep"):
     if model in ("minimax_identity", "qwen_identity"):
         if len(sh.get("characters", [])) != 1:
             raise ValueError("Character reference correction needs a single-character shot")
-        character = store.get_character(sid, sh["characters"][0]["id"])
+        character = store.find_character(store.bible(sid)["characters"], sh["characters"][0]["id"])
         if not character:
             raise ValueError("The shot's character was removed")
         correct = face_correction.qwen_correct_take if model == "qwen_identity" else face_correction.match_identity
@@ -797,3 +1976,142 @@ def job_face_correction(job, sid, eid, shot_id, source_file, model="keep"):
         ep["gates"]["takes"] = False
     store.update_episode(sid, eid, apply)
     job.say("Corrected take added for review. Original retained.")
+
+
+# ── lip-sync pipeline helpers: sound effects, ElevenLabs voices, the cut ─────────────────────────────
+
+def job_sfx(job, sid, eid, shot_ids=None):
+    """Sound effects for each shot's selected take (MMAudio, video-to-audio), prompted with the shot's sound notes."""
+    s, c = _ctx()
+    e = store.get_episode(sid, eid)
+    shots = [sh for sh in sorted(e["shots"], key=lambda x: x["order"]) if not shot_ids or sh["id"] in shot_ids]
+    shots = [sh for sh in shots if sh["takes"].get("items")]
+    if not shots:
+        job.say("No shot has a take yet."); return
+    _gpu_prepare(job, s, c)
+    out = _ep_path(sid, eid, "sfx"); os.makedirs(out, exist_ok=True)
+    job.progress = [0, len(shots)]
+    for i, sh in enumerate(shots, 1):
+        job.check()
+        take = sh["takes"]["items"][sh["takes"].get("selected") or 0]
+        name = c.upload(store.abs_media(take["file"]), f"sfx_{eid}_{sh['id']}{os.path.splitext(take['file'])[1]}")
+        text = (sh.get("sound") or "quiet room tone") + ", realistic film sound effects and ambience, no voices"
+        seconds = media.probe(s["ffprobe"], store.abs_media(take["file"]))["duration"]
+        job.say(f"{sh['id']}: {text}")
+        res = c.run(lipsync_engine.sfx_workflow(name, seconds, text, _seed(), f"studio/{eid}/sfx_{sh['id']}"),
+                    cancel=lambda: job.cancel_flag)
+        if not res["audios"]:
+            raise RuntimeError("MMAudio returned no audio")
+        dst = os.path.join(out, sh["id"] + ".flac"); c.download(res["audios"][0], dst)
+        job.progress = [i, len(shots)]
+    job.say(f"Done: {len(shots)} sound-effect beds in sfx/. Build the cut to place them under the picture.")
+
+
+def job_dialogue_elevenlabs(job, sid, eid, shot_ids=None):
+    """Voice every line with ElevenLabs (the character's elevenlabs_voice_id). The line's emotion is an unspoken stage
+    direction; neighbouring lines are context; an optional "say" field is what is spoken (pronunciation)."""
+    import hashlib
+    import requests
+    s, _ = _ctx()
+    key = cloud._read_secrets().get("elevenlabs") or os.environ.get("ELEVENLABS_API_KEY", "")
+    if not key:
+        raise ValueError("No ElevenLabs API key: save it as the 'elevenlabs' secret")
+    b = store.bible(sid)
+    e = store.get_episode(sid, eid)
+    lines = [(sh["id"], d) for sh in sorted(e["shots"], key=lambda x: x["order"]) for d in sh.get("dialogue") or []
+             if (d.get("line") or "").strip()]
+    todo = [(i, x) for i, x in enumerate(lines) if not shot_ids or x[0] in shot_ids]
+    out = _ep_path(sid, eid, "dialogue"); os.makedirs(out, exist_ok=True)
+    job.progress = [0, len(todo)]
+    new = {}
+    for n, (i, (shot_id, d)) in enumerate(todo, 1):
+        job.check()
+        ch = store.find_character(b["characters"], d.get("speaker"))
+        vid = ((ch or {}).get("voice") or {}).get("elevenlabs_voice_id")
+        if not vid:
+            raise ValueError(f"{shot_id}: {d.get('speaker')} has no ElevenLabs voice (design one on the Characters page)")
+        spoken = lambda x: (x.get("say") or x["line"]).strip()
+        text = spoken(d)
+        prev = " ".join(spoken(x[1]) for x in lines[max(0, i - 2):i])
+        pronoun = "they"
+        direction = (d.get("emotion") or "").strip()
+        body = {"text": text, "model_id": "eleven_multilingual_v2", "previous_text": prev or None,
+                "next_text": f" {pronoun} said, {direction}." if direction else None,
+                "voice_settings": {"stability": 0.55, "similarity_boost": 0.8, "style": 0.0, "use_speaker_boost": True}}
+        r = requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/{vid}?output_format=mp3_44100_128",
+                          headers={"xi-api-key": key}, json=body, timeout=120)
+        if not r.ok:
+            raise RuntimeError(f"ElevenLabs HTTP {r.status_code}: {r.text[:300]}")
+        tag = hashlib.sha256((vid + text + direction + prev).encode()).hexdigest()[:16]
+        mp3 = os.path.join(out, f"el_{tag}.mp3"); wav = os.path.join(out, f"el_{tag}.wav")
+        with open(mp3, "wb") as f:
+            f.write(r.content)
+        media._run([s["ffmpeg"], "-y", "-v", "error", "-i", mp3, "-af",
+                    "silenceremove=start_periods=1:start_threshold=-45dB:stop_periods=-1:stop_threshold=-45dB:stop_duration=0.35,"
+                    "loudnorm=I=-16:TP=-1.5:LRA=7,aresample=48000", wav])
+        new[d["line"].strip()] = {"file": store.rel(wav), "duration": media.probe(s["ffprobe"], wav)["duration"]}
+        job.say(f'{shot_id} {(ch or {}).get("name", d.get("speaker"))}: "{text}"' + (f" [{direction}]" if direction else ""))
+        job.progress = [n, len(todo)]
+
+    def apply(ep):
+        dt = ep.setdefault("dialogue_takes", {}); assets = ep.setdefault("audio_assets", [])
+        for line, v in new.items():
+            hits = [k for k, x in dt.items() if (x.get("text") or "").strip() == line]
+            for k in hits or ["el_" + hashlib.sha256(line.encode()).hexdigest()[:13]]:
+                dt[k] = {**dt.get(k, {}), "text": line, "file": v["file"], "duration": v["duration"], "engine": "elevenlabs",
+                         "match": 1.0}
+            if v["file"] not in assets:
+                assets.append(v["file"])
+    store.update_episode(sid, eid, apply)
+    job.say(f"Done: {len(new)} lines voiced with ElevenLabs.")
+
+
+def job_coverage_cut(job, sid, eid):
+    """Cut a coverage episode: picture alternates between the singles, inserts and master of each scene while the
+    dialogue runs continuously underneath (J/L cuts, punch-ins on long lines)."""
+    from . import coverage, timeline
+    s, _ = _ctx()
+    e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
+    fps = int(s["video"]["fps"])
+    body, assets = coverage.build_cut(s, e, sid, eid, fps)
+
+    def add(ep):
+        a = ep.setdefault("audio_assets", [])
+        for f in assets:
+            if f not in a:
+                a.append(f)
+    store.update_episode(sid, eid, add)
+    e = store.get_episode(sid, eid)
+    cur = timeline.view(e, s)["edit"] if e.get("timeline") else timeline.default_edit(e, s)
+    edit = {**cur, "fps": fps, "clips": body["clips"], "audio": body["audio"], "music": None,
+            "revision": (e.get("timeline") or {}).get("revision", 0)}
+    timeline.save(sid, eid, edit, s)
+    st = coverage.stats(body["clips"], fps)
+    job.say(f"Coverage cut built: {st['shots']} cuts, average {st['mean']:.1f}s, {st['total']:.1f}s total. "
+            "Export it on the Cut page.")
+
+
+def job_lipsync_cut(job, sid, eid):
+    """Lay the lip-sync takes, their dialogue and the sound-effect beds on the Cut timeline."""
+    from . import timeline
+    s, _ = _ctx()
+    e = store.get_episode(sid, eid)
+    s = settings_mod.for_episode(s, e)
+    fps = int(s["video"]["fps"])
+    body, assets = lipsync_engine.build_cut(s, e, sid, eid, fps)
+
+    def add(ep):
+        a = ep.setdefault("audio_assets", [])
+        for f in assets:
+            if f not in a:
+                a.append(f)
+    store.update_episode(sid, eid, add)
+    e = store.get_episode(sid, eid)
+    cur = timeline.view(e, s)["edit"] if e.get("timeline") else timeline.default_edit(e, s)
+    edit = {**cur, "fps": fps, "clips": body["clips"], "audio": body["audio"], "music": None,
+            "revision": (e.get("timeline") or {}).get("revision", 0)}
+    timeline.save(sid, eid, edit, s)
+    total = sum(c["frames"] for c in body["clips"]) / fps
+    job.say(f"Cut built: {len(body['clips'])} shots, {sum(1 for a in body['audio'] if a['guide'])} lines, "
+            f"{sum(1 for a in body['audio'] if not a['guide'])} sound beds, {total:.1f}s. Export it on the Cut page.")

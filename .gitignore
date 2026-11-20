@@ -56,3 +56,8 @@ video_director_agent/user_settings.json
 
 # This installation’s public local HTTPS CA
 studio/static/reelwright-local-ca.crt
+
+# Packaging output
+build/
+dist/
+*.egg-info/

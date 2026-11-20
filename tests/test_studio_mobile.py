@@ -43,6 +43,77 @@ def photo():
     return {'name': 'phone.jpg', 'mimeType': 'image/jpeg', 'buffer': data.getvalue()}
 
 
+def test_frames_identity_source_and_composition_preview(mobile_server, tmp_path):
+    from studio import store
+    base, sid, eid = mobile_server
+    for name, color in [('composition.png', 'blue'), ('identity.png', 'red')]:
+        Image.new('RGB', (64, 96), color).save(tmp_path / name)
+    def prepare(ep):
+        ep['shots'][0]['frame_source'] = 'qwen_refs'
+        ep['shots'][0]['frame']['candidates'] = [
+            {'file': 'identity.png', 'source': 'qwen_refs', 'composition': 'composition.png'}]
+    store.update_episode(sid, eid, prepare)
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True)
+        errors = []
+        page.on('pageerror', lambda e: errors.append(str(e)))
+        page.route('**/api/status', lambda route: route.fulfill(json={'comfy': False,
+                   'comfy_host': 'local', 'ollama_models': [], 'loras': [], 'missing': []}))
+        page.route('**/frames', lambda route: route.fulfill(json={'id': 'identity-test'}))
+        page.goto(f'{base}/#/s/{sid}/e/{eid}/frames')
+        playwright.expect(page.locator('#src-S01_SH01 option:checked')).to_have_text('Z-Image + Qwen identity')
+        page.locator('.cand-more summary').tap()
+        page.get_by_role('button', name='View composition before identity', exact=True).tap()
+        playwright.expect(page.locator('#lightbox.on')).to_be_visible()
+        playwright.expect(page.locator('#lb-img')).to_have_attribute('src', '/media/composition.png')
+        page.keyboard.press('Escape')
+        page.locator('#src-S01_SH01').select_option('qwen_refs')
+        with page.expect_request('**/frames') as request:
+            page.locator('[data-render]').tap()
+        assert request.value.post_data_json['source'] == 'qwen_refs'
+        assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
+        assert not errors, errors
+        browser.close()
+
+
+def test_shot_blocking_can_be_reviewed_and_edited_without_prompt_overrides(mobile_server):
+    from studio import store
+    base, sid, eid = mobile_server
+    store.save_character(sid, store.new_character('Maryam', appearance='dark hair', outfits={'default': 'cream sweater'}))
+    plan = {'camera': 'eye level outside', 'layout': 'closed bakery window between camera and subject',
+            'moment': 'waiting behind glass', 'lighting': 'warm inside, blue night outside',
+            'subjects': [{'id':'maryam', 'position':'right', 'space':'inside', 'depth':'background',
+                          'zone':'inside behind glass', 'pose':'standing', 'facing':'outward',
+                          'gaze_target':'offscreen', 'gaze_direction':'toward street left', 'expression':'guarded',
+                          'visibility':'upper_body', 'wardrobe_state':'dry'}],
+            'props': [], 'constraints': ['Only one woman']}
+    def prepare(ep):
+        ep['shots'][0].update(characters=[{'id':'maryam'}], first_frame=plan)
+    store.update_episode(sid, eid, prepare)
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={'width':390,'height':844}, is_mobile=True, has_touch=True)
+        errors = []
+        page.on('pageerror', lambda e: errors.append(str(e)))
+        page.route('**/api/status', lambda route: route.fulfill(json={'comfy':False,'comfy_host':'local',
+                   'ollama_models':[],'loras':[],'missing':[]}))
+        page.goto(f'{base}/#/s/{sid}/e/{eid}/shots')
+        page.locator('.sr-toggle').tap()
+        page.locator('.sr-blocking summary').tap()
+        zone = page.locator('[data-f="first_frame.subjects.0.zone"]')
+        playwright.expect(zone).to_have_value('inside behind glass')
+        zone.fill('inside, one metre behind the closed glass')
+        page.locator('.sr-prompts summary').tap()
+        playwright.expect(page.locator('[data-f="image_prompt_override"]')).to_be_disabled()
+        with page.expect_response('**/shots'):
+            page.locator('#save').tap()
+        assert store.get_episode(sid,eid)['shots'][0]['first_frame']['subjects'][0]['zone'] == 'inside, one metre behind the closed glass'
+        assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
+        assert not errors, errors
+        browser.close()
+
+
 @pytest.mark.parametrize('engine', ['chromium', 'webkit'])
 def test_touch_crop_upload_and_mobile_layout(mobile_server, engine, tmp_path):
     from studio import store
@@ -152,6 +223,33 @@ def test_installable_shell_and_offline_recovery(mobile_server):
         browser.close()
 
 
+def test_home_projects_default_to_recent_then_keep_manual_order(mobile_server):
+    base, _, _ = mobile_server
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(base)
+        page.evaluate("""async () => {
+          await fetch('/api/series', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: 'Newer project'})
+          });
+        }""")
+        page.reload()
+        page.get_by_role('heading', name='Projects', exact=True).wait_for()
+        cards = page.locator('.sheet h3')
+        assert cards.all_text_contents() == ['Newer project', 'Mobile Test']
+
+        page.get_by_role('button', name='Move Newer project down').click()
+        page.wait_for_function("document.querySelector('.sheet h3')?.textContent === 'Mobile Test'")
+        assert cards.all_text_contents() == ['Mobile Test', 'Newer project']
+        page.reload()
+        page.wait_for_function("document.querySelector('.sheet h3')?.textContent === 'Mobile Test'")
+        assert cards.all_text_contents() == ['Mobile Test', 'Newer project']
+        browser.close()
+
+
 def test_character_reference_correction_model_settings(mobile_server):
     from studio import settings
     base, sid, eid = mobile_server
@@ -167,7 +265,7 @@ def test_character_reference_correction_model_settings(mobile_server):
         page.get_by_text('Local character reference files', exact=True).tap()
         page.locator('#identity-unet').fill('custom-ref2va.safetensors')
         page.locator('#save-models').tap()
-        page.get_by_text('Model settings saved.', exact=True).wait_for()
+        page.get_by_text('Model settings saved.', exact=True).first.wait_for()
         cfg = settings.load()['face_correction']
         assert cfg['model'] == 'minimax_identity'
         assert cfg['identity_unet'] == 'custom-ref2va.safetensors'
@@ -177,7 +275,7 @@ def test_character_reference_correction_model_settings(mobile_server):
         page.goto(f'{base}/#/models')
         page.locator('#face-model').select_option('qwen_identity')
         page.locator('#save-models').tap()
-        page.get_by_text('Model settings saved.', exact=True).wait_for()
+        page.get_by_text('Model settings saved.', exact=True).first.wait_for()
         page.goto(f'{base}/#/s/{sid}/e/{eid}/takes')
         assert page.locator('#face-S01_SH01').input_value() == 'qwen_identity'
         from studio import store
@@ -190,6 +288,7 @@ def test_character_reference_correction_model_settings(mobile_server):
             route.fulfill(json={'id': 'qwen-test'})
         page.route('**/frame_correction', submit)
         page.locator('[data-qwenface="0"]').tap()
+        page.wait_for_function('true'); [page.wait_for_timeout(100) for _ in range(30) if not sent]  # the request is asynchronous
         assert sent == [{'index': 0}]
         assert not errors, errors
         browser.close()

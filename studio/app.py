@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
-from . import jobs, llm, media, planner, prompts, store, providers
+from . import beats, blocking, cloud, dialogue, jobs, llm, media, planner, prompts, store, providers, timeline, voices, blender
 from . import settings as settings_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +23,8 @@ EDITABLE_SHOT_FIELDS = {
     "scene_id", "location_id", "time_of_day", "framing", "camera", "characters", "action", "dialogue",
     "sound", "action_seconds", "duration_s", "duration_locked", "start_mode", "frame_source", "engine",
     "video_model", "image_prompt_extra", "motion_prompt_extra", "image_prompt_override", "motion_prompt_override", "notes",
+    "cover", "cutaway", "cue_line", "frame_from", "post_sync", "face",
+    "first_frame", "screen_text",
 }
 
 
@@ -77,10 +79,27 @@ def media_file(path: str):
 def _required_model_options(s):
     """Check configured render families, including existing project/shot overrides."""
     sources, engines = set(), set()
+    flux1_loras, klein_loras = set(), set()
+    flux1_needed = False
+
+    def include_flux_source(sh, b, source):
+        nonlocal flux1_needed
+        if source != "flux_lora":
+            return
+        loras = prompts.image_loras(sh, b, 1.0)
+        families = {lora.get("model_family", "flux1") for lora in loras}
+        if families == {"flux2_klein"}:
+            klein_loras.update(lora["name"] for lora in loras if lora.get("name"))
+        else:
+            flux1_needed = True
+            flux1_loras.update(lora["name"] for lora in loras if lora.get("name"))
 
     def include_style(b):
         style = b["style"]
-        sources.add(jobs._resolve_source({"frame_source": style["default_frame_source"], "characters": []}, b))
+        sh = {"frame_source": style["default_frame_source"], "characters": []}
+        source = jobs._resolve_source(sh, b)
+        sources.add(source)
+        include_flux_source(sh, b, source)
         engines.add(style["default_engine"])
 
     include_style({"style": {**store.DEFAULT_STYLE, **s.get("style_defaults", {})}, "characters": {}})
@@ -90,10 +109,15 @@ def _required_model_options(s):
         include_style(b)
         for character in b["characters"].values():
             if character.get("frame_source"):
-                sources.add(jobs._resolve_source({"characters": [{"id": character["id"]}]}, b))
+                sh = {"characters": [{"id": character["id"]}]}
+                source = jobs._resolve_source(sh, b)
+                sources.add(source)
+                include_flux_source(sh, b, source)
         for episode in store.list_episodes(sid):
             for shot in (store.get_episode(sid, episode["id"]) or {}).get("shots", []):
-                sources.add(jobs._resolve_source(shot, b))
+                source = jobs._resolve_source(shot, b)
+                sources.add(source)
+                include_flux_source(shot, b, source)
                 engines.add(shot.get("engine") or b["style"]["default_engine"])
 
     needed = {}
@@ -101,10 +125,20 @@ def _required_model_options(s):
     def require(node, field, *names):
         needed.setdefault((node, field), set()).update(names)
 
-    if "flux_lora" in sources:
+    if flux1_needed:
         require("UNETLoader", "unet_name", s["flux"]["unet"])
+        require("DualCLIPLoader", "clip_name1", s["flux"]["clip_l"])
+        require("DualCLIPLoader", "clip_name2", s["flux"]["t5"])
         require("VAELoader", "vae_name", s["flux"]["vae"])
-    if "zimage" in sources:
+        if flux1_loras:
+            require("LoraLoaderModelOnly", "lora_name", *flux1_loras)
+    if klein_loras:
+        klein = s["flux2_klein"]
+        require("UNETLoader", "unet_name", klein["unet"])
+        require("CLIPLoader", "clip_name", klein["clip"])
+        require("VAELoader", "vae_name", klein["vae"])
+        require("LoraLoaderModelOnly", "lora_name", *klein_loras)
+    if sources & {"zimage", "qwen_refs"}:
         require("UNETLoader", "unet_name", s["zimage"]["unet"])
         require("CLIPLoader", "clip_name", s["zimage"]["clip"])
         require("VAELoader", "vae_name", s["zimage"]["vae"])
@@ -113,6 +147,13 @@ def _required_model_options(s):
         require("CLIPLoader", "clip_name", s["qwen_edit"]["clip"])
         require("VAELoader", "vae_name", s["qwen_edit"]["vae"])
         require("LoraLoaderModelOnly", "lora_name", s["qwen_edit"]["lora"])
+    if "qwen_2511" in sources:
+        q = s["qwen_2511"]
+        require("UNETLoader", "unet_name", q["unet"])
+        require("CLIPLoader", "clip_name", q["clip"])
+        require("VAELoader", "vae_name", q["vae"])
+        if q.get("lora"):
+            require("LoraLoaderModelOnly", "lora_name", q["lora"])
     if "wan" in engines:
         require("UNETLoader", "unet_name", s["wan"]["high"], s["wan"]["low"])
         require("CLIPLoader", "clip_name", s["wan"]["text_encoder"])
@@ -140,7 +181,8 @@ def status():
     c = comfy_mod.Comfy(s["comfy_host"])
     alive = c.alive()
     out = {"comfy": alive, "comfy_host": s["comfy_host"], "ollama_models": llm.installed(s["ollama_host"]),
-           "planner_model": s["planner_model"], "vision_model": s["vision_model"], "loras": [], "missing": []}
+           "planner_model": s["planner_model"], "vision_model": s["vision_model"], "loras": [], "missing": [],
+           "image_lora_presets": s.get("image_lora_presets", {})}
     if alive:
         try:
             out["loras"] = c.options("LoraLoaderModelOnly", "lora_name")
@@ -150,7 +192,15 @@ def status():
                 out["missing"] += sorted(n for n in names if n not in opts and n not in out["missing"])
         except Exception as exc:
             out["error"] = str(exc)
-    for m in {s["planner_model"], s["vision_model"]}:
+    vh = voices.health(s)
+    out["voices"] = {"ok": bool(vh), "device": (vh or {}).get("device"), "engine": voices.cfg(s)["engine"]}
+    out["planner_provider"], out["vision_provider"] = llm.provider(s, "planner"), llm.provider(s, "vision")
+    out["planner"], out["vision"] = llm.describe(s, "planner"), llm.describe(s, "vision")
+    for role in ("planner", "vision"):
+        p = llm.provider(s, role)
+        if p != "ollama" and not cloud.key_source(s, p):
+            out["missing"].append(f"{p}:api_key")
+    for m in {llm.ollama_model(s, r) for r in ("planner", "vision")} - {""}:
         names = out["ollama_models"]
         if m not in names and f"{m}:latest" not in names:
             out["missing"].append(f"ollama:{m}")
@@ -159,12 +209,111 @@ def status():
 
 @app.get("/api/settings")
 def get_settings():
-    return {"effective": _s(), "user": settings_mod.raw_user()}
+    return {"effective": cloud.mask_keys(_s()), "user": cloud.mask_keys(settings_mod.raw_user())}
 
 
 @app.put("/api/settings")
 def put_settings(user: dict = Body(...)):
-    return settings_mod.save(user)
+    if "ai_connections" in user:
+        try:
+            user["ai_connections"] = cloud.validate_connections(user["ai_connections"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    user = cloud.keep_masked_keys(user, settings_mod.raw_user())
+    return cloud.mask_keys(settings_mod.save(user))
+
+
+# ── AI models page ──────────────────────────────────────────────────────
+
+def _full_ref(s, ref):
+    try:
+        conn, model = cloud.resolve_text(s, ref)
+        if conn == "ollama" and not cloud.parse_ref(ref)[1]:
+            return ref
+        return f"{conn}:{model}"
+    except cloud.CloudError:
+        return ref
+
+
+def _ai_view():
+    s = _s()
+    conns = [{**c, "key": cloud.key_source(s, c["id"])} for c in cloud.connections(s)]
+    return {"connections": conns, "types": cloud.TYPES, "presets": cloud.PRESETS,
+            "defaults": {r: _full_ref(s, llm.ref(s, r)) for r in ("planner", "vision")},
+            "labels": {"planner": llm.describe(s, "planner"), "vision": llm.describe(s, "vision")},
+            "choices": cloud.choices(s, llm.installed(s["ollama_host"]))}
+
+
+@app.get("/api/ai")
+def ai_get():
+    return _ai_view()
+
+
+@app.put("/api/ai")
+def ai_put(body: dict = Body(...)):
+    """{connections: [...], defaults: {planner, vision}} - keys are set separately."""
+    user = settings_mod.raw_user()
+    try:
+        if "connections" in body:
+            user["ai_connections"] = cloud.validate_connections(body["connections"])
+        for role in ("planner", "vision"):
+            ref = (body.get("defaults") or {}).get(role)
+            if ref is not None:
+                conn = cloud.parse_ref(ref)[0]
+                ids = {c["id"] for c in (user.get("ai_connections") or cloud.connections(_s()))}
+                if ref and conn != "ollama" and conn not in ids:
+                    raise ValueError(f"Unknown connection '{conn}' for {role}")
+                user[role] = ref
+                user.pop(f"{role}_provider", None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    settings_mod.save(user)
+    known = {c["id"] for c in cloud.connections(_s())}
+    for cid in list(cloud._read_secrets()):
+        if cid not in known:
+            cloud.set_key(cid, None)          # a deleted connection takes its key with it
+    return _ai_view()
+
+
+@app.put("/api/ai/{conn_id}/key")
+def ai_key(conn_id: str, body: dict = Body(...)):
+    """{key: "..."} stores the key; {key: ""} removes it. The key is never returned."""
+    try:
+        cloud.get_conn(_s(), conn_id)
+    except cloud.CloudError:
+        _404("connection")
+    key = str(body.get("key") or "").strip()
+    if len(key) > 4096 or any(ch.isspace() for ch in key):
+        raise HTTPException(400, "That does not look like an API key")
+    cloud.set_key(conn_id, key or None)
+    return _ai_view()
+
+
+@app.get("/api/ai/{conn_id}/models")
+def ai_models(conn_id: str):
+    try:
+        return {"models": cloud.list_models(_s(), conn_id)}
+    except cloud.CloudError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/ai/{conn_id}/test")
+def ai_test(conn_id: str, body: dict = Body(default={})):
+    """Checks the key (model list) and, with {model}, writes one tiny JSON reply."""
+    s = _s()
+    try:
+        c = cloud.get_conn(s, conn_id)
+        models = cloud.list_models(s, conn_id)
+        out = {"ok": True, "models": len(models), "message": f"Connected: {len(models)} models available."}
+        model = body.get("model") or c.get("text_model")
+        if model:
+            reply = cloud.chat_json(s, conn_id, "Reply in JSON.", "Say hello in three words.",
+                                    {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+                                    temperature=0.2, model=model)
+            out["message"] += f" {model} replied: {str(reply.get('text', ''))[:80]}"
+        return out
+    except cloud.CloudError as exc:
+        return {"ok": False, "message": str(exc)}
 
 
 @app.get("/api/jobs")
@@ -175,6 +324,27 @@ def list_jobs():
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     return {"ok": jobs.QUEUE.cancel(job_id)}
+
+
+def _text_choice(body, key="model") -> str:
+    """A per-job text model choice ("<connection>:<model>"), checked before the job starts."""
+    ref = str((body or {}).get(key) or "").strip()
+    if ref:
+        try:
+            cloud.resolve_text(_s(), ref)
+        except cloud.CloudError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return ref
+
+
+def _image_choice(source) -> str:
+    source = str(source or "").strip()
+    if cloud.is_image_source(source):
+        try:
+            cloud.resolve_image(_s(), source)
+        except cloud.CloudError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return source
 
 
 def _submit(kind, title, fn, **params):
@@ -188,6 +358,14 @@ def series_list():
     return store.list_series()
 
 
+@app.put("/api/series/order")
+def series_order(body: dict = Body(...)):
+    try:
+        return store.save_series_order(body.get("ids"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/series")
 def series_create(body: dict = Body(...)):
     return store.create_series(body.get("name", "").strip() or "My series")
@@ -197,6 +375,54 @@ def series_create(body: dict = Body(...)):
 def series_get(sid: str):
     s = store.get_series(sid) or _404("series")
     return {"series": s, "bible": store.bible(sid), "episodes": store.list_episodes(sid)}
+
+
+@app.get("/api/s/{sid}/playground")
+def playground_get(sid: str):
+    store.get_series(sid) or _404("series")
+    s, b = _s(), store.bible(sid)
+    choices = cloud.choices(s, llm.installed(s["ollama_host"]))["image"]
+    models = [{"source": x["source"], "label": x["label"]} for x in choices if x.get("ready")]
+    c = comfy_mod.Comfy(s["comfy_host"])
+    if c.alive():
+        try:
+            opts = c.options("UNETLoader", "unet_name")
+            z = s["zimage"]
+            if z["unet"] in opts and z["clip"] in c.options("CLIPLoader", "clip_name") and z["vae"] in c.options("VAELoader", "vae_name"):
+                models.append({"source": "zimage", "label": "Z-Image · local"})
+            q = s["qwen_edit"]
+            if (q["unet"] in opts and q["clip"] in c.options("CLIPLoader", "clip_name")
+                    and q["vae"] in c.options("VAELoader", "vae_name")
+                    and q["lora"] in c.options("LoraLoaderModelOnly", "lora_name")):
+                models.append({"source": "qwen_refs", "label": "Qwen Edit · local, character references"})
+            q2511 = s["qwen_2511"]
+            q2511_nodes = all(c.has_node(n) for n in (
+                "TextEncodeQwenImageEditPlus", "FluxKontextMultiReferenceLatentMethod", "CFGNorm",
+                "ModelSamplingAuraFlow", "EmptySD3LatentImage"))
+            q2511_lora_ready = not q2511.get("lora") or q2511["lora"] in c.options("LoraLoaderModelOnly", "lora_name")
+            if (q2511_nodes and q2511["unet"] in opts
+                    and q2511["clip"] in c.options("CLIPLoader", "clip_name")
+                    and q2511["vae"] in c.options("VAELoader", "vae_name") and q2511_lora_ready):
+                models.append({"source": "qwen_2511", "label": "Qwen 2511 · local, character references"})
+            f = s["flux"]
+            dual = c.options("DualCLIPLoader", "clip_name1")
+            if f["unet"] in opts and f["vae"] in c.options("VAELoader", "vae_name") and f["clip_l"] in dual and f["t5"] in c.options("DualCLIPLoader", "clip_name2"):
+                models.append({"source": "flux_lora", "label": "Flux · local"})
+        except Exception:
+            pass
+    return {"series": store.get_series(sid), "characters": list(b["characters"].values()),
+            "locations": list(b["locations"].values()), "models": models,
+            "renders": store.playground_renders(sid)}
+
+
+@app.post("/api/s/{sid}/playground/render")
+def playground_render(sid: str, body: dict = Body(...)):
+    store.get_series(sid) or _404("series")
+    source = str(body.get("source") or "").strip()
+    valid = {x["source"] for x in playground_get(sid)["models"]}
+    if source not in valid:
+        raise HTTPException(400, "Choose an available image model")
+    return _submit("playground", "Playground render", jobs.job_playground, sid=sid, body=body)
 
 
 @app.put("/api/s/{sid}/style")
@@ -218,7 +444,9 @@ def props_put(sid: str, body: list = Body(...)):
 def char_create(sid: str, body: dict = Body(...)):
     c = store.new_character(body.get("name", "New character"))
     c["id"] = ""
-    return store.save_character(sid, c, bump=False)
+    c = store.save_character(sid, c, bump=False)
+    store.relink_characters(sid)
+    return c
 
 
 @app.put("/api/s/{sid}/characters/{cid}")
@@ -226,7 +454,15 @@ def char_put(sid: str, cid: str, body: dict = Body(...)):
     cur = store.get_character(sid, cid) or _404("character")
     keep = {k: cur.get(k) for k in ("id", "refs", "sheet", "version")}
     merged = {**cur, **body, **keep, "draft": False}
-    return store.save_character(sid, merged, bump=True)
+    image_lora = merged.get("image_lora") or {}
+    preset = _s().get("image_lora_presets", {}).get(image_lora.get("name"))
+    if preset:
+        merged["image_lora"] = {**image_lora, "model_family": preset["model_family"]}
+        merged["trigger"] = preset["trigger"]
+    c = store.save_character(sid, merged, bump=True)
+    if (cur.get("name") or "") != (c.get("name") or ""):
+        store.relink_characters(sid)     # shots that still name a deleted id may now mean this character
+    return c
 
 
 @app.delete("/api/s/{sid}/characters/{cid}")
@@ -234,6 +470,7 @@ def char_delete(sid: str, cid: str):
     _ensure_idle(sid)
     store.get_character(sid, cid) or _404("character")
     store.archive_dir(store.char_dir(sid, cid))
+    store.relink_characters(sid)
     return {"ok": True}
 
 
@@ -243,6 +480,9 @@ async def char_upload(sid: str, cid: str, kind: str = Form("ref"), file: UploadF
     if kind == "voice":
         p = await _save_upload(file, store.char_dir(sid, cid), "voice" + os.path.splitext(file.filename or ".wav")[1])
         c["voice"]["file"] = store.rel(p)
+        c["voice"].pop("ref_text", None)          # transcribed again for dialogue cloning
+        c["voice"]["designed"] = False
+        c["voice"].pop("profile", None)
         return store.save_character(sid, c, bump=True)
     p = await _save_upload(file, os.path.join(store.char_dir(sid, cid), "refs"))
     c["refs"] = (c.get("refs") or []) + [store.rel(p)]
@@ -262,9 +502,56 @@ def char_refs(sid: str, cid: str, body: dict = Body(...)):
     return store.save_character(sid, c, bump=False)
 
 
+@app.post("/api/s/{sid}/characters/{cid}/voice")
+def char_voice(sid: str, cid: str, body: dict = Body(default={})):
+    """Design the character's reference voice from {description} (or its saved voice description)."""
+    c = store.get_character(sid, cid) or _404("character")
+    desc = str(body.get("description") or (c.get("voice") or {}).get("description") or "").strip()
+    if not desc:
+        raise HTTPException(400, "Write a voice description first, e.g. 'a cheerful four-year-old boy, high-pitched child voice'")
+    if not voices.health(_s()):
+        raise HTTPException(400, "VoiceStudio is not running (systemctl --user start reelwright-voice)")
+    return _submit("voice", f"Voice: {c['name']}", dialogue.job_design_voice, sid=sid, cid=cid, description=desc)
+
+
+@app.get("/api/voices/profiles")
+def voice_profiles():
+    """Voices saved in VoiceStudio's library, to cast onto characters."""
+    try:
+        return voices.profiles(_s())
+    except voices.VoiceError as exc:
+        raise HTTPException(400, f"{exc}. Start it with: systemctl --user start reelwright-voice") from None
+
+
+@app.post("/api/s/{sid}/characters/{cid}/voice/profile")
+def char_voice_profile(sid: str, cid: str, body: dict = Body(...)):
+    """Cast a VoiceStudio voice profile {profile_id} as the character's reference voice."""
+    c = store.get_character(sid, cid) or _404("character")
+    pid = str(body.get("profile_id") or "").strip()
+    try:
+        prof = next((p for p in voices.profiles(_s()) if p["id"] == pid), None)
+        if prof is None:
+            raise HTTPException(404, f"VoiceStudio has no voice '{pid}'")
+        wav = voices.profile_audio(_s(), pid)
+    except voices.VoiceError as exc:
+        raise HTTPException(400, str(exc)) from None
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", pid)
+    path = os.path.join(store.char_dir(sid, cid), f"voice_vs_{safe}.wav")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(wav)
+    v = c.setdefault("voice", {})
+    v.update(file=store.rel(path), designed=False, profile={"id": pid, "name": prof["name"]})
+    if prof["ref_text"]:
+        v["ref_text"] = prof["ref_text"]
+    else:
+        v.pop("ref_text", None)                  # transcribed when the dialogue is voiced
+    return store.save_character(sid, c, bump=False)   # takes are keyed on the audio, frames stay valid
+
+
 @app.post("/api/s/{sid}/characters/{cid}/sheet")
 def char_sheet(sid: str, cid: str, body: dict = Body(default={})):
-    src = body.get("source") or "flux_lora"
+    src = _image_choice(body.get("source")) or "flux_lora"
     return _submit("sheet", f"Character sheet: {cid}", jobs.job_character_sheet, sid=sid, cid=cid, source=src)
 
 
@@ -293,7 +580,7 @@ def loc_delete(sid: str, lid: str):
 @app.post("/api/s/{sid}/locations/{lid}/plates")
 def loc_plates(sid: str, lid: str, body: dict = Body(...)):
     return _submit("plates", f"Plates: {lid}/{body.get('variant')}", jobs.job_location_plate, sid=sid, lid=lid,
-                   variant=body.get("variant") or "day", source=body.get("source") or "zimage")
+                   variant=body.get("variant") or "day", source=_image_choice(body.get("source")) or "zimage")
 
 
 @app.post("/api/s/{sid}/locations/{lid}/upload")
@@ -318,6 +605,17 @@ def ep_create(sid: str, body: dict = Body(...)):
     return store.create_episode(sid, body.get("title", "").strip() or "Episode 1")
 
 
+@app.post("/api/s/{sid}/e/{eid}/clone")
+def ep_clone(sid: str, eid: str, body: dict = Body(default={})):
+    """Duplicate an episode in this project: story, shot list, frames, takes and cut."""
+    _ensure_idle(sid, eid)
+    _ep(sid, eid)
+    try:
+        return store.clone_episode(sid, eid, (body.get("title") or "").strip() or None)
+    except KeyError:
+        _404("episode")
+
+
 def _decorate(sid: str, e: dict) -> dict:
     s = settings_mod.for_episode(_s(), e)
     b = store.bible(sid)
@@ -326,7 +624,10 @@ def _decorate(sid: str, e: dict) -> dict:
         engine = sh.get("engine") or b["style"].get("default_engine") or "ltx"
         sh["_engine"] = engine
         sh["_source"] = prompts.frame_source(sh, b) if sh.get("start_mode") == "new" else sh.get("start_mode")
-        sh["_image_prompt"] = prompts.image_prompt(sh, b)
+        src = jobs._resolve_source(sh, b)
+        refs_2511 = jobs._qwen2511_refs(sh, b) if src == "qwen_2511" else []
+        sh["_image_prompt"] = jobs.qwen2511_prompt(sh, b, refs_2511) if refs_2511 else \
+            prompts.image_prompt(sh, b, composition=src == "qwen_refs")
         sh["_motion_prompt"] = prompts.motion_prompt(sh, b, engine)
         sig = store.bible_signature(b, sh)
         sh["_stale"] = bool(sh["frame"].get("candidates")) and sh["frame"].get("bible_sig") not in ("", sig)
@@ -355,19 +656,91 @@ def ep_story(sid: str, eid: str, body: dict = Body(...)):
 
 
 @app.post("/api/s/{sid}/e/{eid}/draft_bible")
-def ep_draft_bible(sid: str, eid: str):
+def ep_draft_bible(sid: str, eid: str, body: dict = Body(default={})):
     e = _ep(sid, eid)
-    return _submit("draft_bible", "Draft bible from story", jobs.job_draft_bible, sid=sid, story=e.get("story", ""))
+    return _submit("draft_bible", "Draft bible from story", jobs.job_draft_bible, sid=sid, story=e.get("story", ""),
+                   model=_text_choice(body))
+
+
+@app.post("/api/s/{sid}/e/{eid}/dialogue")
+def ep_dialogue(sid: str, eid: str, body: dict = Body(default={})):
+    """Voice every dialogue line (VoiceStudio) and place each as a lip-sync-guide clip on the Cut timeline."""
+    _ep(sid, eid)
+    if not voices.health(_s()):
+        raise HTTPException(400, "VoiceStudio is not running (systemctl --user start reelwright-voice)")
+    return _submit("dialogue", f"Dialogue {eid}", dialogue.job_dialogue, sid=sid, eid=eid,
+                   shot_ids=body.get("shot_ids") or None)
+
+
+@app.post("/api/s/{sid}/e/{eid}/dialogue_elevenlabs")
+def ep_dialogue_elevenlabs(sid: str, eid: str, body: dict = Body(default={})):
+    """Voice every line with ElevenLabs (each character's designed voice), the line's emotion as stage direction."""
+    _ep(sid, eid)
+    return _submit("dialogue", f"ElevenLabs dialogue {eid}", jobs.job_dialogue_elevenlabs, sid=sid, eid=eid,
+                   shot_ids=body.get("shot_ids") or None)
+
+
+@app.post("/api/s/{sid}/e/{eid}/sfx")
+def ep_sfx(sid: str, eid: str, body: dict = Body(default={})):
+    """Sound effects for each shot's selected take (MMAudio, from the picture and the shot's sound notes)."""
+    _ep(sid, eid)
+    return _submit("sfx", f"Sound effects {eid}", jobs.job_sfx, sid=sid, eid=eid, shot_ids=body.get("shot_ids") or None)
+
+
+@app.post("/api/s/{sid}/e/{eid}/coverage_cut")
+def ep_coverage_cut(sid: str, eid: str):
+    _ep(sid, eid)
+    return _submit("cut", f"Coverage cut {eid}", jobs.job_coverage_cut, sid=sid, eid=eid)
+
+
+@app.post("/api/s/{sid}/e/{eid}/lipsync_cut")
+def ep_lipsync_cut(sid: str, eid: str):
+    """Build the Cut timeline from the lip-sync takes: picture, one dialogue lane per speaker, sound-effect beds."""
+    _ep(sid, eid)
+    return _submit("cut", f"Lip-sync cut {eid}", jobs.job_lipsync_cut, sid=sid, eid=eid)
+
+
+@app.post("/api/s/{sid}/e/{eid}/write_episode")
+def ep_write_episode(sid: str, eid: str, body: dict = Body(...)):
+    _ep(sid, eid)
+    prev = str(body.get("previous") or "")
+    if prev:
+        _ep(sid, prev)
+    return _submit("plan", f"Write episode {eid}", jobs.job_write_episode, sid=sid, eid=eid,
+                   number=int(body.get("number") or 1), ep_title=str(body.get("title") or ""), previous_eid=prev,
+                   model=_text_choice(body))
+
+
+@app.post("/api/s/{sid}/e/{eid}/plan_cards")
+def ep_plan_cards(sid: str, eid: str, body: dict = Body(default={})):
+    _ep(sid, eid)
+    return _submit("plan", f"Story spine and scene cards {eid}", jobs.job_plan_cards, sid=sid, eid=eid,
+                   model=_text_choice(body))
+
+
+@app.post("/api/s/{sid}/e/{eid}/plan_shots")
+def ep_plan_shots(sid: str, eid: str, body: dict = Body(default={})):
+    _ep(sid, eid)
+    return _submit("plan", f"Shot design {eid}", jobs.job_plan_shots, sid=sid, eid=eid, model=_text_choice(body),
+                   review=bool(body.get("review", True)))
 
 
 @app.post("/api/s/{sid}/e/{eid}/plan")
-def ep_plan(sid: str, eid: str):
-    return _submit("plan", f"Plan {eid}", jobs.job_plan, sid=sid, eid=eid)
+def ep_plan(sid: str, eid: str, body: dict = Body(default={})):
+    return _submit("plan", f"Plan {eid}", jobs.job_plan, sid=sid, eid=eid, model=_text_choice(body))
+
+
+@app.post("/api/s/{sid}/e/{eid}/block_shots")
+def ep_block_shots(sid: str, eid: str, body: dict = Body(default={})):
+    _ep(sid, eid)
+    return _submit("plan", f"First-frame blocking {eid}", jobs.job_block_shots, sid=sid, eid=eid,
+                   model=_text_choice(body))
 
 
 @app.post("/api/s/{sid}/e/{eid}/replan/{scene_id}")
-def ep_replan(sid: str, eid: str, scene_id: str):
-    return _submit("replan", f"Re-plan {scene_id}", jobs.job_replan_scene, sid=sid, eid=eid, scene_id=scene_id)
+def ep_replan(sid: str, eid: str, scene_id: str, body: dict = Body(default={})):
+    return _submit("replan", f"Re-plan {scene_id}", jobs.job_replan_scene, sid=sid, eid=eid, scene_id=scene_id,
+                   model=_text_choice(body))
 
 
 @app.put("/api/s/{sid}/e/{eid}/shots")
@@ -375,11 +748,16 @@ def ep_shots(sid: str, eid: str, body: list = Body(...)):
     s = _s()
     b = store.bible(sid)
 
+    current = {shot["id"]: shot for shot in _ep(sid, eid)["shots"]}
     for inc in body:
         try:
             providers.validate_model(inc.get("engine") or b["style"].get("default_engine") or "ltx", inc.get("video_model") or "")
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        merged = {**current.get(inc.get("id") or inc.get("_copy_of"), {}), **inc}
+        errors = blocking.validate(merged, b)
+        if errors:
+            raise HTTPException(400, f"{inc.get('id') or 'Shot'}: " + "; ".join(errors))
     def apply(e):
         old = {sh["id"]: sh for sh in e["shots"]}
         new_list = []
@@ -391,6 +769,7 @@ def ep_shots(sid: str, eid: str, body: list = Body(...)):
             for k in EDITABLE_SHOT_FIELDS:
                 if k in inc:
                     base[k] = inc[k]
+            store.normalize_cast(b["characters"], base)
             if not inc.get("duration_locked"):
                 eng = base.get("engine") or b["style"].get("default_engine") or "ltx"
                 cap = s[eng]["max_seconds"]
@@ -417,19 +796,95 @@ def ep_gate(sid: str, eid: str, body: dict = Body(...)):
     return store.update_episode(sid, eid, lambda e: e["gates"].update({body["gate"]: bool(body.get("value"))}))["gates"]
 
 
+# previz (pre-visual blockout of a scene before takes are rendered)
+@app.post("/api/s/{sid}/e/{eid}/previz")
+def ep_previz(sid: str, eid: str, body: dict = Body(...)):
+    """{shot_id, state} stores the 3D blockout state (camera, entity positions, movement notes) for one shot."""
+    _ep(sid, eid)
+    shot_id = body.get("shot_id")
+    state = body.get("state")
+    if not shot_id or not isinstance(state, dict):
+        raise HTTPException(400, "Send {shot_id, state} with the blockout state.")
+
+    def apply(e):
+        try:
+            shot = store.find_shot(e, shot_id)
+        except KeyError:
+            raise HTTPException(404, f"Shot {shot_id} not found")
+        shot["previz"] = state
+    store.update_episode(sid, eid, apply)
+    return {"ok": True, "shot_id": shot_id}
+
+
+# previz via Blender MCP (3D animation preview of the approved blockout)
+@app.post("/api/s/{sid}/e/{eid}/previz_blender")
+def ep_previz_blender(sid: str, eid: str, body: dict = Body(default={})):
+    """Render a Blender previz animation for one shot from its approved blockout state.
+    Body: {shot_id, seconds?, fps?}. Returns job submission."""
+    e = _ep(sid, eid)
+    shot_id = body.get("shot_id")
+    if not shot_id:
+        raise HTTPException(400, "Send {shot_id}.")
+    shot = store.find_shot(e, shot_id)
+    if not shot.get("previz"):
+        raise HTTPException(400, "This shot has no previz blockout yet. Build it in the Previz tab first.")
+    seconds = float(body.get("seconds") or _s()["blender"]["seconds"])
+    fps = int(body.get("fps") or _s()["blender"]["fps"])
+    out_dir = os.path.join(store.ep_dir(sid, eid), "previz")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{shot_id}.mp4")
+    return _submit("previz_blender", f"Blender previz {shot_id}", jobs.job_previz_blender,
+                   sid=sid, eid=eid, shot_id=shot_id, seconds=seconds, fps=fps, out_path=out_path)
+
+
+@app.get("/api/s/{sid}/e/{eid}/previz_blender/{shot_id}")
+def ep_previz_blender_get(sid: str, eid: str, shot_id: str):
+    """Return previz video file info for a shot, or 404 if not rendered yet."""
+    _ep(sid, eid)
+    path = os.path.join(store.ep_dir(sid, eid), "previz", f"{shot_id}.mp4")
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Previz not rendered yet for this shot.")
+    info = media.probe(_s()["ffprobe"], path)
+    return {"file": store.rel(path), "url": f"/media/{store.rel(path)}", **info}
+
+
 # frames
+@app.post("/api/s/{sid}/e/{eid}/reference_render")
+def ep_reference_render(sid: str, eid: str, body: dict = Body(default={})):
+    e = _ep(sid, eid)
+    source = (e.get("reference_rebuild") or {}).get("source")
+    if not source or not os.path.isfile(store.abs_media(source)):
+        raise HTTPException(400, "This episode needs its uploaded performance reference first")
+    ids = body.get("shot_ids") or []
+    if not isinstance(ids, list) or any(not isinstance(x, str) for x in ids) or set(ids) - {sh["id"] for sh in e["shots"]}:
+        raise HTTPException(400, "Choose existing episode shots")
+    if not e["shots"] or any(not sh.get("reference") for sh in e["shots"]):
+        raise HTTPException(400, "Plan the reference shot windows before rendering")
+    recover_prompt = body.get("recover_prompt") or ""
+    recover_shot = body.get("recover_shot") or ""
+    if recover_prompt and (not isinstance(recover_prompt, str) or not re.fullmatch(r"[a-f0-9-]{36}", recover_prompt) or recover_shot not in {sh["id"] for sh in e["shots"]}):
+        raise HTTPException(400, "Choose an existing frame render to recover")
+    with jobs.QUEUE.cv:
+        for job in jobs.QUEUE.jobs.values():
+            if job.kind == "reference_render" and job.status in ("queued", "running") and job.params.get("sid") == sid and job.params.get("eid") == eid:
+                return job.public()
+        return _submit("reference_render", f"Reference film · {e['title']}", jobs.job_reference_rebuild,
+                       sid=sid, eid=eid, shot_ids=ids, recover_prompt=recover_prompt, recover_shot=recover_shot)
+
+
 @app.post("/api/s/{sid}/e/{eid}/frames")
 def ep_frames(sid: str, eid: str, body: dict = Body(default={})):
     return _submit("frames", f"First frames {eid}", jobs.job_frames, sid=sid, eid=eid,
                    shot_ids=body.get("shot_ids") or [], force=bool(body.get("force")),
-                   source_override=body.get("source") or "")
+                   source_override=_image_choice(body.get("source")), check_model=_text_choice(body, "check_model"))
 
 
 @app.post("/api/s/{sid}/e/{eid}/vision")
 def ep_vision(sid: str, eid: str, body: dict = Body(default={})):
     e = _ep(sid, eid)
     ids = body.get("shot_ids") or [sh["id"] for sh in e["shots"]]
-    return _submit("vision", f"Vision check {eid}", jobs.job_vision, sid=sid, eid=eid, shot_ids=ids)
+    return _submit("vision", f"Vision check {eid}", jobs.job_vision, sid=sid, eid=eid, shot_ids=ids,
+                   model=_text_choice(body), force=bool(body.get("force")))
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/upload_frame")
@@ -536,19 +991,131 @@ def frame_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default
 def _correction_character(sid, sh):
     if len(sh.get("characters", [])) != 1:
         raise HTTPException(400, "Character reference correction needs a single-character shot")
-    character = store.get_character(sid, sh["characters"][0]["id"])
+    character = store.find_character(store.bible(sid)["characters"], sh["characters"][0]["id"])
     if not character or not any(os.path.isfile(store.abs_media(p)) for p in character.get("refs", []) if p):
         raise HTTPException(400, "Upload a reference photo for this character in Characters first")
     return character
 
 
 # takes
+@app.get('/api/s/{sid}/e/{eid}/timeline')
+def get_timeline(sid: str, eid: str, selected_takes: bool = False):
+    episode = _ep(sid, eid)
+    if selected_takes:
+        episode = {**episode, 'timeline': timeline.default_edit(episode, _s(), selected_takes=True)}
+    return timeline.view(episode, _s())
+
+
+@app.get('/api/s/{sid}/e/{eid}/timeline/source')
+def timeline_source(sid: str, eid: str, file: str, audio: bool = False):
+    try:
+        return timeline.source_info(_ep(sid, eid), file, _s(), audio=audio)
+    except (ValueError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get('/api/s/{sid}/e/{eid}/timeline/waveform')
+def timeline_waveform(sid: str, eid: str, file: str):
+    try:
+        info = timeline.source_info(_ep(sid, eid), file, _s(), audio=True)
+        return {'duration': info['duration'], 'peaks': media.audio_peaks(_s()['ffmpeg'], store.abs_media(file))}
+    except (ValueError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get('/api/s/{sid}/e/{eid}/timeline/thumb')
+def timeline_thumb(sid: str, eid: str, file: str, t: float = 0.0, h: int = 96):
+    try:
+        path = timeline.thumbnail(sid, eid, _ep(sid, eid), file, t, h, _s())
+    except (ValueError, TypeError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return FileResponse(path, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=3600'})
+
+
+@app.get('/api/s/{sid}/e/{eid}/timeline/beats')
+def timeline_beats(sid: str, eid: str, file: str):
+    """Tempo and beat times for the episode's music (cached per file)."""
+    try:
+        cfg = _s()
+        timeline.source_info(_ep(sid, eid), file, cfg, audio=True)
+        return beats.analyze_file(cfg['ffmpeg'], store.abs_media(file), os.path.join(store.ep_dir(sid, eid), 'out', 'beats'))
+    except (ValueError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post('/api/s/{sid}/e/{eid}/timeline/audio')
+async def upload_timeline_audio(sid: str, eid: str, file: UploadFile = File(...)):
+    """A voice-over or sound effect for an extra audio lane; the music track is not touched."""
+    _ep(sid, eid)
+    p = await _save_upload(file, os.path.join(store.ep_dir(sid, eid), "uploads"))
+    try:
+        info = media.probe(_s()['ffprobe'], p)
+        if not info['has_audio'] or not math.isfinite(info['duration']) or info['duration'] <= 0:
+            raise ValueError('Upload a playable audio file')
+    except (ValueError, media.MediaError) as exc:
+        os.unlink(p)
+        raise HTTPException(400, 'Upload a playable audio file') from exc
+    rel = store.rel(p)
+
+    def apply(e):
+        assets = e.setdefault('audio_assets', [])
+        if rel not in assets:
+            assets.append(rel)
+    store.update_episode(sid, eid, apply)
+    return {'file': rel, 'duration': info['duration']}
+
+
+@app.put('/api/s/{sid}/e/{eid}/timeline')
+def save_timeline(sid: str, eid: str, body: dict = Body(...)):
+    _ep(sid, eid)
+    try:
+        episode = timeline.save(sid, eid, body, _s())
+        return timeline.view(episode, _s())
+    except timeline.EditConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, TypeError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _timeline_export(sid, eid, window=None):
+    episode = _ep(sid, eid)
+    cfg = settings_mod.for_episode(_s(), episode)
+    try:
+        edit = timeline.validate(episode, episode.get('timeline') or timeline.default_edit(episode, cfg), cfg)
+        if not edit['clips']:
+            raise ValueError('Add clips to the timeline before rendering')
+        if window:
+            total = timeline.clip_starts(edit['clips'])[1]
+            if window[0] >= total:
+                raise ValueError('The range starts after the end of the timeline')
+            window = (window[0], min(window[1], total))
+    except (ValueError, TypeError, media.MediaError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _submit('timeline', f'Timeline {"preview" if window else "export"} {eid}', timeline.render, sid=sid, eid=eid,
+                   edit=edit, video=dict(cfg['video']), window=window)
+
+
+@app.post('/api/s/{sid}/e/{eid}/timeline/export')
+def export_timeline(sid: str, eid: str, body: dict | None = Body(default=None)):
+    """Render the whole timeline, or `{"range": [first_frame, end_frame]}` as a quick preview."""
+    window = None
+    value = (body or {}).get('range')
+    if value is not None:
+        if not isinstance(value, list) or len(value) != 2 or any(type(x) is not int for x in value) or value[0] < 0 or value[1] <= value[0]:
+            raise HTTPException(400, 'Choose a range that ends after it starts')
+        window = (value[0], value[1])
+    return _timeline_export(sid, eid, window)
+
+
 @app.post("/api/s/{sid}/e/{eid}/takes")
 def ep_takes(sid: str, eid: str, body: dict = Body(default={})):
     _ep(sid, eid)
     try:
         if body.get("engine"):
             providers.validate_model(body["engine"], body.get("model") or "")
+            problem = providers.engine_problem(_s(), body["engine"])
+            if problem:
+                raise ValueError(problem)
         elif body.get("model"):
             raise ValueError("Choose an engine with the model")
         if not 1 <= int(body.get("takes") or _s()["takes_per_shot"]) <= 8:
@@ -558,6 +1125,28 @@ def ep_takes(sid: str, eid: str, body: dict = Body(default={})):
     return _submit("takes", f"Takes {eid}", jobs.job_takes, sid=sid, eid=eid,
                    shot_ids=body.get("shot_ids") or [], takes=body.get("takes"), force=bool(body.get("force")),
                    engine_override=body.get("engine") or "", model_override=body.get("model") or "")
+
+
+@app.post("/api/s/{sid}/e/{eid}/takes/song")
+def ep_song_takes(sid: str, eid: str, body: dict = Body(default={})):
+    """Music videos: InfiniteTalk takes driven by the song's isolated vocals, each from its shot's window in the song.
+    {shot_ids?: [...]} - default: every InfiniteTalk shot with a face."""
+    e = _ep(sid, eid)
+    shot_ids = body.get("shot_ids") or []
+    if not isinstance(shot_ids, list) or not all(isinstance(x, str) for x in shot_ids):
+        raise HTTPException(400, "shot_ids must be a list of shot ids")
+    if not jobs.song_file(e):
+        raise HTTPException(400, "This episode has no song. Upload the song on the Cut page (Music) first.")
+    known = {sh["id"] for sh in e["shots"]}
+    unknown = [x for x in shot_ids if x not in known]
+    if unknown:
+        raise HTTPException(400, f"Unknown shots: {', '.join(unknown)}")
+    if not shot_ids and not jobs.song_shots(e):
+        raise HTTPException(400, "No InfiniteTalk shots with a face to sing; tick the singing shots or set their engine.")
+    problem = providers.engine_problem(_s(), "infinitetalk")
+    if problem:
+        raise HTTPException(400, problem)
+    return _submit("takes", f"Song lip-sync {eid}", jobs.job_song_takes, sid=sid, eid=eid, shot_ids=shot_ids)
 
 
 @app.post("/api/s/{sid}/e/{eid}/shots/{shot_id}/take")
@@ -616,6 +1205,8 @@ def ep_animatic(sid: str, eid: str):
 
 @app.post("/api/s/{sid}/e/{eid}/cut")
 def ep_cut(sid: str, eid: str):
+    if _ep(sid, eid).get('timeline'):
+        return _timeline_export(sid, eid)
     return _submit("cut", f"Final cut {eid}", jobs.job_cut, sid=sid, eid=eid)
 
 
@@ -638,6 +1229,10 @@ async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: fl
     def apply(e):
         m = e.setdefault("music", {})
         if rel:
+            assets = e.setdefault('audio_assets', [])
+            for path in (m.get('file'), rel):
+                if path and path not in assets:
+                    assets.append(path)
             m["file"] = rel
         m["volume"] = float(volume)
         m["duck"] = duck.lower() in ("1", "true", "yes", "on")
@@ -648,6 +1243,8 @@ async def ep_music(sid: str, eid: str, file: UploadFile = File(None), volume: fl
 def ep_lipsync(sid: str, eid: str, body: dict = Body(default={})):
     from . import lipsync
     episode = _ep(sid, eid)
+    if episode.get('timeline'):
+        raise HTTPException(400, 'Choose lip-sync clips and render the saved timeline in Takes')
     audio_file = (episode.get('music') or {}).get('file')
     if not audio_file or not os.path.isfile(store.abs_media(audio_file)):
         raise HTTPException(400, 'Upload music or a voice recording in Cut first')
@@ -754,7 +1351,8 @@ def face_correction(sid: str, eid: str, shot_id: str, body: dict = Body(default=
 @app.get("/api/models")
 def video_models():
     from .providers import VIDEO_MODELS
-    return VIDEO_MODELS
+    cfg = _s()
+    return [{**m, "available": not (note := providers.engine_problem(cfg, m["engine"])), "note": note} for m in VIDEO_MODELS]
 
 
 

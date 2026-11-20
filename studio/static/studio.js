@@ -149,6 +149,29 @@ function ask(msg, okLabel = "Confirm", danger = false) {
     $("#ask-yes").focus();
   });
 }
+function promptText(msg, value = "", okLabel = "OK") {
+  return new Promise((resolve) => {
+    modal(`<h3 style="margin:0 0 8px;font-size:16px;max-width:420px">${esc(msg)}</h3>
+      <input id="ask-input" value="${esc(value)}" style="width:100%" aria-label="${esc(msg)}">
+      <div class="row" style="justify-content:flex-end;margin-top:16px">
+        <button id="ask-no">Cancel</button><button class="primary" id="ask-yes">${esc(okLabel)}</button></div>`);
+    const finish = (v) => { askDone = null; closeModal(); resolve(v); };
+    askDone = () => resolve(null);
+    $("#ask-no").onclick = () => finish(null);
+    $("#ask-yes").onclick = () => finish($("#ask-input").value.trim());
+    $("#ask-input").onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); $("#ask-yes").click(); } };
+    $("#ask-input").focus();
+    $("#ask-input").select();
+  });
+}
+async function cloneEpisode(sid, eid, title) {
+  const name = await promptText("Name the copy", `${title || "Episode"} copy`, "Clone");
+  if (name == null) return;
+  const e = await POST(`/api/s/${sid}/e/${eid}/clone`, { title: name || `${title || "Episode"} copy` });
+  toast("Episode cloned.");
+  delete App.sd[sid];
+  location.hash = `#/s/${sid}/e/${e.id}/story`;
+}
 $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
 
 const LB = { items: [], i: 0 };
@@ -211,6 +234,7 @@ function renderNav() {
     const chars = Object.values(d.bible.characters), locs = Object.values(d.bible.locations);
     html += `<div class="nav-sec">${esc(d.series.name)}</div>` +
       item(`#/s/${sid}`, "folder", "Overview") + item(`#/s/${sid}/style`, "palette", "Style & props") +
+      item(`#/s/${sid}/playground`, "image", "Playground") +
       `<div class="nav-sec">Episodes</div>` + d.episodes.map((e) => item(`#/s/${sid}/e/${e.id}/story`, "clapper", e.title, `<span class="count">${e.shots}</span>`)).join("") +
       `<div class="nav-sec">Characters</div>` + chars.slice(0, 10).map((c) => item(`#/s/${sid}/c/${c.id}`, "user", c.name, c.draft ? `<span class="count">draft</span>` : "")).join("") +
       `<div class="nav-sec">Locations</div>` + locs.slice(0, 10).map((l) => item(`#/s/${sid}/l/${l.id}`, "pin", l.name, l.draft ? `<span class="count">draft</span>` : "")).join("");
@@ -409,6 +433,7 @@ document.addEventListener("keydown", (e) => {
 // ── router ───────────────────────────────────────────────────────────────
 const SKELETON = `<div class="skel h1"></div><div class="skel row-card"></div><div class="skel row-card"></div>`;
 async function route() {
+  if (App.pgViewport) { App.pgViewport.destroy(); App.pgViewport = null; }
   if (App.timelineEditor) {
     const editor = App.timelineEditor;
     try { if (editor.dirty) await editor.flush(); }
@@ -435,6 +460,7 @@ async function route() {
     if (parts[0] === "s") {
       const sid = parts[1];
       if (parts.length === 2) return await viewSeries(view, sid);
+      if (parts[2] === "playground") return await viewPlayground(view, sid);
       if (parts[2] === "c") return await viewCharacter(view, sid, parts[3]);
       if (parts[2] === "l") return await viewLocation(view, sid, parts[3]);
       if (parts[2] === "style") return await viewStyle(view, sid);
@@ -451,7 +477,7 @@ async function route() {
   }
 }
 window.addEventListener("hashchange", route);
-$("#view").addEventListener("input", (e) => { if (!e.target.matches("input[type=file], .bulk-check, .bulk-actions input, input[data-chk], input[data-chk-all], #take-model, #ntakes, #src-override, [data-edit-model]")) App.dirty = true; });
+$("#view").addEventListener("input", (e) => { if (!e.target.closest(".pg-page") && !e.target.matches("input[type=file], .bulk-check, .bulk-actions input, input[data-chk], input[data-chk-all], #take-model, #ntakes, #src-override, [data-edit-model]")) App.dirty = true; });
 window.addEventListener("beforeunload", (e) => { if (App.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
 // ── shared bits ──────────────────────────────────────────────────────────
@@ -523,6 +549,108 @@ async function viewHome(view) {
   $("#add-series").onclick = create; onEnter("#new-series", create);
 }
 
+async function viewPlayground(view, sid) {
+  const d = await getSeries(sid), pg = await GET(`/api/s/${sid}/playground`);
+  const chars = pg.characters.filter(c => !c.draft), locs = pg.locations.filter(l => !l.draft);
+  crumbs([[d.series.name, `#/s/${sid}`], ["Playground", null]]);
+  const renderGallery = () => {
+    const root = $("#pg-renders", view); if (!root) return;
+    $("#pg-results-count", view).textContent = `${pg.renders.length} ${pg.renders.length === 1 ? "frame" : "frames"}`;
+    root.innerHTML = pg.renders.length ? `<div class="pg-gallery">${pg.renders.map(r => `<article class="pg-result"><button class="pg-result-image" data-zoom="${media(r.file)}" aria-label="View render"><img src="${media(r.file)}" loading="lazy" alt="Generated test frame"></button><div class="pg-result-info"><span class="chip">${esc(sourceLabel(r.source))}</span><time>${esc(r.created || "")}</time></div><details><summary>Prompt used</summary><p>${esc(r.prompt)}</p></details></article>`).join("")}</div>` : `<div class="pg-empty"><div class="pg-empty-mark">✳</div><b>No renders yet</b><span>Direct a scene in the viewport, then render a test frame.</span></div>`;
+    $$('[data-zoom]', root).forEach(img => img.onclick = () => zoom(img.dataset.zoom));
+  };
+  const locationPlate = l => l && ((l.plates || {})[$("#pg-time", view)?.value.trim()] || Object.values(l.plates || {})[0] || "");
+  view.innerHTML = `<div class="pg-page">
+    <header class="pg-heading"><div><div class="pg-eyebrow">${esc(d.series.name)} <span>/</span> DIRECTOR'S DESK</div><h1>Playground</h1><p>Build the shot yourself. Select a character, drag them into place, and orbit the scene.</p></div><a class="pg-back" href="#/s/${sid}">← Project</a></header>
+    ${!chars.length || !locs.length ? `<div class="notice">Add at least one saved character and one saved location to this project's Bible to build a scene.</div>` : ""}
+    <div class="pg3-workspace"><section class="pg3-main">
+      <div class="pg3-toolbar"><div class="pg3-tools"><button class="pg3-mode on" data-mode="move" title="Move object (W)">↔ <span>Move</span></button><button class="pg3-mode" data-mode="rotate" title="Rotate object (E)">⟳ <span>Rotate</span></button><button class="pg3-mode" data-mode="scale" title="Scale object (R)">⤢ <span>Scale</span></button></div><span class="pg3-toolbar-help">Drag an object to move · Drag empty space to orbit · Scroll to zoom</span><button id="pg3-reset" class="pg3-quiet">Reset view</button></div>
+      <div class="pg3-viewport" id="pg3-host"><div class="pg3-loading">Preparing the 3D scene…</div></div>
+      <div class="pg3-status"><span><i class="pg3-dot"></i> EDITOR VIEW</span><span id="pg3-selected">Select an object in the scene</span><span id="pg3-coords">—</span></div>
+      <section class="pg-results"><div class="pg-results-head"><div><span class="pg-eyebrow">GALLERY</span><h2>Test renders</h2></div><span class="pg-results-count" id="pg-results-count">${pg.renders.length} ${pg.renders.length === 1 ? "frame" : "frames"}</span></div><div id="pg-renders"></div></section>
+    </section><aside class="pg3-inspector">
+      <section class="pg3-panel"><div class="pg3-panel-head"><span>01</span><div><b>Environment</b><small>Set the scene location</small></div></div>
+        <label class="pg-field">Project location<select id="pg-location">${locs.map(l => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join("")}</select></label>
+        <div class="pg3-location-note" id="pg3-location-note"></div><label class="pg-field">Time / atmosphere<input id="pg-time" placeholder="Evening, rain, fog…"></label>
+      </section>
+      <section class="pg3-panel"><div class="pg3-panel-head"><span>02</span><div><b>Scene objects</b><small>Check to add to the 3D scene</small></div></div>
+        <div class="pg3-entity-list">${chars.map(c => `<label class="pg3-entity"><input type="checkbox" class="pg-char" value="${esc(c.id)}"><span class="pg-avatar">${charThumb(c) ? `<img src="${charThumb(c)}" alt="">` : `<span>${esc((c.name || "?").slice(0, 1))}</span>`}</span><span class="pg3-entity-name">${esc(c.name)}<small>${(c.refs || []).length ? "Reference photo ready" : "Description only"}</small></span><span class="pg3-add">+</span></label>`).join("") || `<div class="pg-no-cast">No saved characters in this project's Bible.</div>`}</div>
+        <div class="pg3-props" id="pg3-props"></div><div class="pg3-entity-tools"><button type="button" id="pg3-add-car">＋ Add car</button><button type="button" id="pg3-add-block">＋ Add prop</button></div>
+      </section>
+      <section class="pg3-panel"><div class="pg3-panel-head"><span>03</span><div><b>Camera</b><small>Adjust the view and shot</small></div></div>
+        <label class="pg-field">Shot size<select id="pg-framing">${["wide", "medium", "medium close-up", "close-up", "over-the-shoulder", "two-shot"].map(x => `<option>${x}</option>`).join("")}</select></label>
+        <label class="pg3-range">Orbit <output id="pg3-angle-out">0°</output><input id="pg3-angle" type="range" min="-180" max="180" value="0"></label>
+        <label class="pg3-range">Camera height <output id="pg3-height-out">5.5 m</output><input id="pg3-height" type="range" min="1.2" max="13" step="0.1" value="5.5"></label>
+        <label class="pg3-range">Distance <output id="pg3-distance-out">13 m</output><input id="pg3-distance" type="range" min="5" max="35" step="0.5" value="13"></label>
+        <label class="pg3-range">Lens <output id="pg3-lens-out">50 mm</output><input id="pg3-lens" type="range" min="18" max="100" step="1" value="50"></label>
+      </section>
+      <section class="pg3-panel"><div class="pg3-panel-head"><span>04</span><div><b>Render</b><small>Generate a still from this setup</small></div></div>
+        <label class="pg-field">Image model<select id="pg-model" ${pg.models.length ? "" : "disabled"}>${pg.models.map(m => `<option value="${esc(m.source)}">${esc(m.label)}</option>`).join("")}</select></label>
+        <label class="pg-field">Action / direction <textarea id="pg-action" placeholder="Optional: describe what happens in the shot…"></textarea></label>
+        <label class="pg-field">Visual notes <textarea id="pg-extra" placeholder="Optional: lighting, weather, mood…"></textarea></label>
+        ${pg.models.length ? "" : `<div class="pg-model-empty">No ready image models are configured.</div>`}
+        <button class="primary pg3-render" id="pg-render" ${pg.models.length && locs.length ? "" : "disabled"}>Render test frame <b>↗</b></button><p class="pg3-render-note">Scene objects, layout, and camera are included in the prompt. Renders stay in this project's gallery.</p>
+      </section>
+    </aside></div></div>`;
+  renderGallery();
+  const { DirectorViewport } = await import("/static/playground3d.js");
+  const initialLoc = locs[0];
+  const selectedChars = () => $$(".pg-char:checked", view).map((box, i) => {
+    const c = chars.find(ch => ch.id === box.value), old = viewport?.getState().entities.find(e => e.id === box.value);
+    return { id: c.id, name: c.name, appearance: c.appearance, refs: c.refs, position: old?.position || [((i - (box.parentElement.parentElement.querySelectorAll(".pg-char:checked").length - 1) / 2) * 2.4), 0, 1.5], rotation: old?.rotation || [0, 0, 0], scale: old?.scale || 1 };
+  });
+  let viewport;
+  let propSignature = "";
+  const paintState = state => {
+    $$(".pg3-mode", view).forEach(button => button.classList.toggle("on", button.dataset.mode === state.mode));
+    const chosen = state.entities.find(e => e.id === state.selectedId), name = chosen && (chars.find(c => c.id === chosen.id)?.name || chosen.id);
+    $("#pg3-selected", view).textContent = chosen ? `${name} · ${state.selectedId}` : "Select an object in the scene";
+    $("#pg3-coords", view).textContent = chosen ? `X ${chosen.position[0].toFixed(1)}  Y ${chosen.position[1].toFixed(1)}  Z ${chosen.position[2].toFixed(1)}` : "—";
+    $("#pg3-angle", view).value = Math.round(state.camera.azimuth); $("#pg3-angle-out", view).textContent = `${Math.round(state.camera.azimuth)}°`;
+    $("#pg3-height", view).value = state.camera.height; $("#pg3-height-out", view).textContent = `${state.camera.height.toFixed(1)} m`;
+    $("#pg3-distance", view).value = state.camera.distance; $("#pg3-distance-out", view).textContent = `${state.camera.distance.toFixed(1)} m`;
+    $("#pg3-lens", view).value = state.camera.lens; $("#pg3-lens-out", view).textContent = `${Math.round(state.camera.lens)} mm`;
+    $$(".pg3-entity", view).forEach(row => row.classList.toggle("active", $(".pg-char", row).checked));
+    const propList = $("#pg3-props", view);
+    const props = state.entities.filter(e => e.kind === "prop"), signature = `${state.selectedId}|${props.map(e => e.id).join(",")}`;
+    if (signature !== propSignature) {
+      propSignature = signature;
+      propList.innerHTML = props.map(e => `<div class="pg3-prop-row ${e.id === state.selectedId ? "active" : ""}"><button type="button" class="pg3-prop-name" data-focus="${esc(e.id)}">▰ ${esc(e.name)}</button><button type="button" class="pg3-prop-remove" data-remove="${esc(e.id)}" aria-label="Remove ${esc(e.name)}">×</button></div>`).join("");
+      $$('[data-focus]', propList).forEach(button => button.onclick = () => viewport.focus(button.dataset.focus));
+      $$('[data-remove]', propList).forEach(button => button.onclick = () => viewport.removeEntity(button.dataset.remove));
+    }
+  };
+  viewport = new DirectorViewport($("#pg3-host", view), { characters: [], onChange: paintState });
+  if (initialLoc) viewport.setLocation(initialLoc.name, locationPlate(initialLoc) ? media(locationPlate(initialLoc)) : "");
+  $("#pg3-location-note", view).textContent = initialLoc?.description || "Project location blockout";
+  $$(".pg-char", view).forEach(box => box.addEventListener("change", () => viewport.setCharacters(selectedChars())));
+  $$(".pg3-mode", view).forEach(button => button.onclick = () => { $$(".pg3-mode", view).forEach(b => b.classList.toggle("on", b === button)); viewport.setMode(button.dataset.mode); });
+  $("#pg3-reset", view).onclick = () => { viewport.cameraState = { azimuth: 0, height: 5.5, distance: 13, lens: 50 }; viewport.updateCamera(); paintState(viewport.getState()); };
+  $("#pg3-host", view).addEventListener("contextmenu", e => e.preventDefault());
+  const syncEnvironment = () => { const l = locs.find(x => x.id === $("#pg-location", view).value); const plate = locationPlate(l); viewport.setLocation(l?.name || "Location", plate ? media(plate) : ""); $("#pg3-location-note", view).textContent = l?.description || "Project location blockout"; };
+  $("#pg-location", view).onchange = syncEnvironment;
+  $("#pg-time", view).addEventListener("change", syncEnvironment);
+  const cameraInputs = [["#pg3-angle", "azimuth"], ["#pg3-height", "height"], ["#pg3-distance", "distance"], ["#pg3-lens", "lens"]];
+  cameraInputs.forEach(([sel, key]) => $(sel, view).addEventListener("input", e => viewport.setCameraState(key, e.target.value)));
+  $("#pg3-add-car", view).onclick = () => viewport.addProp("car");
+  $("#pg3-add-block", view).onclick = () => viewport.addProp("prop");
+  const refreshGallery = async () => { try { pg.renders = (await GET(`/api/s/${sid}/playground`)).renders; renderGallery(); } catch { /* keep current gallery */ } };
+  App.refreshers.push(refreshGallery);
+  $("#pg-render", view).onclick = async () => {
+    const state = viewport.getState(), camera = state.camera;
+    const cameraText = `${camera.height.toFixed(1)} m high, ${camera.azimuth.toFixed(0)}° azimuth (fixed viewpoint), ${camera.distance.toFixed(1)} m from the scene, ${Math.round(camera.lens)} mm lens`;
+    const body = { source: $("#pg-model", view).value, location_id: $("#pg-location", view).value,
+      time_of_day: $("#pg-time", view).value, framing: $("#pg-framing", view).value, camera: cameraText,
+      camera_state: camera, action: $("#pg-action", view).value, extra: $("#pg-extra", view).value,
+      character_ids: state.entities.filter(e => e.kind === "character").map(e => e.id),
+      positions: Object.fromEntries(state.entities.filter(e => e.kind === "character").map(e => [e.id, { position: e.position, rotation: e.rotation, scale: e.scale }])),
+      scene_props: state.entities.filter(e => e.kind === "prop").map(e => ({ name: e.name, position: e.position, rotation: e.rotation, scale: e.scale })) };
+    await startJob(`/api/s/${sid}/playground/render`, body);
+  };
+  App.pgViewport = viewport;
+}
+
+
 // ── series overview ─────────────────────────────────────────────────────
 async function viewSeries(view, sid) {
   const d = await getSeries(sid);
@@ -532,7 +660,7 @@ async function viewSeries(view, sid) {
     <div class="page-head"><div><h1>${esc(d.series.name)}</h1>
       <p class="sub">${pl(d.episodes.length, "episode")}, ${pl(d.episodes.reduce((a, e) => a + e.shots, 0), "shot")}, ${pl(chars.length, "character")}, ${pl(locs.length, "location")}. <a href="#/s/${sid}/style">Style &amp; props</a></p></div></div>
     <div class="section-head"><h2>Episodes</h2></div>
-    ${d.episodes.length ? `<div class="eplist">${d.episodes.map((e, k) => `<a class="eprow" href="#/s/${sid}/e/${e.id}/story"><span class="n">EP ${String(k + 1).padStart(2, "0")}</span><span class="t">${esc(e.title)}</span><span class="muted small">${pl(e.shots, "shot")}</span></a>`).join("")}</div>` : `<div class="empty"><b>No episodes yet</b>Name one below to start writing.</div>`}
+    ${d.episodes.length ? `<div class="eplist">${d.episodes.map((e, k) => `<a class="eprow" href="#/s/${sid}/e/${e.id}/story"><span class="n">EP ${String(k + 1).padStart(2, "0")}</span><span class="t">${esc(e.title)}</span><span class="muted small">${pl(e.shots, "shot")}</span><button type="button" class="link ep-clone" data-clone="${esc(e.id)}" data-title="${esc(e.title)}">Clone</button></a>`).join("")}</div>` : `<div class="empty"><b>No episodes yet</b>Name one below to start writing.</div>`}
     ${addCard("new-ep", "Episode title", "add-ep", "New episode", true)}
     <div class="section-head"><h2>Characters</h2></div>
     <div class="prints">${chars.map((c) => printFig(charThumb(c), c.name, `#/s/${sid}/c/${c.id}`, `${c.draft ? "draft, " : ""}${c.image_lora?.name ? "LoRA" : "no LoRA"}, ${pl((c.refs || []).length, "photo")}`)).join("")}</div>
@@ -557,6 +685,13 @@ async function viewSeries(view, sid) {
   const addLoc = async () => { const l = await POST(`/api/s/${sid}/locations`, { name: $("#new-loc").value || "New location" }); location.hash = `#/s/${sid}/l/${l.id}`; };
   $("#add-ep").onclick = addEp; $("#add-char").onclick = addChar; $("#add-loc").onclick = addLoc;
   onEnter("#new-ep", addEp); onEnter("#new-char", addChar); onEnter("#new-loc", addLoc);
+  view.onclick = (ev) => {
+    const b = ev.target.closest("[data-clone]");
+    if (!b) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    cloneEpisode(sid, b.dataset.clone, b.dataset.title);
+  };
 }
 
 // ── helpers for key: value textareas ────────────────────────────────────
@@ -571,7 +706,8 @@ function textToKv(t) {
   return o;
 }
 function loraSelect(id, value) {
-  const opts = [""].concat(App.loras || []);
+  const presets = Object.keys(App.status?.image_lora_presets || {});
+  const opts = [""].concat([...new Set([...(App.loras || []), ...presets])]);
   if (value && !opts.includes(value)) opts.push(value);
   return `<select id="${id}">${opts.map((o) => `<option value="${esc(o)}" ${o === value ? "selected" : ""}>${o ? esc(o) : "- none -"}</option>`).join("")}</select>`;
 }
@@ -594,7 +730,7 @@ async function viewCharacter(view, sid, cid) {
     <div class="card form-grid">
       <h3 class="form-sec full">Identity</h3>
       <div><label>Name</label><input id="f-name" value="${esc(c.name)}"></div>
-      <div><label>Trigger token (from LoRA training, e.g. ohwx_sam)</label><input id="f-trigger" value="${esc(c.trigger)}"></div>
+      <div><label>Trigger token (auto-filled for registered LoRAs)</label><input id="f-trigger" value="${esc(c.trigger)}" ${App.status?.image_lora_presets?.[c.image_lora?.name] ? "readonly" : ""}></div>
       <div class="full"><label>Locked appearance (50-80 words, copied verbatim into every prompt)</label><textarea id="f-app">${esc(c.appearance)}</textarea></div>
       <h3 class="form-sec full">Wardrobe &amp; acting</h3>
       <div class="full"><label>Outfits - one per line, "name: description"</label><textarea id="f-outfits">${esc(kvToText(c.outfits))}</textarea></div>
@@ -602,8 +738,12 @@ async function viewCharacter(view, sid, cid) {
       <div><label>Never change (comma separated)</label><input id="f-never" value="${esc((c.never_change || []).join(", "))}"></div>
       <div class="full"><label>Acting notes</label><textarea id="f-acting" style="min-height:44px">${esc(c.acting_notes)}</textarea></div>
       <h3 class="form-sec full">Models</h3>
-      <div><label>Image LoRA (Flux 1)</label>${loraSelect("f-ilora", c.image_lora?.name)}</div>
+      <div><label>Image LoRA</label>${loraSelect("f-ilora", c.image_lora?.name)}</div>
       <div><label>Image LoRA strength</label><input id="f-ilora-s" type="number" step="0.05" value="${c.image_lora?.strength ?? 0.9}"></div>
+      <div><label>Image LoRA base (must match training)</label><select id="f-ilora-family">
+        <option value="flux1" ${(c.image_lora?.model_family || "flux1") === "flux1" ? "selected" : ""}>FLUX.1</option>
+        <option value="flux2_klein" ${c.image_lora?.model_family === "flux2_klein" ? "selected" : ""}>FLUX.2 Klein Base 4B</option>
+      </select></div>
       <div><label>Video LoRA (Wan 2.2, optional)</label>${loraSelect("f-vlora", c.video_lora?.name)}</div>
       <div><label>Video LoRA strength</label><input id="f-vlora-s" type="number" step="0.05" value="${c.video_lora?.strength ?? 0.8}"></div>
       <div><label>First-frame source</label>${sourceSelect("f-src", c.frame_source)}</div>
@@ -634,10 +774,28 @@ async function viewCharacter(view, sid, cid) {
     outfits: textToKv($("#f-outfits").value), default_outfit: $("#f-defout").value.trim() || "default",
     never_change: $("#f-never").value.split(",").map((x) => x.trim()).filter(Boolean),
     acting_notes: $("#f-acting").value,
-    image_lora: { name: $("#f-ilora").value, strength: parseFloat($("#f-ilora-s").value) || 0.9 },
+    image_lora: { name: $("#f-ilora").value, strength: parseFloat($("#f-ilora-s").value) || 0.9,
+      model_family: $("#f-ilora-family").value || "flux1" },
     video_lora: { name: $("#f-vlora").value, strength: parseFloat($("#f-vlora-s").value) || 0.8 },
     frame_source: $("#f-src").value,
     voice: { ...(c.voice || {}), wpm: parseInt($("#f-wpm").value) || 140, description: $("#f-voice").value },
+  });
+  const imageLoraPresets = App.status?.image_lora_presets || {};
+  let activeImageLoraPreset = imageLoraPresets[c.image_lora?.name];
+  $("#f-ilora").addEventListener("change", () => {
+    const preset = imageLoraPresets[$("#f-ilora").value];
+    if (preset) {
+      $("#f-trigger").value = preset.trigger;
+      $("#f-trigger").readOnly = true;
+      $("#f-ilora-family").value = preset.model_family;
+    } else {
+      if (activeImageLoraPreset && $("#f-trigger").value.trim() === activeImageLoraPreset.trigger) {
+        $("#f-trigger").value = "";
+      }
+      $("#f-trigger").readOnly = false;
+      $("#f-ilora-family").value = "flux1";
+    }
+    activeImageLoraPreset = preset;
   });
   $("#save").onclick = async () => { await PUT(`/api/s/${sid}/characters/${cid}`, collect()); toast("Saved. Shots using this character are now marked stale."); route(); };
   $("#del").onclick = async () => { if (await ask(`Delete ${c.name}? Files are kept in a .deleted folder.`, "Delete", true)) { await api("DELETE", `/api/s/${sid}/characters/${cid}`); location.hash = `#/s/${sid}`; } };
@@ -970,12 +1128,14 @@ async function viewModels(view) {
   };
 }
 
-refreshStatus();
 setInterval(refreshStatus, 15000);
 pollJobs();
 setInterval(pollJobs, 2000);
-// The model pickers need /api/ai; wait for it briefly before the first render (never re-render afterwards).
-window.addEventListener("load", () => Promise.race([loadAI(), new Promise((r) => setTimeout(r, 1500))]).finally(route));
+// The character model pickers need both the AI choices and ComfyUI LoRAs before first render.
+window.addEventListener("load", () => Promise.race([
+  Promise.all([loadAI(), refreshStatus()]),
+  new Promise((r) => setTimeout(r, 2500)),
+]).finally(route));
 
 // Visible "unsaved changes" state (App.dirty is set by edits and cleared on save).
 (() => {

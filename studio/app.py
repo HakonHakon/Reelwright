@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import comfy as comfy_mod
-from . import beats, blocking, cloud, dialogue, jobs, llm, media, planner, prompts, store, providers, timeline, voices
+from . import beats, blocking, cloud, dialogue, jobs, llm, media, planner, prompts, store, providers, timeline, voices, blender
 from . import settings as settings_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -79,10 +79,27 @@ def media_file(path: str):
 def _required_model_options(s):
     """Check configured render families, including existing project/shot overrides."""
     sources, engines = set(), set()
+    flux1_loras, klein_loras = set(), set()
+    flux1_needed = False
+
+    def include_flux_source(sh, b, source):
+        nonlocal flux1_needed
+        if source != "flux_lora":
+            return
+        loras = prompts.image_loras(sh, b, 1.0)
+        families = {lora.get("model_family", "flux1") for lora in loras}
+        if families == {"flux2_klein"}:
+            klein_loras.update(lora["name"] for lora in loras if lora.get("name"))
+        else:
+            flux1_needed = True
+            flux1_loras.update(lora["name"] for lora in loras if lora.get("name"))
 
     def include_style(b):
         style = b["style"]
-        sources.add(jobs._resolve_source({"frame_source": style["default_frame_source"], "characters": []}, b))
+        sh = {"frame_source": style["default_frame_source"], "characters": []}
+        source = jobs._resolve_source(sh, b)
+        sources.add(source)
+        include_flux_source(sh, b, source)
         engines.add(style["default_engine"])
 
     include_style({"style": {**store.DEFAULT_STYLE, **s.get("style_defaults", {})}, "characters": {}})
@@ -92,10 +109,15 @@ def _required_model_options(s):
         include_style(b)
         for character in b["characters"].values():
             if character.get("frame_source"):
-                sources.add(jobs._resolve_source({"characters": [{"id": character["id"]}]}, b))
+                sh = {"characters": [{"id": character["id"]}]}
+                source = jobs._resolve_source(sh, b)
+                sources.add(source)
+                include_flux_source(sh, b, source)
         for episode in store.list_episodes(sid):
             for shot in (store.get_episode(sid, episode["id"]) or {}).get("shots", []):
-                sources.add(jobs._resolve_source(shot, b))
+                source = jobs._resolve_source(shot, b)
+                sources.add(source)
+                include_flux_source(shot, b, source)
                 engines.add(shot.get("engine") or b["style"]["default_engine"])
 
     needed = {}
@@ -103,9 +125,19 @@ def _required_model_options(s):
     def require(node, field, *names):
         needed.setdefault((node, field), set()).update(names)
 
-    if "flux_lora" in sources:
+    if flux1_needed:
         require("UNETLoader", "unet_name", s["flux"]["unet"])
+        require("DualCLIPLoader", "clip_name1", s["flux"]["clip_l"])
+        require("DualCLIPLoader", "clip_name2", s["flux"]["t5"])
         require("VAELoader", "vae_name", s["flux"]["vae"])
+        if flux1_loras:
+            require("LoraLoaderModelOnly", "lora_name", *flux1_loras)
+    if klein_loras:
+        klein = s["flux2_klein"]
+        require("UNETLoader", "unet_name", klein["unet"])
+        require("CLIPLoader", "clip_name", klein["clip"])
+        require("VAELoader", "vae_name", klein["vae"])
+        require("LoraLoaderModelOnly", "lora_name", *klein_loras)
     if sources & {"zimage", "qwen_refs"}:
         require("UNETLoader", "unet_name", s["zimage"]["unet"])
         require("CLIPLoader", "clip_name", s["zimage"]["clip"])
@@ -149,7 +181,8 @@ def status():
     c = comfy_mod.Comfy(s["comfy_host"])
     alive = c.alive()
     out = {"comfy": alive, "comfy_host": s["comfy_host"], "ollama_models": llm.installed(s["ollama_host"]),
-           "planner_model": s["planner_model"], "vision_model": s["vision_model"], "loras": [], "missing": []}
+           "planner_model": s["planner_model"], "vision_model": s["vision_model"], "loras": [], "missing": [],
+           "image_lora_presets": s.get("image_lora_presets", {})}
     if alive:
         try:
             out["loras"] = c.options("LoraLoaderModelOnly", "lora_name")
@@ -344,6 +377,54 @@ def series_get(sid: str):
     return {"series": s, "bible": store.bible(sid), "episodes": store.list_episodes(sid)}
 
 
+@app.get("/api/s/{sid}/playground")
+def playground_get(sid: str):
+    store.get_series(sid) or _404("series")
+    s, b = _s(), store.bible(sid)
+    choices = cloud.choices(s, llm.installed(s["ollama_host"]))["image"]
+    models = [{"source": x["source"], "label": x["label"]} for x in choices if x.get("ready")]
+    c = comfy_mod.Comfy(s["comfy_host"])
+    if c.alive():
+        try:
+            opts = c.options("UNETLoader", "unet_name")
+            z = s["zimage"]
+            if z["unet"] in opts and z["clip"] in c.options("CLIPLoader", "clip_name") and z["vae"] in c.options("VAELoader", "vae_name"):
+                models.append({"source": "zimage", "label": "Z-Image · local"})
+            q = s["qwen_edit"]
+            if (q["unet"] in opts and q["clip"] in c.options("CLIPLoader", "clip_name")
+                    and q["vae"] in c.options("VAELoader", "vae_name")
+                    and q["lora"] in c.options("LoraLoaderModelOnly", "lora_name")):
+                models.append({"source": "qwen_refs", "label": "Qwen Edit · local, character references"})
+            q2511 = s["qwen_2511"]
+            q2511_nodes = all(c.has_node(n) for n in (
+                "TextEncodeQwenImageEditPlus", "FluxKontextMultiReferenceLatentMethod", "CFGNorm",
+                "ModelSamplingAuraFlow", "EmptySD3LatentImage"))
+            q2511_lora_ready = not q2511.get("lora") or q2511["lora"] in c.options("LoraLoaderModelOnly", "lora_name")
+            if (q2511_nodes and q2511["unet"] in opts
+                    and q2511["clip"] in c.options("CLIPLoader", "clip_name")
+                    and q2511["vae"] in c.options("VAELoader", "vae_name") and q2511_lora_ready):
+                models.append({"source": "qwen_2511", "label": "Qwen 2511 · local, character references"})
+            f = s["flux"]
+            dual = c.options("DualCLIPLoader", "clip_name1")
+            if f["unet"] in opts and f["vae"] in c.options("VAELoader", "vae_name") and f["clip_l"] in dual and f["t5"] in c.options("DualCLIPLoader", "clip_name2"):
+                models.append({"source": "flux_lora", "label": "Flux · local"})
+        except Exception:
+            pass
+    return {"series": store.get_series(sid), "characters": list(b["characters"].values()),
+            "locations": list(b["locations"].values()), "models": models,
+            "renders": store.playground_renders(sid)}
+
+
+@app.post("/api/s/{sid}/playground/render")
+def playground_render(sid: str, body: dict = Body(...)):
+    store.get_series(sid) or _404("series")
+    source = str(body.get("source") or "").strip()
+    valid = {x["source"] for x in playground_get(sid)["models"]}
+    if source not in valid:
+        raise HTTPException(400, "Choose an available image model")
+    return _submit("playground", "Playground render", jobs.job_playground, sid=sid, body=body)
+
+
 @app.put("/api/s/{sid}/style")
 def style_put(sid: str, body: dict = Body(...)):
     try:
@@ -373,6 +454,11 @@ def char_put(sid: str, cid: str, body: dict = Body(...)):
     cur = store.get_character(sid, cid) or _404("character")
     keep = {k: cur.get(k) for k in ("id", "refs", "sheet", "version")}
     merged = {**cur, **body, **keep, "draft": False}
+    image_lora = merged.get("image_lora") or {}
+    preset = _s().get("image_lora_presets", {}).get(image_lora.get("name"))
+    if preset:
+        merged["image_lora"] = {**image_lora, "model_family": preset["model_family"]}
+        merged["trigger"] = preset["trigger"]
     c = store.save_character(sid, merged, bump=True)
     if (cur.get("name") or "") != (c.get("name") or ""):
         store.relink_characters(sid)     # shots that still name a deleted id may now mean this character
@@ -517,6 +603,17 @@ def loc_approve(sid: str, lid: str, body: dict = Body(...)):
 @app.post("/api/s/{sid}/episodes")
 def ep_create(sid: str, body: dict = Body(...)):
     return store.create_episode(sid, body.get("title", "").strip() or "Episode 1")
+
+
+@app.post("/api/s/{sid}/e/{eid}/clone")
+def ep_clone(sid: str, eid: str, body: dict = Body(default={})):
+    """Duplicate an episode in this project: story, shot list, frames, takes and cut."""
+    _ensure_idle(sid, eid)
+    _ep(sid, eid)
+    try:
+        return store.clone_episode(sid, eid, (body.get("title") or "").strip() or None)
+    except KeyError:
+        _404("episode")
 
 
 def _decorate(sid: str, e: dict) -> dict:
@@ -699,7 +796,82 @@ def ep_gate(sid: str, eid: str, body: dict = Body(...)):
     return store.update_episode(sid, eid, lambda e: e["gates"].update({body["gate"]: bool(body.get("value"))}))["gates"]
 
 
+# previz (pre-visual blockout of a scene before takes are rendered)
+@app.post("/api/s/{sid}/e/{eid}/previz")
+def ep_previz(sid: str, eid: str, body: dict = Body(...)):
+    """{shot_id, state} stores the 3D blockout state (camera, entity positions, movement notes) for one shot."""
+    _ep(sid, eid)
+    shot_id = body.get("shot_id")
+    state = body.get("state")
+    if not shot_id or not isinstance(state, dict):
+        raise HTTPException(400, "Send {shot_id, state} with the blockout state.")
+
+    def apply(e):
+        try:
+            shot = store.find_shot(e, shot_id)
+        except KeyError:
+            raise HTTPException(404, f"Shot {shot_id} not found")
+        shot["previz"] = state
+    store.update_episode(sid, eid, apply)
+    return {"ok": True, "shot_id": shot_id}
+
+
+# previz via Blender MCP (3D animation preview of the approved blockout)
+@app.post("/api/s/{sid}/e/{eid}/previz_blender")
+def ep_previz_blender(sid: str, eid: str, body: dict = Body(default={})):
+    """Render a Blender previz animation for one shot from its approved blockout state.
+    Body: {shot_id, seconds?, fps?}. Returns job submission."""
+    e = _ep(sid, eid)
+    shot_id = body.get("shot_id")
+    if not shot_id:
+        raise HTTPException(400, "Send {shot_id}.")
+    shot = store.find_shot(e, shot_id)
+    if not shot.get("previz"):
+        raise HTTPException(400, "This shot has no previz blockout yet. Build it in the Previz tab first.")
+    seconds = float(body.get("seconds") or _s()["blender"]["seconds"])
+    fps = int(body.get("fps") or _s()["blender"]["fps"])
+    out_dir = os.path.join(store.ep_dir(sid, eid), "previz")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{shot_id}.mp4")
+    return _submit("previz_blender", f"Blender previz {shot_id}", jobs.job_previz_blender,
+                   sid=sid, eid=eid, shot_id=shot_id, seconds=seconds, fps=fps, out_path=out_path)
+
+
+@app.get("/api/s/{sid}/e/{eid}/previz_blender/{shot_id}")
+def ep_previz_blender_get(sid: str, eid: str, shot_id: str):
+    """Return previz video file info for a shot, or 404 if not rendered yet."""
+    _ep(sid, eid)
+    path = os.path.join(store.ep_dir(sid, eid), "previz", f"{shot_id}.mp4")
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Previz not rendered yet for this shot.")
+    info = media.probe(_s()["ffprobe"], path)
+    return {"file": store.rel(path), "url": f"/media/{store.rel(path)}", **info}
+
+
 # frames
+@app.post("/api/s/{sid}/e/{eid}/reference_render")
+def ep_reference_render(sid: str, eid: str, body: dict = Body(default={})):
+    e = _ep(sid, eid)
+    source = (e.get("reference_rebuild") or {}).get("source")
+    if not source or not os.path.isfile(store.abs_media(source)):
+        raise HTTPException(400, "This episode needs its uploaded performance reference first")
+    ids = body.get("shot_ids") or []
+    if not isinstance(ids, list) or any(not isinstance(x, str) for x in ids) or set(ids) - {sh["id"] for sh in e["shots"]}:
+        raise HTTPException(400, "Choose existing episode shots")
+    if not e["shots"] or any(not sh.get("reference") for sh in e["shots"]):
+        raise HTTPException(400, "Plan the reference shot windows before rendering")
+    recover_prompt = body.get("recover_prompt") or ""
+    recover_shot = body.get("recover_shot") or ""
+    if recover_prompt and (not isinstance(recover_prompt, str) or not re.fullmatch(r"[a-f0-9-]{36}", recover_prompt) or recover_shot not in {sh["id"] for sh in e["shots"]}):
+        raise HTTPException(400, "Choose an existing frame render to recover")
+    with jobs.QUEUE.cv:
+        for job in jobs.QUEUE.jobs.values():
+            if job.kind == "reference_render" and job.status in ("queued", "running") and job.params.get("sid") == sid and job.params.get("eid") == eid:
+                return job.public()
+        return _submit("reference_render", f"Reference film · {e['title']}", jobs.job_reference_rebuild,
+                       sid=sid, eid=eid, shot_ids=ids, recover_prompt=recover_prompt, recover_shot=recover_shot)
+
+
 @app.post("/api/s/{sid}/e/{eid}/frames")
 def ep_frames(sid: str, eid: str, body: dict = Body(default={})):
     return _submit("frames", f"First frames {eid}", jobs.job_frames, sid=sid, eid=eid,

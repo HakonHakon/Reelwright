@@ -51,6 +51,56 @@ def flux_image(s: dict, prompt: str, seed: int, width: int, height: int, batch: 
     return wf
 
 
+def flux2_klein_image(s: dict, prompt: str, seed: int, width: int, height: int, batch: int = 1,
+                      loras: list[dict] | None = None, prefix: str = "studio/frame",
+                      init_image: str | None = None, denoise: float = 1.0) -> dict:
+    """FLUX.2 Klein Base workflow for Klein-trained character LoRAs."""
+    f = s["flux2_klein"]
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": f["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": f["clip"], "type": "flux2", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": f["vae"]}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
+        "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+    }
+    model = _loras(wf, ["1", 0], loras or [], 30)
+    if init_image:
+        wf.update({
+            "40": {"class_type": "LoadImage", "inputs": {"image": init_image}},
+            "41": {"class_type": "ImageScale", "inputs": {
+                "upscale_method": "lanczos", "width": int(width), "height": int(height),
+                "crop": "center", "image": ["40", 0]}},
+            "42": {"class_type": "VAEEncode", "inputs": {"pixels": ["41", 0], "vae": ["3", 0]}},
+        })
+        latent = ["42", 0]
+        if batch > 1:
+            wf["43"] = {"class_type": "RepeatLatentBatch", "inputs": {"samples": latent, "amount": int(batch)}}
+            latent = ["43", 0]
+        wf["8"] = {"class_type": "KSampler", "inputs": {
+            "seed": int(seed), "steps": int(f["steps"]), "cfg": float(f["guidance"]),
+            "sampler_name": f["sampler"], "scheduler": "simple", "denoise": float(denoise),
+            "model": model, "positive": ["4", 0], "negative": ["5", 0], "latent_image": latent}}
+        samples = ["8", 0]
+    else:
+        wf.update({
+            "6": {"class_type": "EmptyFlux2LatentImage", "inputs": {
+                "width": int(width), "height": int(height), "batch_size": int(batch)}},
+            "7": {"class_type": "Flux2Scheduler", "inputs": {
+                "steps": int(f["steps"]), "width": int(width), "height": int(height)}},
+            "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": f["sampler"]}},
+            "9": {"class_type": "CFGGuider", "inputs": {
+                "model": model, "positive": ["4", 0], "negative": ["5", 0], "cfg": float(f["guidance"])}},
+            "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
+            "11": {"class_type": "SamplerCustomAdvanced", "inputs": {
+                "noise": ["10", 0], "guider": ["9", 0], "sampler": ["8", 0],
+                "sigmas": ["7", 0], "latent_image": ["6", 0]}},
+        })
+        samples = ["11", 0]
+    wf["19"] = {"class_type": "VAEDecode", "inputs": {"samples": samples, "vae": ["3", 0]}}
+    wf["20"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": prefix, "images": ["19", 0]}}
+    return wf
+
+
 def zimage_image(s: dict, prompt: str, seed: int, width: int, height: int, batch: int = 1,
                  prefix: str = "studio/frame", init_image: str | None = None, denoise: float = 1.0) -> dict:
     z = s["zimage"]

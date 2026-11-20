@@ -195,6 +195,19 @@ def test_best_candidate_prefers_no_camera_gaze():
     assert jobs.best_candidate(cands) == 1 and jobs.best_candidate([{}]) is None
     assert jobs.best_candidate([{"check": {"matches": False, "looks_at_camera": False, "score": 9}}]) is None
     assert jobs.best_candidate([{"check": {"matches": True, "looks_at_camera": True, "score": 10}}]) is None
+    assert jobs.best_candidate([{"check": {"matches": True, "looks_at_camera": None,
+                                            "camera_gaze_allowed": False, "score": 10}}]) is None
+
+
+def test_identity_only_check_does_not_certify_camera_gaze(monkeypatch):
+    from studio import detect, jobs
+    monkeypatch.setattr(detect, "analyze", lambda path, refs: {"faces": []})
+    shot = {"characters": [{"id": "hakon"}]}
+    bible = {"characters": {"hakon": {"id": "hakon", "name": "Hakon", "refs": []}}}
+    check = jobs._identity_check("unused.png", shot, bible)
+    assert check["looks_at_camera"] is None
+    assert check["camera_gaze_allowed"] is False
+    assert jobs.best_candidate([{"check": check}]) is None
 
 
 def test_block_shots_adds_blocking_without_redesigning_and_retries_on_errors(sid, monkeypatch):

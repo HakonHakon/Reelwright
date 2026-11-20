@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import uuid
 
@@ -76,6 +77,22 @@ def loc_dir(sid: str, lid: str) -> str:
 
 def ep_dir(sid: str, eid: str) -> str:
     return os.path.join(series_dir(sid), "episodes", eid)
+
+
+def playground_dir(sid: str) -> str:
+    return os.path.join(series_dir(sid), "playground")
+
+
+def playground_renders(sid: str) -> list[dict]:
+    return _read(os.path.join(playground_dir(sid), "renders.json"), [])
+
+
+def add_playground_render(sid: str, render: dict) -> None:
+    path = os.path.join(playground_dir(sid), "renders.json")
+    with _lock:
+        rows = _read(path, [])
+        rows.insert(0, render)
+        _write(path, rows[:60])
 
 
 def _read(path: str, default=None):
@@ -195,7 +212,7 @@ def new_character(name: str, **fields) -> dict:
         "id": slug(name, "character"), "name": name, "trigger": "",
         "appearance": "", "outfits": {"default": ""}, "default_outfit": "default",
         "acting_notes": "", "never_change": [],
-        "image_lora": {"name": "", "strength": 0.9},
+        "image_lora": {"name": "", "strength": 0.9, "model_family": "flux1"},
         "video_lora": {"name": "", "strength": 0.8},
         "voice": {"file": "", "wpm": 140, "description": ""},
         "frame_source": "",          # "" = inherit series default
@@ -378,6 +395,59 @@ def list_episodes(sid: str) -> list[dict]:
     return out
 
 
+def _rewrite_prefix(node, old: str, new: str) -> None:
+    """Rewrite media paths that belong to one episode. Bible paths must be left alone."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                if old in value:
+                    node[key] = value.replace(old, new)
+            else:
+                _rewrite_prefix(value, old, new)
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            if isinstance(value, str):
+                if old in value:
+                    node[i] = value.replace(old, new)
+            else:
+                _rewrite_prefix(value, old, new)
+
+
+def _clone_ignore(_directory, names):
+    return [n for n in names if n in ("episode.json", "backups") or n.endswith(".tmp") or n.startswith(".deleted")]
+
+
+def clone_episode(sid: str, eid: str, title: str | None = None) -> dict:
+    """Copy an episode, including frames, takes and the cut, under a new id.
+
+    Paths that point into this episode are rewritten. Bible references are not.
+    Internal backups are not copied."""
+    with _lock:
+        src = get_episode(sid, eid)
+        if src is None:
+            raise KeyError(eid)
+        existing = {e["id"] for e in list_episodes(sid)}
+        title = (title or f"{src.get('title') or eid} copy").strip() or f"{eid} copy"
+        new_id = _unique(slug(title, "episode"), existing)
+        data = copy.deepcopy(src)
+        data["id"] = new_id
+        data["title"] = title
+        data["created"] = now()
+        old = f"series/{sid}/episodes/{eid}/"
+        new = f"series/{sid}/episodes/{new_id}/"
+        _rewrite_prefix(data, old, new)
+        _rewrite_prefix(data, old.replace("/", os.sep), new.replace("/", os.sep))
+        dst = ep_dir(sid, new_id)
+        try:
+            shutil.copytree(ep_dir(sid, eid), dst, ignore=_clone_ignore)
+            _write(os.path.join(dst, "episode.json"), data)
+        except Exception:
+            if os.path.isdir(dst):
+                shutil.rmtree(dst, ignore_errors=True)
+            raise
+        return data
+
+
 def create_episode(sid: str, title: str) -> dict:
     with _lock:
         existing = {e["id"] for e in list_episodes(sid)}
@@ -385,7 +455,7 @@ def create_episode(sid: str, title: str) -> dict:
         e = {
             "id": eid, "title": title or eid, "created": now(), "story": "",
             "scenes": [], "shots": [],
-            "gates": {"shots": False, "frames": False, "animatic": False, "takes": False},
+            "gates": {"shots": False, "previz": False, "frames": False, "animatic": False, "takes": False},
             "stats": {"spf": {}}, "music": {"file": "", "volume": 0.25, "duck": True},
             "outputs": {},
         }

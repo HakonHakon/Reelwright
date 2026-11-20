@@ -70,12 +70,24 @@ def _insert_lead(action: str) -> str:
     return f"Extreme close-up insert shot {level}filling the whole frame with {what}"
 
 
+def _ensure_image_lora_triggers(prompt: str, shot: dict, bible: dict) -> str:
+    """Always pair a selected image LoRA with its trained trigger in image prompts."""
+    missing = []
+    for character, _ in characters_in(shot, bible):
+        if not (character.get("image_lora") or {}).get("name"):
+            continue
+        token = (character.get("trigger") or "").strip()
+        if token and not re.search(rf"(?<!\w){re.escape(token)}(?!\w)", prompt):
+            missing.append(token)
+    return f"{', '.join(missing)}, {prompt}" if missing else prompt
+
+
 def image_prompt(shot: dict, bible: dict, composition: bool = False) -> str:
     """First-frame prompt: a still moment, composition first."""
     if shot.get("first_frame") is not None:
-        return blocking.image_prompt(shot, bible, composition=composition)
+        return _ensure_image_lora_triggers(blocking.image_prompt(shot, bible, composition=composition), shot, bible)
     if shot.get("image_prompt_override"):
-        return shot["image_prompt_override"]
+        return _ensure_image_lora_triggers(shot["image_prompt_override"], shot, bible)
     style = bible["style"]
     loc = bible["locations"].get(shot.get("location_id") or "")
     framing = (shot.get("framing") or "").lower()
@@ -116,7 +128,8 @@ def image_prompt(shot: dict, bible: dict, composition: bool = False) -> str:
         style.get("grade", ""),
         crop,               # repeated last: the shot's extra notes (wardrobe, cast) pull the whole figure back in
     ]
-    return ". ".join(l.strip().rstrip(".") for l in lines if l and l.strip()) + "."
+    prompt = ". ".join(l.strip().rstrip(".") for l in lines if l and l.strip()) + "."
+    return _ensure_image_lora_triggers(prompt, shot, bible)
 
 
 def motion_prompt(shot: dict, bible: dict, engine: str = "ltx") -> str:
@@ -130,13 +143,19 @@ def motion_prompt(shot: dict, bible: dict, engine: str = "ltx") -> str:
         # a character's video LoRA (applied to Wan renders) answers to its trigger word, e.g. "s4m"
         chars = [f"{_video_trigger(c)}, {t}" if _video_trigger(c) else t
                  for (c, _), t in zip(characters_in(shot, bible), chars)]
+        previz = shot.get("previz") or {}
+        previz_movement = (previz.get("movement") or "").strip()
         lines = [style.get("look", ""), "; ".join(chars), shot.get("action", ""),
+                 f"Movement: {previz_movement}" if previz_movement else "",
                  f"Camera: {shot.get('camera', '')}" if shot.get("camera") else "",
                  shot.get("motion_prompt_extra", "")]
         return ". ".join(l.strip().rstrip(".") for l in lines if l and l.strip()) + "."
 
     camera = (shot.get("camera") or "").strip() or "static camera"
     framing = (shot.get("framing") or "").lower()
+    # Previz movement: the approved 3D blockout describes what happens in the shot.
+    previz = shot.get("previz") or {}
+    previz_movement = (previz.get("movement") or "").strip()
     # The first frame already carries the room; repeating the full description makes LTX
     # re-compose the shot (a close-up drifts into a wide). Keep only light for close/derived shots.
     from_frame = shot.get("start_mode") in ("chain", "reuse", "punch_in") or framing in CLOSE_FRAMINGS
@@ -154,6 +173,7 @@ def motion_prompt(shot: dict, bible: dict, engine: str = "ltx") -> str:
         ("The same person stays on screen the whole shot; age, face, hair and clothing do not change"
          if chars else ""),
         f"Action: {shot.get('action', '')}" if shot.get("action") else "",
+        f"Movement: {previz_movement}" if previz_movement else "",
         f"Light: {setting}" if from_frame and setting else (f"Setting: {setting}" if setting else ""),
         style.get("look", ""),
     ]
@@ -176,7 +196,8 @@ def image_loras(shot: dict, bible: dict, second_scale: float) -> list[dict]:
         lora = c.get("image_lora") or {}
         if lora.get("name"):
             strength = float(lora.get("strength", 0.9)) * (1.0 if i == 0 else second_scale)
-            loras.append({"name": lora["name"], "strength": round(strength, 3)})
+            loras.append({"name": lora["name"], "strength": round(strength, 3),
+                          "model_family": lora.get("model_family", "flux1")})
     return loras
 
 

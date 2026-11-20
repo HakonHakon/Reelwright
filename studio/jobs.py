@@ -13,7 +13,7 @@ import uuid
 from collections import deque
 
 from . import comfy as comfy_mod
-from . import blocking, cloud, llm, media, planner, prompts, store, workflows, providers, lipsync_engine, lipsync
+from . import blocking, cloud, llm, media, planner, prompts, store, workflows, providers, lipsync_engine, lipsync, blender
 from . import settings as settings_mod
 
 
@@ -105,6 +105,28 @@ class Queue:
 
 
 QUEUE = Queue()
+
+
+def job_reference_rebuild(job, sid, eid, shot_ids=None, recover_prompt="", recover_shot=""):
+    """Keep the entire reference render in the shared, cancellable Studio queue."""
+    from . import reference_rebuild
+    try:
+        if recover_prompt:
+            reference_rebuild.recover_frame(job, sid, eid, recover_shot, recover_prompt)
+        reference_rebuild.render(job, sid, eid, shot_ids or None)
+        job.check()
+        if store.get_episode(sid, eid)["reference_rebuild"].get("status") == "rendered_pending_visual_review":
+            job.say("Checking rendered frame counts and original soundtrack...")
+            reference_rebuild.verify(job, sid, eid)
+    except Cancelled:
+        store.update_episode(sid, eid, lambda ep: ep["reference_rebuild"].update(status="cancelled"))
+        raise
+    except Exception as exc:
+        status = "cancelled" if job.cancel_flag else "error"
+        store.update_episode(sid, eid, lambda ep: ep["reference_rebuild"].update(status=status, error=str(exc)))
+        if job.cancel_flag:
+            raise Cancelled() from exc
+        raise
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
@@ -309,8 +331,10 @@ def _identity_check(path: str, sh, b) -> dict:
     if len(measured["faces"]) > len(cast):
         critical.append(f"detector: {len(measured['faces'])} faces, the shot has {len(cast)} people")
     vals = [v for v in best.values() if v > 0]
-    return {"matches": not critical, "score": max(0, 10 - 4 * len(critical)), "looks_at_camera": False,
-            "camera_gaze_allowed": True, "issues": critical, "critical": critical,
+    # A face-identity detector cannot establish eyeline. Leave gaze unverified so
+    # these candidates cannot be auto-selected before a composition check.
+    return {"matches": not critical, "score": max(0, 10 - 4 * len(critical)), "looks_at_camera": None,
+            "camera_gaze_allowed": False, "issues": critical + ["(minor) camera gaze not checked"], "critical": critical,
             "resemblance": round(sum(vals) / len(vals), 3) if vals else None, "detector": measured}
 
 
@@ -326,6 +350,12 @@ def qwen2511_prompt(sh, b, refs) -> str:
         name = c.get("name") or c["id"]
         lines.append(f"Image {i + 1} is {'another photo of ' if c['id'] in seen else 'a photo of '}{name}.")
         seen.add(c["id"])
+    cast = list({c["id"]: c for c, _ in prompts.characters_in(sh, b)}.values())
+    if cast:
+        names = ", ".join(c.get("name") or c["id"] for c in cast)
+        lines.append(f"Scene cast: exactly {len(cast)} {'person' if len(cast) == 1 else 'people'} ({names}); "
+                     "each appears once. Reference images supply identity only, not additional people or panels. "
+                     "Do not reproduce reference portraits, inset photos, duplicates or reflected copies.")
     lines.append("Create a brand-new cinematic film still: one single continuous photograph, not a collage, not a "
                  "split screen. Each person keeps the exact face, facial features, ears, hair, skin tone and age from "
                  "their photos and appears exactly once, in a new pose that fits the scene; do not copy a photo's pose, "
@@ -464,7 +494,13 @@ def _render_images(job, s, c, source, prompt, seed, n, loras, prefix, init_image
     if source == "qwen_refs":
         wf = workflows.qwen_edit_image(s, prompt, seed, w, h, n, ref_images or [], prefix)
     elif source == "flux_lora":
-        wf = workflows.flux_image(s, prompt, seed, w, h, n, loras, prefix, init_image, denoise)
+        families = {item.get("model_family", "flux1") for item in loras}
+        if len(families) > 1:
+            raise RuntimeError("A shot cannot mix Flux 1 and Flux 2 Klein image LoRAs.")
+        if families == {"flux2_klein"}:
+            wf = workflows.flux2_klein_image(s, prompt, seed, w, h, n, loras, prefix, init_image, denoise)
+        else:
+            wf = workflows.flux_image(s, prompt, seed, w, h, n, loras, prefix, init_image, denoise)
     else:
         wf = workflows.zimage_image(s, prompt, seed, w, h, n, prefix, init_image, denoise)
     res = c.run(wf, cancel=lambda: job.cancel_flag)
@@ -578,7 +614,9 @@ def job_character_sheet(job, sid, cid, source="flux_lora"):
         if cloud.is_image_source(source) else []
     loras = []
     if source == "flux_lora" and (ch.get("image_lora") or {}).get("name"):
-        loras = [{"name": ch["image_lora"]["name"], "strength": float(ch["image_lora"].get("strength", 0.9))}]
+        image_lora = ch["image_lora"]
+        loras = [{"name": image_lora["name"], "strength": float(image_lora.get("strength", 0.9)),
+                  "model_family": image_lora.get("model_family", "flux1")}]
     out_dir = os.path.join(store.char_dir(sid, cid), "sheet")
     if source == "qwen_refs":
         return _qwen_character_sheet(job, s, c, sid, ch, out_dir)
@@ -658,6 +696,135 @@ def job_location_plate(job, sid, lid, variant, source="zimage", count=4):
         {"file": store.rel(p), "variant": variant, "seed": seed, "source": source} for p in paths]
     store.save_location(sid, cur, bump=False)
     job.say("Done.")
+
+
+def job_playground(job, sid, body):
+    """Render one director's playground still, kept separate from episode frames and project canon."""
+    s, c = _ctx()
+    b = store.bible(sid)
+    source = str(body.get("source") or "")
+    if not cloud.is_image_source(source):
+        _gpu_prepare(job, s, c)
+    location_id = str(body.get("location_id") or "")
+    loc = b["locations"].get(location_id)
+    if not loc:
+        raise ValueError("Choose a location from this project's Bible")
+    selected = list(dict.fromkeys(str(x) for x in (body.get("character_ids") or [])))
+    chars = [b["characters"][cid] for cid in selected if cid in b["characters"]]
+    framing = str(body.get("framing") or "wide").strip()[:60]
+    camera = str(body.get("camera") or "eye level, static camera").strip()[:500]
+    camera = re.sub(r"\borbit\b", "azimuth (fixed viewpoint)", camera, flags=re.I)
+    action = str(body.get("action") or "").strip()[:3000]
+    if not action:
+        action = f"A cinematic still at {loc.get('name') or 'the selected location'}"
+    camera_state = body.get("camera_state") or {}
+    try:
+        camera_azimuth = float(camera_state.get("azimuth", 0))
+    except (TypeError, ValueError):
+        camera_azimuth = 0.0
+    az = math.radians(camera_azimuth)
+    target = camera_state.get("target") or [0, 0, 0]
+    try:
+        target_x, target_z = float(target[0]), float(target[2])
+    except (TypeError, ValueError, IndexError):
+        target_x, target_z = 0.0, 0.0
+
+    def frame_position(transform):
+        if not isinstance(transform, dict) or not isinstance(transform.get("position"), (list, tuple)):
+            return str(transform or "center")
+        try:
+            x, z = float(transform["position"][0]), float(transform["position"][2])
+        except (TypeError, ValueError, IndexError):
+            return "center"
+        x, z = x - target_x, z - target_z
+        horizontal = x * math.cos(az) - z * math.sin(az)
+        depth = x * math.sin(az) + z * math.cos(az)
+        side = "left" if horizontal < -0.8 else "right" if horizontal > 0.8 else "center"
+        plane = "foreground" if depth > 1.5 else "background" if depth < -1.5 else "midground"
+        rotation = transform.get("rotation") or [0, 0, 0]
+        try:
+            yaw = math.radians(float(rotation[1]) if isinstance(rotation, (list, tuple)) else 0)
+            facing_dot = math.sin(yaw) * math.sin(az) + math.cos(yaw) * math.cos(az)
+            facing = ", facing camera" if facing_dot > 0.45 else ", turned away from camera" if facing_dot < -0.45 else ", in profile"
+        except (TypeError, ValueError, IndexError):
+            facing = ""
+        return f"{side} {plane}{facing}"
+
+    transforms = body.get("positions") or {}
+    shot = {"location_id": location_id, "time_of_day": str(body.get("time_of_day") or ""),
+            "framing": framing, "camera": camera, "action": action,
+            "characters": [{"id": ch["id"], "position": frame_position(transforms.get(ch["id"])),
+                            "outfit": ch.get("default_outfit") or "default"} for ch in chars],
+            "image_prompt_extra": str(body.get("extra") or "")[:1500]}
+    props = body.get("scene_props") or []
+    if props:
+        prop_lines = []
+        for prop in props[:20]:
+            prop_lines.append(f"{str(prop.get('name') or 'prop')[:80]} at {frame_position(prop)}")
+        shot["image_prompt_extra"] = ". ".join(x for x in [shot["image_prompt_extra"], "Scene objects: " + "; ".join(prop_lines)] if x)
+    prompt = prompts.image_prompt(shot, b)
+    if camera:
+        prompt = f"{framing.capitalize()} shot. Camera: {camera}. " + prompt
+    refs = []
+    for ch in chars:
+        for rel in ch.get("refs") or []:
+            if os.path.isfile(store.abs_media(rel)):
+                refs.append(rel)
+                break
+    plates = loc.get("plates") or {}
+    plate = plates.get(shot["time_of_day"] or "") or next(iter(plates.values()), "")
+    if plate and os.path.isfile(store.abs_media(plate)):
+        refs.append(plate)
+    if cloud.is_image_source(source) and refs:
+        max_refs = cloud.max_refs(s, source)
+        refs = refs[:max_refs]
+        groups = [(ch.get("name") or ch["id"], 1, "views") for ch in chars if any(r in refs for r in (ch.get("refs") or []))]
+        prompt = _refs_prompt(prompt, groups, bool(plate and plate in refs))
+    seed = _seed()
+    job.say(f"Rendering director's test frame ({source})...")
+    ref_images = None
+    if source == "qwen_2511":
+        max_refs = int(s["qwen_2511"].get("max_refs", 3))
+        has_plate = bool(plate and os.path.isfile(store.abs_media(plate)))
+        reference_limit = max_refs - (1 if has_plate and len(chars) < max_refs else 0)
+        roles = {role["id"]: role for role in shot["characters"]}
+        found = []
+        for ch in chars:
+            if len(found) >= reference_limit:
+                break
+            found.extend(_qwen2511_refs({**shot, "characters": [roles[ch["id"]]]}, b, 1)[:1])
+        if not found:
+            raise ValueError("Qwen Image 2511 needs a selected character with a usable reference photo")
+        use_plate = has_plate and len(found) < max_refs
+        found = found[:max_refs - (1 if use_plate else 0)]
+        prompt = qwen2511_prompt(shot, b, found)
+        if camera:
+            prompt = f"{framing.capitalize()} shot. Camera: {camera}. " + prompt
+        local_refs = [rel for _, rel in found] + ([plate] if use_plate else [])
+        if use_plate:
+            prompt += f" Image {len(found) + 1} supplies only the location and layout; ignore any people in that reference."
+        names = [c.upload(store.abs_media(rel), f"playground_2511_{uuid.uuid4().hex[:8]}{os.path.splitext(rel)[1]}")
+                 for rel in local_refs]
+        job.say(f"Using {len(found)} character reference(s){' and a location plate' if use_plate else ''} with Qwen Image 2511...")
+        items = c.run(workflows.qwen2511_image(s, prompt, seed, s["image"]["width"], s["image"]["height"],
+                                               1, names, f"playground/{sid}"),
+                      cancel=lambda: job.cancel_flag)["images"]
+    elif source == "qwen_refs":
+        if not refs:
+            raise ValueError("Qwen Edit needs a saved character reference photo or an approved location plate")
+        refs = refs[:int(s["qwen_edit"].get("max_refs", 3))]
+        groups = [(ch.get("name") or ch["id"], 1, "views") for ch in chars if any(r in refs for r in (ch.get("refs") or []))]
+        prompt = _refs_prompt(prompt, groups, bool(plate and plate in refs))
+        ref_images = [c.upload(store.abs_media(rel), f"playground_{uuid.uuid4().hex[:8]}{os.path.splitext(rel)[1]}") for rel in refs]
+    if source != "qwen_2511":
+        items = _render_images(job, s, c, source, prompt, seed, 1, [], f"playground/{sid}",
+                               ref_files=refs if cloud.is_image_source(source) else None, ref_images=ref_images)
+    paths = _save_outputs(c, items, store.playground_dir(sid), "render_")
+    row = {"file": store.rel(paths[0]), "prompt": prompt, "source": source, "seed": seed,
+           "character_ids": [ch["id"] for ch in chars], "location_id": location_id,
+           "created": store.now()}
+    store.add_playground_render(sid, row)
+    job.say("Saved the test render to this project's Playground gallery.")
 
 
 # ── Episode planning ────────────────────────────────────────────────────
@@ -1133,6 +1300,33 @@ def job_frames(job, sid, eid, shot_ids=None, force=False, source_override="", ch
     if rejected:
         raise RuntimeError(f"No composition passed for {len(rejected)} shot(s): {', '.join(rejected)}. Their layouts "
                            "are kept for review; every other shot rendered. Fix their blocking, then render them again.")
+
+
+def job_previz_blender(job, sid, eid, shot_id, seconds=6, fps=24, out_path=""):
+    """Render a Blender previz animation for one shot from its approved blockout state."""
+    s, c = _ctx()
+    s = settings_mod.for_episode(s, store.get_episode(sid, eid))
+    b = store.bible(sid)
+    e = store.get_episode(sid, eid)
+    shot = store.find_shot(e, shot_id)
+    if not out_path:
+        out_path = os.path.join(store.ep_dir(sid, eid), "previz", f"{shot_id}.mp4")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cfg = s.get("blender") or {}
+    client = blender.BlenderMCPClient(host=cfg.get("host", "127.0.0.1"), port=int(cfg.get("port", 9876)))
+    if not client.alive():
+        raise blender.BlenderMCPError(f"Blender MCP not reachable at {cfg.get('host', '127.0.0.1')}:{cfg.get('port', 9876)}. "
+                                      "Start Blender with the BlenderMCP server first.")
+    job.say(f"Blender MCP alive. Rendering previz for {shot_id} ({seconds}s @ {fps}fps)...")
+    result = blender.previz_blender(client, shot, b, out_path, fps=fps, seconds=seconds)
+    def apply(ep):
+        shot = store.find_shot(ep, shot_id)
+        shot["previz"] = dict(shot.get("previz") or {})
+        shot["previz"]["blender_file"] = store.rel(out_path)
+        shot["previz"]["blender_frames"] = result["frames"]
+        shot["previz"]["blender_seconds"] = result["seconds"]
+    store.update_episode(sid, eid, apply)
+    job.say(f"Blender previz rendered: {out_path}")
 
 
 def _scene_master(e, sh):

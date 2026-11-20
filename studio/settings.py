@@ -45,6 +45,24 @@ DEFAULTS = {
         "scheduler": "simple",
         "second_lora_scale": 0.75,
     },
+    "flux2_klein": {
+        "unet": "flux-2-klein-base-4b.safetensors",
+        "clip": "qwen_3_4b.safetensors",
+        "vae": "flux2-vae.safetensors",
+        "steps": 30,
+        "sampler": "euler",
+        "guidance": 1.0,
+    },
+    "image_lora_presets": {
+        "maryam_movie_actor_v1.safetensors": {
+            "trigger": "mrvxwoman",
+            "model_family": "flux2_klein",
+        },
+        "maryam_movie_actor_v2.safetensors": {
+            "trigger": "mrvxwoman",
+            "model_family": "flux2_klein",
+        },
+    },
     "zimage": {
         "unet": "z_image_turbo_bf16.safetensors",
         "clip": "qwen_3_4b.safetensors",
@@ -142,6 +160,8 @@ DEFAULTS = {
     # clips (SyncNet confidence +33..72%) at the same speed; more steps cost ~60% more time for little gain.
     "lipsync": {"steps": 20, "guidance": 2.0, "seed": 1247},
     "loudness_lufs": -16,
+    # Blender MCP (previz). The BlenderMCP server runs inside Blender on this PC.
+    "blender": {"host": "127.0.0.1", "port": 9876, "fps": 24, "seconds": 6},
     "continuity": {
         "punch_in_denoise": 0.32,   # low: keep the master's face, age and clothes; only re-sharpen
         # LTX tends to hard-cut to a new wide shot ~1 s into close-ups. Re-using the first frame as the

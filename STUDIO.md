@@ -11,8 +11,7 @@ Uses the repo .venv plus your ComfyUI and Ollama.
 ## Workflow
 1. **Series** - create one per show (e.g. "Sam"). The bible is shared by all its episodes.
 2. **Style & props** - look, colour grade, default first-frame source, default video engine.
-3. **Characters** - appearance (locked text), outfits, trigger word, Flux image LoRA (+ strength),
-   optional Wan video LoRA, 5 s voice sample, speaking rate. Render a character sheet and
+3. **Characters** - appearance (locked text), outfits, trigger word, image LoRA (+ strength and matching base family: FLUX.1 or FLUX.2 Klein Base 4B). Registered image LoRAs auto-set their trigger and base. Add an optional Wan video LoRA, 5 s voice sample, and speaking rate. Render a character sheet and
    approve the best images as references.
 4. **Locations** - description, time-of-day variants, ambience; render or upload establishing plates.
 5. **Episode -> Story** - paste a script or prose. "Draft bible from story" creates draft characters

@@ -29,6 +29,53 @@ def project(client):
     return sid, eid, sh
 
 
+def test_clone_episode_copies_story_shots_and_media(client):
+    sid, eid, _ = project(client)
+    frame = f"series/{sid}/episodes/{eid}/frames/S01_SH01/c001.png"
+    bible_ref = f"series/{sid}/bible/characters/sam/refs/a.png"
+
+    def attach(e):
+        e["story"] = "Once upon"
+        e["title"] = "Pilot"
+        e["gates"]["shots"] = True
+        e["shots"][0]["frame"]["candidates"][0]["file"] = frame
+        e["shots"][0]["frame"]["candidates"][0]["refs"] = [bible_ref]
+        e["outputs"] = {"final": f"series/{sid}/episodes/{eid}/out/final.mp4"}
+        e["dialogue_takes"] = {"L1": {"file": f"series/{sid}/episodes/{eid}/uploads/line.wav", "text": "Hi"}}
+
+    store.update_episode(sid, eid, attach)
+    src = store.ep_dir(sid, eid)
+    os.makedirs(os.path.join(src, "frames", "S01_SH01"), exist_ok=True)
+    os.makedirs(os.path.join(src, "backups"), exist_ok=True)
+    with open(os.path.join(src, "frames", "S01_SH01", "c001.png"), "wb") as f:
+        f.write(b"png")
+    with open(os.path.join(src, "backups", "old.json"), "w", encoding="utf-8") as f:
+        f.write("{}")
+
+    copied = client.post(f"/api/s/{sid}/e/{eid}/clone", json={"title": "Pilot copy"}).json()
+    assert copied["id"] != eid and copied["title"] == "Pilot copy" and copied["story"] == "Once upon"
+    assert copied["gates"]["shots"] is True
+    assert copied["shots"][0]["frame"]["candidates"][0]["file"] == f"series/{sid}/episodes/{copied['id']}/frames/S01_SH01/c001.png"
+    assert copied["shots"][0]["frame"]["candidates"][0]["refs"] == [bible_ref]
+    assert copied["outputs"]["final"] == f"series/{sid}/episodes/{copied['id']}/out/final.mp4"
+    assert copied["dialogue_takes"]["L1"]["file"].endswith(f"{copied['id']}/uploads/line.wav")
+    assert os.path.isfile(os.path.join(store.ep_dir(sid, copied["id"]), "frames", "S01_SH01", "c001.png"))
+    assert not os.path.exists(os.path.join(store.ep_dir(sid, copied["id"]), "backups"))
+    assert store.get_episode(sid, eid)["id"] == eid
+    again = client.post(f"/api/s/{sid}/e/{eid}/clone", json={"title": "Pilot copy"})
+    assert again.status_code == 200 and again.json()["id"] not in (eid, copied["id"])
+    assert client.post(f"/api/s/{sid}/e/missing/clone", json={}).status_code == 404
+    listed = client.get(f"/api/s/{sid}").json()["episodes"]
+    assert {e["id"] for e in listed} >= {eid, copied["id"], again.json()["id"]}
+
+
+def test_clone_rejects_active_job(client, monkeypatch):
+    sid, eid, _ = project(client)
+    monkeypatch.setattr(jobs.QUEUE, "list", lambda: [{"status": "running", "params": {"sid": sid, "eid": eid}}])
+    assert client.post(f"/api/s/{sid}/e/{eid}/clone", json={"title": "Copy"}).status_code == 409
+    assert [e["id"] for e in store.list_episodes(sid)] == [eid]
+
+
 def test_project_and_episode_deletion_is_recoverable(client):
     sid, eid, _ = project(client)
     base = f"/api/s/{sid}"
@@ -241,6 +288,26 @@ def test_status_checks_shot_overrides_and_selected_missing_models(client, monkey
     assert client.get('/api/status').json()['missing'] == [settings.DEFAULTS['wan']['high_lightning']]
     store.update_episode(sid, eid, lambda e: e['shots'][0].update(frame_source='flux_lora'))
     assert set(client.get('/api/status').json()['missing']) == set(missing)
+
+
+def test_status_uses_klein_models_for_klein_character_lora(client):
+    sid = client.post("/api/series", json={"name": "Klein project"}).json()["id"]
+    character = client.post(f"/api/s/{sid}/characters", json={"name": "Maryam"}).json()
+    client.put(
+        f"/api/s/{sid}/characters/{character['id']}",
+        json={
+            "frame_source": "flux_lora",
+            "image_lora": {"name": "maryam_movie_actor_v2.safetensors"},
+        },
+    )
+
+    from studio.app import _required_model_options
+    required = _required_model_options(settings.load())
+    assert settings.DEFAULTS["flux2_klein"]["unet"] in required[("UNETLoader", "unet_name")]
+    assert settings.DEFAULTS["flux2_klein"]["clip"] in required[("CLIPLoader", "clip_name")]
+    assert "maryam_movie_actor_v2.safetensors" in required[("LoraLoaderModelOnly", "lora_name")]
+    assert settings.DEFAULTS["flux"]["unet"] not in required.get(("UNETLoader", "unet_name"), set())
+    assert ("DualCLIPLoader", "clip_name1") not in required
 
 
 def test_local_h3_workflow_has_native_audio_and_end_frame(client):
@@ -691,3 +758,69 @@ def test_body_parts_only_shots_do_not_describe_the_face():
     p = prompts.image_prompt(shot, b)
     assert "brown eyes" not in p and "Hirad" not in p and "no face" in p
     assert "brown eyes" in prompts.image_prompt({**shot, "framing": "wide"}, b)
+
+
+def test_flux2_klein_character_lora_routes_to_compatible_graph():
+    from studio import prompts, workflows
+
+    lora = {"name": "maryam_movie_actor_v1.safetensors", "strength": 0.9,
+            "model_family": "flux2_klein"}
+    bible = {"characters": {"maryam": {"id": "maryam", "image_lora": lora}}}
+    shot = {"characters": [{"id": "maryam"}]}
+    assert prompts.image_loras(shot, bible, 0.75) == [lora]
+
+    graph = workflows.flux2_klein_image(
+        settings.DEFAULTS, "mrvxwoman portrait", 123, 1024, 1024, loras=[lora])
+    assert graph["1"]["inputs"]["unet_name"] == "flux-2-klein-base-4b.safetensors"
+    assert graph["2"]["inputs"] == {
+        "clip_name": "qwen_3_4b.safetensors", "type": "flux2", "device": "default"
+    }
+    assert graph["30"]["class_type"] == "LoraLoaderModelOnly"
+    assert graph["30"]["inputs"]["lora_name"] == lora["name"]
+    assert graph["11"]["class_type"] == "SamplerCustomAdvanced"
+
+    edit_graph = workflows.flux2_klein_image(
+        settings.DEFAULTS, "mrvxwoman portrait", 123, 1024, 1024,
+        loras=[lora], init_image="frame.png", denoise=0.3)
+    assert edit_graph["42"]["class_type"] == "VAEEncode"
+    assert edit_graph["8"]["inputs"]["denoise"] == 0.3
+
+
+def test_registered_image_lora_selects_its_trigger_and_base_family(client):
+    sid = client.post("/api/series", json={"name": "Other project"}).json()["id"]
+    character = client.post(f"/api/s/{sid}/characters", json={"name": "Maryam"}).json()
+    saved = client.put(
+        f"/api/s/{sid}/characters/{character['id']}",
+        json={
+            "image_lora": {
+                "name": "maryam_movie_actor_v2.safetensors",
+                "strength": 0.85,
+                "model_family": "flux1",
+            },
+            "trigger": "wrong_manual_token",
+        },
+    ).json()
+    assert saved["trigger"] == "mrvxwoman"
+    assert saved["image_lora"] == {
+        "name": "maryam_movie_actor_v2.safetensors",
+        "strength": 0.85,
+        "model_family": "flux2_klein",
+    }
+
+
+def test_image_lora_trigger_is_inserted_even_for_prompt_overrides_and_inserts():
+    from studio import prompts
+    character = {
+        "id": "maryam", "name": "Maryam", "trigger": "mrvxwoman",
+        "image_lora": {"name": "maryam_movie_actor_v1.safetensors"},
+        "appearance": "dark wavy hair", "outfits": {"default": "dark dress"},
+    }
+    bible = {"style": {}, "locations": {}, "characters": {"maryam": character}}
+    override = {"characters": [{"id": "maryam"}], "image_prompt_override": "A medium shot in a garden."}
+    assert prompts.image_prompt(override, bible).startswith("mrvxwoman, ")
+    insert = {
+        "characters": [{"id": "maryam"}], "framing": "close-up",
+        "action": "Only her hands are visible, holding a cup.",
+    }
+    prompt = prompts.image_prompt(insert, bible)
+    assert "mrvxwoman" in prompt and "no face" in prompt

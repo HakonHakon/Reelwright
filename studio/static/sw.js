@@ -1,6 +1,6 @@
 "use strict";
-const CACHE = "reelwright-mobile-v2";
-const SHELL = ["/static/offline.html", "/static/studio.css", "/static/studio.js", "/static/timeline.js", "/static/episode.js", "/static/app-install.js", "/static/manifest.webmanifest", "/static/icons/icon-192.png", "/static/icons/icon-512.png", "/static/icons/apple-touch-icon.png"];
+const CACHE = "reelwright-mobile-v12";
+const SHELL = ["/static/offline.html", "/static/studio.css", "/static/studio.js", "/static/timeline.js", "/static/episode.js", "/static/app-install.js", "/static/playground3d.js", "/static/vendor/three.module.js", "/static/vendor/three.core.js", "/static/manifest.webmanifest", "/static/icons/icon-192.png", "/static/icons/icon-512.png", "/static/icons/apple-touch-icon.png"];
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });

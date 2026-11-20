@@ -28,6 +28,7 @@ LORAS = ["Sam/ohwx_sam_flux1dev_2500.safetensors", "Maryam flux1/ohwx maryam 275
          "maryam_wan.safetensors", settings.DEFAULTS["wan"]["high_lightning"],
          settings.DEFAULTS["wan"]["low_lightning"], settings.DEFAULTS["ltx"]["id_lora"],
          settings.DEFAULTS["qwen_edit"]["lora"],
+         "maryam_movie_actor_v1.safetensors",
          "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
          "gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors"]
 MODEL_KEYS = ("_name", "clip_name1", "clip_name2", "text_encoder")
@@ -38,6 +39,11 @@ def build_object_info():
     graphs = [
         workflows.flux_image(s, "p", 1, 64, 64, 2, [{"name": LORAS[0], "strength": 1}], init_image="x.png"),
         workflows.flux_image(s, "p", 1, 64, 64, 2),
+        workflows.flux2_klein_image(
+            s, "p", 1, 64, 64, 1,
+            [{"name": "maryam_movie_actor_v1.safetensors", "strength": 0.9, "model_family": "flux2_klein"}],
+        ),
+        workflows.flux2_klein_image(s, "p", 1, 64, 64, 1, init_image="x.png", denoise=0.3),
         workflows.zimage_image(s, "p", 1, 64, 64, 2),
         workflows.qwen_edit_image(s, "p", 1, 64, 64, 2, ["a.png", "b.png"]),
         workflows.ltx_i2v(s, "p", "a.png", 9, 1, end_frame="b.png", voice_audio="v.wav"),

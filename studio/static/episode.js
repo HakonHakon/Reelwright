@@ -2,8 +2,15 @@
 "use strict";
 
 const TABS = [["story", "1. Story", null, "Story"], ["shots", "2. Shot list", "shots", "Shots"], ["frames", "3. First frames", "frames", "Frames"],
-  ["animatic", "4. Animatic", "animatic", "Animatic"], ["takes", "5. Takes", "takes", "Takes"], ["cut", "6. Cut", null, "Cut"]];
+  ["animatic", "4. Animatic", "animatic", "Animatic"], ["previz", "5. Previz", "previz", "Previz"], ["takes", "6. Takes", "takes", "Takes"], ["cut", "7. Cut", null, "Cut"]];
 const FRAMINGS = ["extreme wide", "wide", "full", "medium wide", "medium", "medium close-up", "close-up", "extreme close-up", "over-the-shoulder", "two-shot", "insert"];
+const POSITIONS = ["left", "right", "center", "background", "foreground"];
+const CAMERAS = ["static", "static, eye level", "static, low angle", "slow push-in", "slow push-in, eye level", "slow tilt up", "tracking", "handheld"];
+const FF_ENUMS = {
+  depth: ["foreground", "midground", "background"],
+  space: ["inside", "outside", "other"],
+  visibility: ["full_body", "upper_body", "partial", "back_of_head", "silhouette", "offscreen"],
+};
 
 async function viewEpisode(view, sid, eid, tab) {
   const [d, e] = await Promise.all([getSeries(sid), GET(`/api/s/${sid}/e/${eid}`)]);
@@ -12,14 +19,14 @@ async function viewEpisode(view, sid, eid, tab) {
   view.innerHTML = `<div id="ep-head"></div><div id="tab"></div>`;
   const paintHead = () => {
     const e = ctx.e, g = e.gates || {};
-    const done = { story: e.shots.length > 0 || (e.scenes || []).length > 0, shots: !!g.shots, frames: !!g.frames, animatic: !!g.animatic, takes: !!g.takes, cut: !!(e.outputs && e.outputs.final) };
+    const done = { story: e.shots.length > 0 || (e.scenes || []).length > 0, shots: !!g.shots, previz: !!g.previz, frames: !!g.frames, animatic: !!g.animatic, takes: !!g.takes, cut: !!(e.outputs && e.outputs.final) };
     const nDone = Object.values(done).filter(Boolean).length;
     $("#ep-head").innerHTML = `
     <div class="page-head"><div class="grow"><h1>${esc(e.title)}</h1>
-      <div class="row sub"><span class="chip">${e.shots.length} shots</span><span class="chip">runtime ${fmtSec(e._runtime)}</span><span class="chip">est. render ${fmtSec(e._estimate_s)} at ${e._settings.takes_per_shot} takes/shot</span><span class="chip ${nDone === 6 ? "good" : "accent"}">${nDone}/6 stages done</span></div></div></div>
+      <div class="row sub"><span class="chip">${e.shots.length} shots</span><span class="chip">runtime ${fmtSec(e._runtime)}</span><span class="chip">est. render ${fmtSec(e._estimate_s)} at ${e._settings.takes_per_shot} takes/shot</span><span class="chip ${nDone === 7 ? "good" : "accent"}">${nDone}/7 stages done</span></div></div></div>
     <nav class="tabs" aria-label="Episode stages">${TABS.map(([k, label, gate, short], i) => `<a href="#/s/${sid}/e/${eid}/${k}" class="${k === tab ? "on" : ""} ${done[k] ? "done" : ""}" ${k === tab ? 'aria-current="page"' : ""}><span class="n">${done[k] ? ic("check") : i + 1}</span><span class="tl">${label.replace(/^\d+\.\s*/, "")}</span><span class="ts">${short}</span>${gate && g[gate] ? `<span class="gate chip good">approved</span>` : ""}</a>`).join("")}</nav>
-    <div class="progress"><div style="width:${Math.round((nDone / 6) * 100)}%"></div></div>`;
-    pageMenu($("#ep-head"), [["Delete episode…", async () => {
+    <div class="progress"><div style="width:${Math.round((nDone / 7) * 100)}%"></div></div>`;
+    pageMenu($("#ep-head"), [["Clone episode…", () => cloneEpisode(sid, eid, e.title)], ["Delete episode…", async () => {
       if (await ask(`Delete episode ${ctx.e.title}? Files are kept in a .deleted folder.`, "Delete", true)) {
         await api("DELETE", ctx.base); location.hash = `#/s/${sid}`;
       }
@@ -28,7 +35,7 @@ async function viewEpisode(view, sid, eid, tab) {
   paintHead();
   document.body.classList.add("has-stepper");  // phones: the stage stepper takes the bottom bar
   const el = $("#tab");
-  const fn = { story: tabStory, shots: tabShots, frames: tabFrames, animatic: tabAnimatic, takes: tabTakes, cut: tabCut }[tab] || tabStory;
+  const fn = { story: tabStory, shots: tabShots, frames: tabFrames, animatic: tabAnimatic, previz: tabPreviz, takes: tabTakes, cut: tabCut }[tab] || tabStory;
   await fn(el, ctx);
   const bulkRoot = () => (tab === "takes" ? $("#take-library", el) : el);
   const setupBulk = () => {
@@ -42,7 +49,7 @@ async function viewEpisode(view, sid, eid, tab) {
   setupBulk();
   // Soft reload: fetch the episode again and repaint only what changed. The page, the scroll position, open panels,
   // playing videos and the timeline editor (with its undo history) stay as they are.
-  if (["frames", "takes", "animatic"].includes(tab)) {
+  if (["frames", "takes", "animatic", "previz"].includes(tab)) {
     let chain = Promise.resolve();
     const run = async () => {
       let fresh;
@@ -190,6 +197,103 @@ async function tabShots(el, ctx) {
       <span class="sr-sum-action">${esc(sh.action || "No action yet")}</span>`;
   };
   const sel = (f, i, v, opts, labels) => `<select data-i="${i}" data-f="${f}">${opts.map((o, k) => `<option value="${esc(o)}" ${o === (v || "") ? "selected" : ""}>${esc(labels ? labels[k] : o || "inherit")}</option>`).join("")}</select>`;
+  const known = (f, i, value, values, labels) => {
+    const vals = [...values], labs = labels ? [...labels] : vals.map((x) => x);
+    if (value && !vals.includes(value)) { vals.push(value); labs.push(String(value)); }
+    return vals.length ? sel(f, i, value, vals, labs) : `<input data-i="${i}" data-f="${f}" value="${esc(value)}">`;
+  };
+  const sceneIdsFor = (sh) => {
+    const ids = ctx.e.scenes.map((s) => s.id);
+    if (sh.scene_id && !ids.includes(sh.scene_id)) ids.unshift(sh.scene_id);
+    return ids.length ? ids : [sh.scene_id || "S01"];
+  };
+  const sceneField = (sh, i) => ctx.e.scenes.length
+    ? known("scene_id", i, sh.scene_id, sceneIdsFor(sh), sceneIdsFor(sh).map((id) => {
+        const sc = ctx.e.scenes.find((s) => s.id === id);
+        return sc?.summary ? `${id} · ${sc.summary}` : id;
+      }))
+    : `<input data-i="${i}" data-f="scene_id" value="${esc(sh.scene_id)}">`;
+  const todValues = (sh) => {
+    const vals = Object.keys(ctx.locs[sh.location_id]?.variants || {});
+    const sc = ctx.e.scenes.find((s) => s.id === sh.scene_id);
+    if (sc?.time_of_day && !vals.includes(sc.time_of_day)) vals.push(sc.time_of_day);
+    if (sh.time_of_day && !vals.includes(sh.time_of_day)) vals.push(sh.time_of_day);
+    return vals.length ? vals : ["day"];
+  };
+  const cameraValues = () => [...new Set([...CAMERAS, ...shots.map((s) => s.camera).filter((c) => c && c !== "__custom__")])];
+  const cameraField = (sh, i) => {
+    const vals = cameraValues();
+    const custom = !!sh._camera_custom || (sh.camera && !vals.includes(sh.camera));
+    return known("camera", i, custom ? "__custom__" : sh.camera, ["", ...vals, "__custom__"], ["—", ...vals, "Custom…"])
+      + (custom ? `<input data-i="${i}" data-f="camera_text" value="${esc(sh.camera)}" placeholder="Describe the camera">` : "");
+  };
+  const castEditor = (sh, i) => {
+    const used = new Set((sh.characters || []).map((c) => c.id));
+    const addable = Object.keys(ctx.chars).filter((id) => !used.has(id));
+    const rows = (sh.characters || []).map((c, k) => {
+      const ch = ctx.chars[c.id];
+      const outfits = Object.keys(ch?.outfits || {});
+      if (!outfits.length) outfits.push(ch?.default_outfit || c.outfit || "default");
+      return `<div class="pick-row"><span class="pick-name">${esc(charName(ctx, c.id))}</span>
+        ${known(`cast.${k}.position`, i, c.position || "center", POSITIONS)}
+        ${known(`cast.${k}.outfit`, i, c.outfit || ch?.default_outfit || outfits[0], outfits)}
+        <button type="button" class="link danger" data-cast-del="${i}" data-k="${k}">remove</button></div>`;
+    }).join("");
+    const add = addable.length
+      ? `<select data-cast-add="${i}" aria-label="Add character"><option value="">Add character…</option>${addable.map((id) => `<option value="${esc(id)}">${esc(charName(ctx, id))}</option>`).join("")}</select>`
+      : (Object.keys(ctx.chars).length ? `<span class="muted small">Everyone in the bible is already in this shot.</span>` : `<span class="muted small">Add characters to the project bible first.</span>`);
+    return `<div class="pick-list">${rows}${add}</div>`;
+  };
+  const speakerIds = (line) => {
+    const ids = Object.keys(ctx.chars);
+    if (line?.speaker && !ids.includes(line.speaker)) ids.unshift(line.speaker);
+    return ids;
+  };
+  const dlgEditor = (sh, i) => {
+    const rows = (sh.dialogue || []).map((d, k) => {
+      const ids = speakerIds(d);
+      return `<div class="pick-row dlg">
+        ${ids.length ? known(`dlg.${k}.speaker`, i, d.speaker, ids, ids.map((id) => charName(ctx, id))) : `<input data-i="${i}" data-f="dlg.${k}.speaker" value="${esc(d.speaker)}" placeholder="Speaker">`}
+        <input data-i="${i}" data-f="dlg.${k}.line" value="${esc(d.line)}" placeholder="Line" aria-label="Line">
+        <input data-i="${i}" data-f="dlg.${k}.emotion" value="${esc(d.emotion || "")}" placeholder="Acting direction" aria-label="Acting direction">
+        <button type="button" class="link danger" data-dlg-del="${i}" data-k="${k}">remove</button></div>`;
+    }).join("");
+    return `<div class="pick-list">${rows}<button type="button" class="link" data-dlg-add="${i}">Add line</button></div>`;
+  };
+  const ffControl = (sh, i, kind, index, key, value) => {
+    const path = `first_frame.${kind}.${index}.${key}`;
+    if (kind === "subjects" && FF_ENUMS[key]) return known(path, i, value, FF_ENUMS[key], FF_ENUMS[key].map((v) => v.replaceAll("_", " ")));
+    if (kind === "subjects" && key === "gaze_target") {
+      const subjects = sh.first_frame.subjects || [], props = sh.first_frame.props || [];
+      const vals = [...subjects.map((s) => s.id), ...props.map((p) => p.id), "offscreen", "camera"];
+      const labels = [...subjects.map((s) => charName(ctx, s.id)), ...props.map((p) => (p.id || "").replaceAll("_", " ")), "offscreen", "camera"];
+      return known(path, i, value, vals, labels);
+    }
+    if (kind === "props" && key === "holder") {
+      const subjects = sh.first_frame.subjects || [];
+      return known(path, i, value || "none", [...subjects.map((s) => s.id), "none"], [...subjects.map((s) => charName(ctx, s.id)), "none"]);
+    }
+    if (kind === "props" && key === "id") {
+      const ids = (ctx.d.bible.props || []).map((p) => p.id).filter(Boolean);
+      return ids.length ? known(path, i, value, ids) : `<input data-i="${i}" data-f="${path}" value="${esc(value)}">`;
+    }
+    return `<input data-i="${i}" data-f="${path}" value="${esc(value ?? "")}">`;
+  };
+  const blankSubject = (id) => ({
+    id, position: "center", depth: "midground", space: "inside", zone: "center of frame", pose: "standing",
+    facing: "toward camera", gaze_target: "camera", gaze_direction: "forward", expression: "neutral",
+    visibility: "full_body", wardrobe_state: "as dressed",
+  });
+  const syncCast = (sh) => {
+    if (!sh.first_frame) return;
+    const ids = (sh.characters || []).map((c) => c.id);
+    const byId = Object.fromEntries((sh.first_frame.subjects || []).map((s) => [s.id, s]));
+    sh.first_frame.subjects = ids.map((id) => byId[id] || blankSubject(id));
+    const propIds = new Set((sh.first_frame.props || []).map((p) => p.id));
+    const targets = new Set([...ids, ...propIds, "offscreen", "camera"]);
+    for (const subject of sh.first_frame.subjects) if (!targets.has(subject.gaze_target)) subject.gaze_target = "camera";
+    for (const prop of sh.first_frame.props || []) if (prop.holder !== "none" && !ids.includes(prop.holder)) prop.holder = "none";
+  };
   const render = () => {
     let lastScene = null;
     const sceneById = Object.fromEntries(ctx.e.scenes.map((s) => [s.id, s]));
@@ -202,7 +306,7 @@ async function tabShots(el, ctx) {
       <div class="list-bar"><button id="fold-all">${open.size ? "Collapse all" : "Expand all"}</button>
         ${ctx.e.scenes.length > 1 ? `<select id="jump-scene" aria-label="Jump to scene"><option value="">Jump to scene…</option>${[...new Set(shots.map((x) => x.scene_id))].map((id) => `<option value="${esc(id)}">${esc(id)} · ${esc(sceneById[id]?.summary || "")}</option>`).join("")}</select>` : ""}
         <span class="muted small">${pl(shots.length, "shot")} · ${fmtSec(shots.reduce((a, x) => a + (+x.duration_s || 0), 0))}</span></div>
-      <p class="muted small" style="margin:0 0 16px">Characters: <code>id:position:outfit</code>, comma separated. Dialogue: one <code>id [acting direction]: line</code> per line (the direction is optional). Editing a duration locks it.</p>
+      <p class="muted small" style="margin:0 0 16px">Scene, location, time of day, characters, outfits and speakers come from the project — pick them, don't type ids. Editing a duration locks it.</p>
       <div class="shot-rows">
       ${shots.map((sh, i) => {
         let head = "";
@@ -223,14 +327,15 @@ async function tabShots(el, ctx) {
           ${isOpen ? "" : `<div class="sr-summary" data-fold="${i}">${summary(sh)}</div>`}
           <div class="sr-body">
           <div class="sr-grid">
-            ${f("Framing", sel("framing", i, sh.framing, FRAMINGS))}
-            ${f("Camera", `<input data-i="${i}" data-f="camera" value="${esc(sh.camera)}" placeholder="e.g. static, slow push-in">`)}
-            ${f("Location", sel("location_id", i, sh.location_id, locIds, locIds.map((l) => ctx.locs[l].name)))}
-            ${f("Time of day", `<input data-i="${i}" data-f="time_of_day" value="${esc(sh.time_of_day)}" placeholder="e.g. night">`)}
-            ${f("Characters <span class='muted small'>id:position:outfit</span>", `<input data-i="${i}" data-f="characters" value="${esc(charsToText(sh.characters))}" placeholder="sam:left">`, "span2")}
+            ${f("Scene", sceneField(sh, i))}
+            ${f("Framing", known("framing", i, sh.framing || "medium", FRAMINGS))}
+            ${f("Camera", cameraField(sh, i))}
+            ${f("Location", known("location_id", i, sh.location_id, locIds, locIds.map((l) => ctx.locs[l]?.name || l)))}
+            ${f("Time of day", known("time_of_day", i, sh.time_of_day || todValues(sh)[0], todValues(sh)))}
+            ${f("Characters", castEditor(sh, i), "span2")}
             ${f("Action", `<textarea data-i="${i}" data-f="action" rows="3">${esc(sh.action)}</textarea>`, "span2 tall")}
-            ${f("Dialogue <span class='muted small'>one id: line per row</span>", `<textarea data-i="${i}" data-f="dialogue" rows="3">${esc(dlgToText(sh.dialogue))}</textarea>`, "span2")}
-            ${f("Sound", `<input data-i="${i}" data-f="sound" value="${esc(sh.sound)}" placeholder="sound">`, "span2")}
+            ${f("Dialogue", dlgEditor(sh, i), "span2")}
+            ${f("Sound", `<input data-i="${i}" data-f="sound" value="${esc(sh.sound)}" placeholder="sound" list="shot-sounds">`, "span2")}
             ${f(`Duration ${sh.duration_locked ? `<button class="link" data-unlock="${i}" title="Locked - click to auto-compute">🔒 locked</button>` : ""}`, `<input data-i="${i}" data-f="duration_s" type="number" step="0.1" value="${Math.round((+sh.duration_s || 0) * 100) / 100}" aria-label="Duration in seconds">`)}
             ${f("Start", sel("start_mode", i, sh.start_mode, ["new", "punch_in", "reuse", "chain"], ["New frame (master)", "Punch-in from scene master", "Reuse master angle", "Chain: last frame of prev take"]))}
             ${f("Frame source", sel("frame_source", i, sh.frame_source, frameSourceValues(sh.frame_source), frameSourceValues(sh.frame_source).map((v) => v ? sourceLabel(v) : "Inherit (" + sourceLabel(sh._source) + ")")))}
@@ -239,8 +344,8 @@ async function tabShots(el, ctx) {
           <details class="sr-blocking"><summary>First-frame blocking${sh.first_frame ? " · planned" : " · legacy prompt"}</summary>
             ${sh.first_frame ? `<p class="muted small">The opening instant controls the still image. Action describes what happens afterward. Each character appears once in the declared zone.</p>
             <div class="sr-grid">${["camera", "layout", "moment", "lighting"].map(key => f(key[0].toUpperCase() + key.slice(1), `<textarea data-i="${i}" data-f="first_frame.${key}" rows="2">${esc(sh.first_frame[key])}</textarea>`, "span2")).join("")}</div>
-            ${sh.first_frame.subjects.map((subject, index) => `<h4>${esc(charName(ctx, subject.id))}</h4><div class="sr-grid">${["position", "depth", "space", "zone", "pose", "facing", "gaze_target", "gaze_direction", "expression", "visibility", "wardrobe_state"].map(key => f(key.replaceAll("_", " "), `<input data-i="${i}" data-f="first_frame.subjects.${index}.${key}" value="${esc(subject[key])}">`)).join("")}</div>`).join("")}
-            ${sh.first_frame.props.map((prop, index) => `<h4>${esc(prop.id)}</h4><div class="sr-grid">${["placement", "state", "holder"].map(key => f(key, `<input data-i="${i}" data-f="first_frame.props.${index}.${key}" value="${esc(prop[key])}">`)).join("")}</div>`).join("")}
+            ${sh.first_frame.subjects.map((subject, index) => `<h4>${esc(charName(ctx, subject.id))}</h4><div class="sr-grid">${["position", "depth", "space", "zone", "pose", "facing", "gaze_target", "gaze_direction", "expression", "visibility", "wardrobe_state"].map(key => f(key.replaceAll("_", " "), ffControl(sh, i, "subjects", index, key, subject[key]))).join("")}</div>`).join("")}
+            ${sh.first_frame.props.map((prop, index) => `<h4>${esc(prop.id.replaceAll("_", " "))}</h4><div class="sr-grid">${f("Prop", ffControl(sh, i, "props", index, "id", prop.id))}${(["placement", "state", "holder"]).map(key => f(key, ffControl(sh, i, "props", index, key, prop[key]))).join("")}</div>`).join("")}
             <label>Required details · one per line</label><textarea data-i="${i}" data-f="first_frame.constraints" rows="3">${esc(sh.first_frame.constraints.join("\n"))}</textarea>`
             : `<p class="muted small">This shot uses a legacy prompt. Re-plan the scene to create explicit camera, position, gaze, prop and visibility plans.</p>`}
           </details>
@@ -252,7 +357,8 @@ async function tabShots(el, ctx) {
             <label>Full image prompt override${sh.first_frame ? " · controlled by blocking" : " (replaces auto)"}</label><textarea data-i="${i}" data-f="image_prompt_override" ${sh.first_frame ? "disabled" : ""}>${esc(sh.image_prompt_override)}</textarea>
             <label>Full motion prompt override</label><textarea data-i="${i}" data-f="motion_prompt_override">${esc(sh.motion_prompt_override)}</textarea>
           </details></div></article>`;
-      }).join("")}</div>`;
+      }).join("")}</div>
+      <datalist id="shot-sounds">${[...new Set(shots.map((s) => s.sound).filter(Boolean))].map((s) => `<option value="${esc(s)}">`).join("")}</datalist>`;
     bulkSelect(el, "[data-del]", async targets => {
       const indices = targets.map(t => +t.dataset.del).sort((a,b) => b-a);
       indices.forEach(i => shots.splice(i, 1)); App.dirty = true;
@@ -261,7 +367,12 @@ async function tabShots(el, ctx) {
     if (jump) jump.onchange = () => { const h = document.getElementById("scene-" + jump.value); jump.value = ""; if (h) h.scrollIntoView({ behavior: "smooth", block: "start" }); };
   };
   render();
-  const payload = () => shots.map((sh) => ({ ...sh }));
+  const payload = () => shots.map((sh) => {
+    const out = { ...sh };
+    delete out._camera_custom;
+    if (!out.time_of_day) out.time_of_day = todValues(out)[0] || "";
+    return out;
+  });
   el.oninput = (ev) => {
     const t = ev.target; const i = t.dataset.i, f = t.dataset.f; if (i == null || !f) return;
     const sh = shots[+i];
@@ -270,6 +381,35 @@ async function tabShots(el, ctx) {
       for (const part of keys) target = target[part];
       target[key] = key === "constraints" ? t.value.split("\n").map(x => x.trim()).filter(Boolean) : t.value;
     }
+    else if (f.startsWith("cast.")) {
+      const [, k, key] = f.split(".");
+      if (sh.characters[+k]) sh.characters[+k][key] = t.value;
+    }
+    else if (f.startsWith("dlg.")) {
+      const [, k, key] = f.split(".");
+      const line = (sh.dialogue || [])[+k];
+      if (line) {
+        if (key === "emotion") { if (t.value.trim()) line.emotion = t.value; else delete line.emotion; }
+        else line[key] = t.value;
+      }
+    }
+    else if (f === "camera") {
+      if (t.value === "__custom__") sh._camera_custom = true;
+      else { delete sh._camera_custom; sh.camera = t.value; }
+    }
+    else if (f === "camera_text") sh.camera = t.value;
+    else if (f === "scene_id") {
+      sh.scene_id = t.value;
+      const sc = ctx.e.scenes.find((s) => s.id === t.value);
+      if (sc?.location_id) sh.location_id = sc.location_id;
+      if (sc?.time_of_day) sh.time_of_day = sc.time_of_day;
+    }
+    else if (f === "location_id") {
+      sh.location_id = t.value;
+      const vals = Object.keys(ctx.locs[sh.location_id]?.variants || {});
+      if (vals.length && !vals.includes(sh.time_of_day)) sh.time_of_day = vals[0];
+    }
+    else if (f === "time_of_day") sh.time_of_day = t.value;
     else if (f === "characters") sh.characters = textToChars(t.value);
     else if (f === "dialogue") sh.dialogue = textToDlg(t.value);
     else if (f === "duration_s") { sh.duration_s = parseFloat(t.value) || 0; sh.duration_locked = true; }
@@ -277,7 +417,21 @@ async function tabShots(el, ctx) {
     App.dirty = true;
   };
   saveShortcut(() => $("#save", el)?.click());
-  el.onchange = el.oninput;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.dataset.castAdd != null) {
+      const id = t.value;
+      if (!id) return;
+      const sh = shots[+t.dataset.castAdd];
+      const ch = ctx.chars[id];
+      sh.characters = sh.characters || [];
+      sh.characters.push({ id, position: "center", outfit: ch?.default_outfit || Object.keys(ch?.outfits || {})[0] || "default" });
+      syncCast(sh);
+      App.dirty = true;
+      return render();
+    }
+    if (t.tagName === "SELECT" && t.dataset.i != null) render();
+  };
   el.onclick = async (ev) => {
     const t = ev.target, ds = t.dataset;
     const fold = t.closest("[data-fold]");
@@ -293,10 +447,23 @@ async function tabShots(el, ctx) {
       a.action = [a.action, b.action].filter(Boolean).join(" Then "); a.dialogue = (a.dialogue || []).concat(b.dialogue || []);
       a.duration_locked = false; shots.splice(i + 1, 1); App.dirty = true; render();
     }
+    if (ds.castDel != null) { const sh = shots[+ds.castDel]; sh.characters.splice(+ds.k, 1); syncCast(sh); App.dirty = true; return render(); }
+    if (ds.dlgAdd != null) {
+      const sh = shots[+ds.dlgAdd];
+      (sh.dialogue ||= []).push({ speaker: sh.characters[0]?.id || Object.keys(ctx.chars)[0] || "", line: "" });
+      App.dirty = true; return render();
+    }
+    if (ds.dlgDel != null) { shots[+ds.dlgDel].dialogue.splice(+ds.k, 1); App.dirty = true; return render(); }
     if (ds.del) { if (await ask(`Delete ${shots[+ds.del].id || "this shot"}?`, "Delete", true)) { shots.splice(+ds.del, 1); App.dirty = true; render(); } }
     if (ds.unlock) { shots[+ds.unlock].duration_locked = false; App.dirty = true; render(); }
     if (ds.replan) { if (await ask(`Re-plan all shots of ${ds.replan}? Its current shots are replaced.`, "Re-plan", true)) startJob(`${ctx.base}/replan/${ds.replan}`, { model: $("#replan-model")?.value || "" }); }
-    if (t.id === "add") { shots.push({ id: "", scene_id: shots.at(-1)?.scene_id || "S01", location_id: shots.at(-1)?.location_id || locIds[0] || "", framing: "medium", camera: "", characters: [], action: "", dialogue: [], sound: "", action_seconds: 3, start_mode: "new", frame_source: "", engine: "" }); open.add(shots.at(-1)); App.dirty = true; render(); el.querySelector(".shot-row:last-of-type")?.scrollIntoView({ behavior: "smooth", block: "center" }); }
+    if (t.id === "add") {
+      const prev = shots.at(-1);
+      const location_id = prev?.location_id || locIds[0] || "";
+      const variants = Object.keys(ctx.locs[location_id]?.variants || {});
+      shots.push({ id: "", scene_id: prev?.scene_id || ctx.e.scenes[0]?.id || "S01", location_id, framing: "medium", camera: "", characters: [], action: "", dialogue: [], sound: "", action_seconds: 3, start_mode: "new", frame_source: "", engine: "", time_of_day: prev?.time_of_day || variants[0] || "" });
+      open.add(shots.at(-1)); App.dirty = true; render(); el.querySelector(".shot-row:last-of-type")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
     if (t.id === "block") { if (App.dirty) await PUT(`${ctx.base}/shots`, payload()); App.dirty = false; return startJob(`${ctx.base}/block_shots`, { model: $("#replan-model")?.value || "" }); }
     if (t.id === "cont") { await PUT(`${ctx.base}/shots`, payload()); await POST(`${ctx.base}/continuity`); App.dirty = false; toast("Continuity assigned: masters, punch-ins, reuses."); return reload(); }
     if (t.id === "save" || ds.gate) {
@@ -610,7 +777,222 @@ async function tabAnimatic(el, ctx) {
   show(0);
 }
 
-// ── 5. Takes ────────────────────────────────────────────────────────────
+// ── 5. Previz: 3D blockout of each scene before takes are rendered ──
+// Cubes stand in for characters; plan position, camera and movement per shot,
+// then render a Blender previz animation to review movement before committing takes.
+async function tabPreviz(el, ctx) {
+  const { DirectorViewport } = await import("/static/playground3d.js");
+  const shots = ctx.e.shots;
+  const scenes = ctx.e.scenes || [];
+  const g = ctx.e.gates || {};
+
+  const byScene = {};
+  for (const sh of shots) (byScene[sh.scene_id] ||= []).push(sh);
+  const sceneIds = scenes.map(s => s.id).filter(id => byScene[id] && byScene[id].length);
+  if (!sceneIds.length) {
+    el.innerHTML = `<div class="notice">No shots planned yet. Write the spine and scene cards, then plan the shots.</div>`;
+    return;
+  }
+
+  const sceneName = id => (scenes.find(s => s.id === id) || {}).summary || id;
+  let curScene = sceneIds[0];
+  let curShotIdx = 0;
+  let viewport = null;
+  let autoSaveTimer = null;
+
+  const shotFor = () => byScene[curScene][curShotIdx];
+  const shotPreviz = (sh) => sh.previz || { camera: { azimuth: 0, height: 5.5, distance: 13, lens: 50 }, entities: [], movement: "", notes: "", blender_file: "" };
+
+  el.innerHTML = `
+    <div class="previz-wrap">
+      <div class="previz-header">
+        <div class="tb-group">
+          <label>Scene <select id="pv-scene">${sceneIds.map(id => `<option value="${esc(id)}">${esc(sceneName(id))} (${byScene[id].length} shots)</option>`).join("")}</select></label>
+          <label>Shot <select id="pv-shot"></select></label>
+          <span class="grow"></span>
+          ${gateBtn(ctx, "previz", "previz")}
+        </div>
+        <p class="muted small">Cubes stand in for characters. Drag to place them, set the camera, write the movement for this shot. State saves automatically. Render a Blender previz to review the movement, approve it, then generate takes.</p>
+      </div>
+      <div class="previz-body">
+        <div class="previz-viewport" id="pv-host"><div class="pg3-loading">Preparing the 3D scene…</div></div>
+        <aside class="previz-inspector">
+          <div class="pg3-panel"><div class="pg3-panel-head"><span>01</span><div><b>Movement</b><small>What happens in this shot</small></div></div>
+            <textarea id="pv-movement" rows="3" placeholder="e.g. Sam walks from the door to the table and sits down."></textarea>
+            <label class="pg-field" style="margin-top:8px">Notes <textarea id="pv-notes" rows="2" placeholder="Optional notes for the take generation…"></textarea></label>
+          </div>
+          <div class="pg3-panel"><div class="pg3-panel-head"><span>02</span><div><b>Camera</b><small>Adjust the view for this shot</small></div></div>
+            <label class="pg3-range">Orbit <output id="pv-angle-out">0°</output><input id="pv-angle" type="range" min="-180" max="180" value="0"></label>
+            <label class="pg3-range">Camera height <output id="pv-height-out">5.5 m</output><input id="pv-height" type="range" min="1.2" max="13" step="0.1" value="5.5"></label>
+            <label class="pg3-range">Distance <output id="pv-distance-out">13 m</output><input id="pv-distance" type="range" min="5" max="35" step="0.5" value="13"></label>
+            <label class="pg3-range">Lens <output id="pv-lens-out">50 mm</output><input id="pv-lens" type="range" min="18" max="100" step="1" value="50"></label>
+            <button id="pv-reset" class="pg3-quiet">Reset view</button>
+          </div>
+          <div class="pg3-panel"><div class="pg3-panel-head"><span>03</span><div><b>Blender Previz</b><small>Render a 3D animation preview of this shot</small></div></div>
+            <label class="pg-field">Length (s)<input id="pv-len" type="number" min="2" max="30" value="6" style="width:60px"></label>
+            <label class="pg-field">FPS <input id="pv-fps" type="number" min="12" max="60" value="24" style="width:60px"></label>
+            <div class="row" style="gap:6px;margin-top:8px">
+              <button class="primary" id="pv-render-blender">Render Blender Previz</button>
+              <button class="pg3-quiet" id="pv-blen-status" disabled>Blender MCP: checking…</button>
+            </div>
+            <div id="pv-blender-preview" style="margin-top:10px"></div>
+          </div>
+          <div class="pg3-panel"><div class="pg3-panel-head"><span>04</span><div><b>Shot in scene</b><small>${curShotIdx + 1} of ${byScene[curScene].length}</small></div></div>
+            <div class="row" style="gap:6px;margin-top:8px"><button id="pv-prev">← Previous shot</button><button id="pv-next">Next shot →</button></div>
+          </div>
+        </aside>
+      </div>
+    </div>`;
+
+  const sceneSel = $("#pv-scene", el);
+  const shotSel = $("#pv-shot", el);
+  const movementTa = $("#pv-movement", el);
+  const notesTa = $("#pv-notes", el);
+  const lenIn = $("#pv-len", el);
+  const fpsIn = $("#pv-fps", el);
+  const renderBtn = $("#pv-render-blender", el);
+  const statusBtn = $("#pv-blen-status", el);
+  const previewDiv = $("#pv-blender-preview", el);
+
+  const renderShotStrip = () => {
+    const shot = shotFor();
+    const previz = shotPreviz(shot);
+    shotSel.innerHTML = byScene[curScene].map((s, i) =>
+      `<option value="${i}" ${i === curShotIdx ? "selected" : ""}>${esc(s.id)} · ${esc(s.framing || "medium")}${s.characters?.length ? ` · ${s.characters.map(c => esc(ctx.chars[c.id]?.name || c.id)).join(", ")}` : ""}</option>`).join("");
+    movementTa.value = previz.movement || "";
+    notesTa.value = previz.notes || "";
+    lenIn.value = previz.blender_seconds ? previz.blender_seconds : 6;
+    renderPreview(previz);
+    return { shot, previz };
+  };
+
+  const renderPreview = (previz) => {
+    const file = previz.blender_file;
+    if (!file) {
+      previewDiv.innerHTML = `<div class="muted small" style="text-align:center;padding:20px">No Blender previz rendered yet for this shot.</div>`;
+      return;
+    }
+    previewDiv.innerHTML = `
+      <div style="border:1px solid var(--rule);border-radius:var(--r-sm);overflow:hidden;background:#090c10">
+        <video controls style="width:100%;height:auto;display:block;background:#000"><source src="${media(file)}" type="video/mp4">Your browser does not support the video tag.</source></video>
+        <div style="padding:6px 8px;font-size:11px;color:var(--faint);background:var(--film-2)">${esc(file.split('/').pop())} · ${Math.round((previz.blender_seconds||0)*10)/10}s @ ${Math.round((previz.blender_frames||0)/(previz.blender_seconds||1))}fps</div>
+      </div>`;
+  };
+
+  const initViewport = () => {
+    if (viewport) { viewport.destroy(); viewport = null; }
+    const host = $("#pv-host", el);
+    host.replaceChildren(document.createElement("div"));
+    const canvasDiv = host.firstChild;
+    const shot = shotFor();
+    const previz = shotPreviz(shot);
+    const loc = ctx.locs[shot.location_id] || {};
+    const startChars = (shot.characters || []).map(c => ({
+      id: c.id, name: ctx.chars[c.id]?.name || c.id, appearance: ctx.chars[c.id]?.appearance || "",
+      refs: ctx.chars[c.id]?.refs || [],
+      position: (previz.entities.find(e => e.id === c.id)?.position) || [0, 0, 1.5],
+      rotation: (previz.entities.find(e => e.id === c.id)?.rotation) || [0, 0, 0],
+      scale: (previz.entities.find(e => e.id === c.id)?.scale) || 1
+    }));
+    viewport = new DirectorViewport(canvasDiv, {
+      characters: startChars,
+      camera: previz.camera || { azimuth: 0, height: 5.5, distance: 13, lens: 50 },
+      onChange: (state) => {
+        const shot = shotFor();
+        const current = shot.previz || { camera: {}, entities: [], movement: "", notes: "" };
+        shot.previz = { ...current, camera: state.camera, entities: state.entities };
+        clearTimeout(autoSaveTimer);
+        autoSaveTimer = setTimeout(() => savePreviz(shot), 600);
+      }
+    });
+    viewport.setLocation(loc.name || "Location", "");
+    paintControls(previz.camera || { azimuth: 0, height: 5.5, distance: 13, lens: 50 });
+  };
+
+  const paintControls = (cam) => {
+    $("#pv-angle", el).value = Math.round(cam.azimuth); $("#pv-angle-out", el).textContent = `${Math.round(cam.azimuth)}°`;
+    $("#pv-height", el).value = cam.height; $("#pv-height-out", el).textContent = `${cam.height.toFixed(1)} m`;
+    $("#pv-distance", el).value = cam.distance; $("#pv-distance-out", el).textContent = `${cam.distance.toFixed(1)} m`;
+    $("#pv-lens", el).value = cam.lens; $("#pv-lens-out", el).textContent = `${Math.round(cam.lens)} mm`;
+  };
+
+  const savePreviz = async (shot) => {
+    const previz = shotPreviz(shot);
+    previz.movement = movementTa.value.trim();
+    previz.notes = notesTa.value.trim();
+    try { await POST(`${ctx.base}/previz`, { shot_id: shot.id, state: previz }); }
+    catch (err) { toast("Could not save blockout state: " + (err.message || err), true); }
+  };
+
+  const checkBlender = async () => {
+    try {
+      const r = await fetch(`${ctx.base}/previz_blender/${encodeURIComponent(shotFor().id)}`);
+      // 404 means not rendered yet - that's fine
+      if (r.ok) statusBtn.textContent = "Blender MCP: previz ready"; statusBtn.disabled = true;
+    } catch { /* not ready yet */ }
+    statusBtn.textContent = "Blender MCP: ready to render";
+    statusBtn.disabled = false;
+  };
+
+  const switchShot = (idx) => {
+    const s = shotFor();
+    if (s) {
+      const previz = shotPreviz(s);
+      previz.movement = movementTa.value.trim();
+      previz.notes = notesTa.value.trim();
+      POST(`${ctx.base}/previz`, { shot_id: s.id, state: previz }).catch(() => {});
+    }
+    curShotIdx = idx;
+    renderShotStrip();
+    initViewport();
+    checkBlender();
+    $("#pv-next", el).disabled = curShotIdx >= byScene[curScene].length - 1;
+    $("#pv-prev", el).disabled = curShotIdx <= 0;
+  };
+
+  sceneSel.onchange = () => {
+    const s = shotFor();
+    if (s) {
+      const previz = shotPreviz(s);
+      previz.movement = movementTa.value.trim();
+      previz.notes = notesTa.value.trim();
+      POST(`${ctx.base}/previz`, { shot_id: s.id, state: previz }).catch(() => {});
+    }
+    curScene = sceneSel.value; curShotIdx = 0; renderShotStrip(); initViewport(); checkBlender();
+    $("#pv-next", el).disabled = false; $("#pv-prev", el).disabled = true;
+  };
+  shotSel.onchange = () => { curShotIdx = +shotSel.value; renderShotStrip(); initViewport(); checkBlender(); $("#pv-next", el).disabled = curShotIdx >= byScene[curScene].length - 1; $("#pv-prev", el).disabled = curShotIdx <= 0; };
+  movementTa.oninput = () => { const s = shotFor(); if (s) { shotPreviz(s).movement = movementTa.value.trim(); clearTimeout(autoSaveTimer); autoSaveTimer = setTimeout(() => savePreviz(s), 600); } };
+  notesTa.oninput = () => { const s = shotFor(); if (s) { shotPreviz(s).notes = notesTa.value.trim(); clearTimeout(autoSaveTimer); autoSaveTimer = setTimeout(() => savePreviz(s), 600); } };
+  const cameraInputs = [["#pv-angle", "azimuth"], ["#pv-height", "height"], ["#pv-distance", "distance"], ["#pv-lens", "lens"]];
+  cameraInputs.forEach(([sel, key]) => $(sel, el).addEventListener("input", e => { if (viewport) { viewport.setCameraState(key, e.target.value); } }));
+  $("#pv-reset", el).onclick = () => { if (viewport) { viewport.cameraState = { azimuth: 0, height: 5.5, distance: 13, lens: 50 }; viewport.updateCamera(); } };
+  $("#pv-prev", el).onclick = () => { if (curShotIdx > 0) switchShot(curShotIdx - 1); };
+  $("#pv-next", el).onclick = () => { if (curShotIdx < byScene[curScene].length - 1) switchShot(curShotIdx + 1); };
+
+  renderBtn.onclick = async () => {
+    const shot = shotFor();
+    const seconds = parseFloat(lenIn.value) || 6;
+    const fps = parseInt(fpsIn.value) || 24;
+    renderBtn.disabled = true; renderBtn.textContent = "Rendering…";
+    try {
+      await POST(`${ctx.base}/previz_blender`, { shot_id: shot.id, seconds, fps });
+      toast("Blender previz job submitted. Check Activity.");
+    } catch (err) { toast("Blender previz failed: " + (err.message || err), true); }
+    finally { renderBtn.disabled = false; renderBtn.textContent = "Render Blender Previz"; }
+  };
+
+  el.addEventListener("click", (e) => { if (e.target.dataset.gate) setGate(ctx, e.target.dataset.gate, e.target.dataset.val === "1"); });
+
+  renderShotStrip();
+  initViewport();
+  checkBlender();
+  $("#pv-next", el).disabled = byScene[curScene].length <= 1;
+  $("#pv-prev", el).disabled = true;
+  App.refreshers.push(() => { /* viewport persists across soft reloads */ });
+}
+
+// ── 6. Takes ────────────────────────────────────────────────────────────
 // The takes editor starts folded. Opening or closing it is remembered on this device.
 const EDITOR_OPEN_KEY = "reelwright.takesEditorOpen";
 let editorOpen = (() => { try { return localStorage.getItem(EDITOR_OPEN_KEY) === "1"; } catch { return false; } })();
@@ -619,7 +1001,7 @@ async function tabTakes(el, ctx) {
   const spf = ctx.e.stats?.spf || {};
   const models = await GET("/api/models");
   el.innerHTML = `
-    ${!ctx.e.gates.frames ? `<div class="notice">First frames aren't approved yet. Shots without a selected frame are skipped.</div>` : ""}
+    ${ctx.e.reference_rebuild?.source ? `<div class="card"><div class="row"><b class="grow">Reference film</b><button class="primary" id="reference-render">Resume reference render</button><button id="reference-activity">Show queue</button></div><p class="muted small">Recreate the reference performance with this project's characters. Completed shots are kept; dialogue and timing follow the original. ${ctx.e.reference_rebuild.shots_done || 0}/${ctx.e.shots.length} shots saved · ${esc(ctx.e.reference_rebuild.status || "ready")}</p></div>` : !ctx.e.gates.frames ? `<div class="notice">First frames aren't approved yet. Shots without a selected frame are skipped.</div>` : ""}
     <div id="take-history"></div>
     <details class="take-editor-panel" ${editorOpen ? "open" : ""}><summary>Takes editor</summary><div id="take-timeline"></div></details>
     <details class="take-library-panel" open><summary>Take library &amp; batch generation</summary>
@@ -690,7 +1072,13 @@ async function tabTakes(el, ctx) {
   // The editor measures its own size, so redraw it once it is shown.
   panel.ontoggle = () => { editorOpen = panel.open; try { localStorage.setItem(EDITOR_OPEN_KEY, editorOpen ? "1" : "0"); } catch { /* private mode */ } if (panel.open) requestAnimationFrame(() => editor.draw()); };
   const openEditor = () => { if (!panel.open) panel.open = true; };
-  $("#render-missing").onclick = () => startJob(`${ctx.base}/takes`, { takes: n(), ...modelChoice() });
+  const referenceRender = $("#reference-render", el);
+  if (referenceRender) referenceRender.onclick = async () => { await startJob(`${ctx.base}/reference_render`, {}); openJobs(true); };
+  const referenceActivity = $("#reference-activity", el);
+  if (referenceActivity) referenceActivity.onclick = () => openJobs(true);
+  $("#render-missing").onclick = () => ctx.e.reference_rebuild?.source
+    ? startJob(`${ctx.base}/reference_render`, {}).then(() => openJobs(true))
+    : startJob(`${ctx.base}/takes`, { takes: n(), ...modelChoice() });
   const sing = $("#sing-song", el);
   if (sing) sing.onclick = async () => {
     const ticked = $$("input[data-chk]:checked", el).map((x) => x.dataset.chk);

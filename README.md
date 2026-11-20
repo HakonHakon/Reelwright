@@ -4,8 +4,6 @@
 
 ![The current Takes editor with video preview, clip inspector, editable video clips and a music waveform](docs/img/takes-timeline.png)
 
-> **Current timeline build:** the editor shown here is on [`feat/takes-face-correction-and-models`](https://github.com/HakonHakon/Reelwright/tree/feat/takes-face-correction-and-models). The install commands below select that branch. `main` has the earlier Studio until the timeline changes are merged.
-
 ## What Studio handles
 
 | Workspace | What you can do |
@@ -49,7 +47,7 @@ Vocal isolation separates vocals from instruments, not one singer from another. 
 python scripts/install_lipsync.py --python /path/to/python3.10 --comfy /path/to/ComfyUI
 ```
 
-Restart ComfyUI and Studio after installation. The installer creates an isolated runtime and downloads the lip-sync weights. See the [Studio guide on the timeline branch](https://github.com/HakonHakon/Reelwright/blob/feat/takes-face-correction-and-models/STUDIO.md) for configuration and the older Cut workflow.
+Restart ComfyUI and Studio after installation. The installer creates an isolated runtime and downloads the lip-sync weights. See [STUDIO.md](STUDIO.md) for configuration and the older Cut workflow.
 
 ### Voice the dialogue (VoiceStudio)
 
@@ -65,8 +63,6 @@ The Studio status panel shows whether VoiceStudio is reachable. On Linux the eng
 ## AI connections
 
 **AI models** in the sidebar connects OpenAI, Google Gemini or any OpenAI-compatible service (OpenRouter, Groq, DeepSeek, Mistral, xAI, Together, LM Studio …). A connection can write the bible draft, scenes and shots, check frames, and render first frames, character sheets and location plates from reference photos. Local Ollama remains the default. API keys come from the connection's environment variable, else `secrets.json` in the Studio data folder (owner-only); keys never appear in errors, logs or API responses.
-
-## Characters, frames and face correction
 
 Upload character portraits in the project's **Characters** pages, then assign those characters to shots. **First frames** supports uploaded images, reference-conditioned Qwen Image Edit, Flux with LoRAs and Z-Image. Review and pick candidates before generating takes.
 
@@ -98,7 +94,7 @@ The host PC needs Python 3.10+, ffmpeg/ffprobe, ComfyUI and the required models/
 ### Windows
 
 ```bat
-git clone --branch feat/takes-face-correction-and-models https://github.com/HakonHakon/Reelwright.git
+git clone --branch main https://github.com/HakonHakon/Reelwright.git
 cd Reelwright
 setup.bat
 start-studio.bat
@@ -109,7 +105,7 @@ start-studio.bat
 Install Python's venv support and ffmpeg/ffprobe, then:
 
 ```sh
-git clone --branch feat/takes-face-correction-and-models https://github.com/HakonHakon/Reelwright.git
+git clone --branch main https://github.com/HakonHakon/Reelwright.git
 cd Reelwright
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
@@ -118,7 +114,7 @@ bash start-studio.sh
 
 Start ComfyUI and Ollama separately. Studio defaults to ComfyUI on port 8188 and Ollama on port 11434. Install the weights for your chosen workflows and check their filenames in Settings. The Linux launcher also recognizes a local ffmpeg installation under `.runtime/ffmpeg/`.
 
-Already cloned? Save any local changes, then check out `feat/takes-face-correction-and-models` and pull its latest commits before starting Studio.
+Already cloned? Save any local changes, then pull the latest commits from `main` before starting Studio.
 
 ### Android, iPhone and iPad
 
@@ -135,7 +131,6 @@ Use **Expand editor** for a larger editing workspace and **Settings** to show th
 ## Projects, deletion and backups
 
 The Projects home page sorts by most recently edited by default. Use the up/down arrows on a project card to save a custom order; new projects are placed at the top. The order is stored by Studio and remains after a page reload.
-
 Use **Select all / Delete selected** on deletable collections, or **Delete project** on a project page. Project, episode and bible-entry folders are moved to hidden `.deleted_*` folders. Removing a frame or take detaches it while retaining its media file. Deleting a timeline clip changes only the edit.
 
 Projects and media live under `studio_data/`. That directory, downloaded models and `.runtime/` are git-ignored. **A Git push backs up the code, not your characters, uploaded audio, projects or renders.** Back those directories up separately.

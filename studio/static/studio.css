@@ -918,8 +918,15 @@ pre.prompt, .job pre, code { border-radius: var(--r-sm); }
 
 /* Project sheets: card surface, gentle lift on hover. */
 .sheets { gap: 22px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+.project-card { min-width: 0; background: var(--paper); border: 1px solid var(--rule); border-radius: var(--r); box-shadow: var(--shadow-sm); transition: transform .2s var(--ease), box-shadow .2s var(--ease), border-color .2s var(--ease); }
+.project-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); border-color: var(--rule-2); }
 .sheet { background: var(--paper); border: 1px solid var(--rule); border-radius: var(--r); padding: 10px 10px 14px; box-shadow: var(--shadow-sm); transition: transform .2s var(--ease), box-shadow .2s var(--ease), border-color .2s var(--ease); }
 .sheet:hover { transform: translateY(-2px); box-shadow: var(--shadow); border-color: var(--rule-2); }
+.project-card .sheet, .project-card .sheet:hover { background: transparent; border: 0; border-radius: var(--r); box-shadow: none; padding-bottom: 5px; transform: none; }
+.project-order { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 0 12px 12px; color: var(--ink-2); font-size: 12px; }
+.project-order button { width: 34px; height: 30px; border: 1px solid var(--rule); border-radius: var(--r-sm); color: var(--ink); background: var(--paper-2); cursor: pointer; }
+.project-order button:hover:not(:disabled) { border-color: var(--rule-2); background: var(--paper); }
+.project-order button:disabled { opacity: .35; cursor: not-allowed; }
 .sheet .strip { border-radius: var(--r-sm); padding: 22px 12px; gap: 8px; }
 .sheet .strip::before, .sheet .strip::after { background-image: repeating-linear-gradient(90deg, var(--paper) 0 7px, transparent 7px 17px); opacity: .85; }
 .sheet .strip::before { top: 7px; } .sheet .strip::after { bottom: 7px; }

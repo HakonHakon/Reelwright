@@ -223,6 +223,33 @@ def test_installable_shell_and_offline_recovery(mobile_server):
         browser.close()
 
 
+def test_home_projects_default_to_recent_then_keep_manual_order(mobile_server):
+    base, _, _ = mobile_server
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(base)
+        page.evaluate("""async () => {
+          await fetch('/api/series', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: 'Newer project'})
+          });
+        }""")
+        page.reload()
+        page.get_by_role('heading', name='Projects', exact=True).wait_for()
+        cards = page.locator('.sheet h3')
+        assert cards.all_text_contents() == ['Newer project', 'Mobile Test']
+
+        page.get_by_role('button', name='Move Newer project down').click()
+        page.wait_for_function("document.querySelector('.sheet h3')?.textContent === 'Mobile Test'")
+        assert cards.all_text_contents() == ['Mobile Test', 'Newer project']
+        page.reload()
+        page.wait_for_function("document.querySelector('.sheet h3')?.textContent === 'Mobile Test'")
+        assert cards.all_text_contents() == ['Mobile Test', 'Newer project']
+        browser.close()
+
+
 def test_character_reference_correction_model_settings(mobile_server):
     from studio import settings
     base, sid, eid = mobile_server

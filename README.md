@@ -10,7 +10,7 @@
 
 | Workspace | What you can do |
 |---|---|
-| **Projects & characters** | Create projects and episodes; save appearance, outfits, reference portraits, locations and style. |
+| **Projects & characters** | Create projects and episodes; projects default to most recently edited first, with persistent up/down controls for a custom order. Save appearance, outfits, reference portraits, locations and style. |
 | **Story & shot list** | Plan from a script, edit actions and timing, assign characters and models, split, merge and reorder shots. |
 | **First frames** | Generate or upload candidates, crop photos on desktop or mobile, compare results and correct a face with Qwen Image Edit. |
 | **Animatic** | Preview selected frames at shot length before generating video. |
@@ -133,6 +133,8 @@ Use **Expand editor** for a larger editing workspace and **Settings** to show th
 **Install app** provides Android and iOS home-screen instructions. Installable web-app features require HTTPS with a certificate trusted by the phone; browser access works over LAN HTTP. To restrict Studio to the PC, change the launcher's host to `127.0.0.1`.
 
 ## Projects, deletion and backups
+
+The Projects home page sorts by most recently edited by default. Use the up/down arrows on a project card to save a custom order; new projects are placed at the top. The order is stored by Studio and remains after a page reload.
 
 Use **Select all / Delete selected** on deletable collections, or **Delete project** on a project page. Project, episode and bible-entry folders are moved to hidden `.deleted_*` folders. Removing a frame or take detaches it while retaining its media file. Deleting a timeline clip changes only the edit.
 

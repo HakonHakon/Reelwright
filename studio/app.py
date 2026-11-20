@@ -325,6 +325,14 @@ def series_list():
     return store.list_series()
 
 
+@app.put("/api/series/order")
+def series_order(body: dict = Body(...)):
+    try:
+        return store.save_series_order(body.get("ids"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/series")
 def series_create(body: dict = Body(...)):
     return store.create_series(body.get("name", "").strip() or "My series")

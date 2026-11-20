@@ -40,6 +40,28 @@ def series_dir(sid: str) -> str:
     return os.path.join(root(), sid)
 
 
+def _series_order_path() -> str:
+    return os.path.join(root(), ".project-order.json")
+
+
+def _series_updated(sid: str, fallback: str) -> tuple[str, float]:
+    """Return the newest project-metadata modification time without scanning generated media."""
+    latest = 0.0
+    ignored_dirs = {"backups", "frames", "out", "plates", "refs", "sheet", "takes", "uploads", "voice"}
+    for current, dirs, files in os.walk(series_dir(sid)):
+        dirs[:] = [name for name in dirs if name not in ignored_dirs and not name.startswith(".")]
+        for name in files:
+            if not name.endswith(".json"):
+                continue
+            try:
+                latest = max(latest, os.path.getmtime(os.path.join(current, name)))
+            except OSError:
+                continue
+    if not latest:
+        return fallback, 0.0
+    return _dt.datetime.fromtimestamp(latest).isoformat(timespec="microseconds"), latest
+
+
 def bible_dir(sid: str) -> str:
     return os.path.join(series_dir(sid), "bible")
 
@@ -102,8 +124,29 @@ def list_series() -> list[dict]:
                 continue
             s = _read(os.path.join(series_dir(sid), "series.json"))
             if s:
+                updated, updated_ts = _series_updated(sid, s.get("created", ""))
+                s = {**s, "updated": updated, "_updated_ts": updated_ts}
                 out.append(s)
+    order = _read(_series_order_path())
+    if isinstance(order, list):
+        rank = {sid: index for index, sid in enumerate(order) if isinstance(sid, str)}
+        out.sort(key=lambda s: (s["id"] not in rank, rank.get(s["id"], 0), -s["_updated_ts"]))
+    else:
+        out.sort(key=lambda s: (s["_updated_ts"], s.get("created", ""), s["id"]), reverse=True)
+    for series in out:
+        series.pop("_updated_ts", None)
     return out
+
+
+def save_series_order(ids: list[str]) -> list[str]:
+    if not isinstance(ids, list) or not all(isinstance(sid, str) for sid in ids):
+        raise ValueError("Project order must be a list of project IDs.")
+    with _lock:
+        existing = {series["id"] for series in list_series()}
+        if len(ids) != len(existing) or len(set(ids)) != len(ids) or set(ids) != existing:
+            raise ValueError("Project order must include every project exactly once.")
+        _write(_series_order_path(), ids)
+    return ids
 
 
 def create_series(name: str) -> dict:
@@ -115,6 +158,9 @@ def create_series(name: str) -> dict:
         _write(os.path.join(bible_dir(sid), "style.json"),
                {**DEFAULT_STYLE, **_settings.load().get("style_defaults", {})})
         _write(os.path.join(bible_dir(sid), "props.json"), [])
+        order = _read(_series_order_path())
+        if isinstance(order, list):
+            _write(_series_order_path(), [sid, *(item for item in order if item != sid)])
         return s
 
 

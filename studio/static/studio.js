@@ -479,15 +479,20 @@ async function viewHome(view) {
   const details = await Promise.all(list.map((s) => getSeries(s.id).catch(() => null)));
   view.innerHTML = `
     <div class="page-head"><div><h1>${list.length ? "Projects" : "Start your first project"}</h1>
-      <p class="sub">${list.length ? `${pl(list.length, "project")}, ${pl(details.reduce((a, d) => a + (d ? d.episodes.length : 0), 0), "episode")}, ${pl(details.reduce((a, d) => a + (d ? Object.keys(d.bible.characters).length : 0), 0), "character")}` : "A project holds a story world: its characters, locations and episodes."}</p></div></div>
+      <p class="sub">${list.length ? `${pl(list.length, "project")}, ${pl(details.reduce((a, d) => a + (d ? d.episodes.length : 0), 0), "episode")}, ${pl(details.reduce((a, d) => a + (d ? Object.keys(d.bible.characters).length : 0), 0), "character")} · Recently edited first by default; use the arrows to set a custom order.` : "A project holds a story world: its characters, locations and episodes."}</p></div></div>
     ${st.comfy === false ? `<div class="notice">${ic("alert")}<span>ComfyUI is not reachable at ${esc(st.comfy_host)}. Start Comfy Desktop - planning works without it, rendering doesn't.</span></div>` : ""}
     ${(st.missing || []).length ? `<div class="notice">${ic("alert")}<span>Not found: ${esc(st.missing.join(", "))}. Fix names in Settings or install them.</span></div>` : ""}
     <div class="sheets">${list.map((s, k) => {
       const d = details[k];
       const imgs = d ? [...Object.values(d.bible.characters).map(charThumb), ...Object.values(d.bible.locations).map(locThumb)].filter(Boolean).slice(0, 3) : [];
       const cells = [0, 1, 2].map((i) => `<i>${imgs[i] ? `<img src="${imgs[i]}" loading="lazy" alt="">` : ""}</i>`).join("");
-      return `<a class="sheet" href="#/s/${esc(s.id)}"><div class="strip">${cells}</div><h3>${esc(s.name)}</h3>
-        <div class="muted small">${d ? `${pl(d.episodes.length, "episode")}, ${pl(Object.keys(d.bible.characters).length, "character")}, ${pl(Object.keys(d.bible.locations).length, "location")}` : ""}</div></a>`;
+      return `<div class="project-card"><a class="sheet" href="#/s/${esc(s.id)}"><div class="strip">${cells}</div><h3>${esc(s.name)}</h3>
+        <div class="muted small">${d ? `${pl(d.episodes.length, "episode")}, ${pl(Object.keys(d.bible.characters).length, "character")}, ${pl(Object.keys(d.bible.locations).length, "location")}` : ""}</div></a>
+        <div class="project-order" aria-label="Project position">
+          <button type="button" data-project-move="${k}" data-direction="-1" aria-label="Move ${esc(s.name)} up" title="Move up" ${k === 0 ? "disabled" : ""}>↑</button>
+          <span>${k + 1}</span>
+          <button type="button" data-project-move="${k}" data-direction="1" aria-label="Move ${esc(s.name)} down" title="Move down" ${k === list.length - 1 ? "disabled" : ""}>↓</button>
+        </div></div>`;
     }).join("")}</div>
     <div class="addrow" style="margin-top:34px"><input id="new-series" placeholder="New project name, e.g. Summer Stories"><button class="primary" id="add-series">Create project</button></div>`;
   const create = async () => {
@@ -500,6 +505,21 @@ async function viewHome(view) {
       await api("DELETE", `/api/s/${sid}`); delete App.sd[sid];
     }
   }, route, "projects");
+  $$("[data-project-move]", view).forEach(button => {
+    button.onclick = async (event) => {
+      event.preventDefault(); event.stopPropagation();
+      const from = Number(button.dataset.projectMove), to = from + Number(button.dataset.direction);
+      if (to < 0 || to >= list.length) return;
+      const ids = list.map(item => item.id);
+      [ids[from], ids[to]] = [ids[to], ids[from]];
+      button.disabled = true;
+      try {
+        await PUT("/api/series/order", { ids });
+        toast("Project order saved");
+        await route();
+      } catch { await route(); }
+    };
+  });
   $("#add-series").onclick = create; onEnter("#new-series", create);
 }
 
